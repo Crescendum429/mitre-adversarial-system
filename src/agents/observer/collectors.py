@@ -68,41 +68,25 @@ class LogCollector:
 
     def summarize_logs(self, logs: list[dict]) -> str:
         """
-        Formatea logs para el LLM con dos secciones:
-        - Historico agregado: logs anteriores al ultimo minuto, comprimidos por patron
-        - Actividad reciente: ultimos 60s completos, en orden cronologico
+        Formatea logs para el LLM en dos secciones:
+        1. Resumen agregado de TODOS los logs: colapsa entradas repetidas por patron
+           (IP, metodo, ruta, status). Comunica patrones de ataque con bajo token cost.
+        2. Ultimas 50 entradas verbatim: preserva la señal de la tactica actual.
 
-        Esto preserva la informacion critica de la tactica actual (siempre en recientes)
-        mientras reduce el volumen de logs repetitivos del escaneo previo.
+        Esto acota el output a ~200-600 lineas independientemente del volumen total.
         """
         if not logs:
             return "No se encontraron logs nuevos en la ventana temporal."
 
         sorted_logs = sorted(logs, key=lambda l: l.get("timestamp", ""))
 
-        last_ts_str = sorted_logs[-1].get("timestamp", "")
-        try:
-            last_dt = datetime.fromisoformat(last_ts_str)
-            cutoff_str = (last_dt - timedelta(seconds=60)).isoformat()
-        except (ValueError, TypeError):
-            cutoff_str = ""
+        lines = [f"=== RESUMEN AGREGADO ({len(sorted_logs)} entradas totales) ==="]
+        lines.extend(self._aggregate_entries(sorted_logs))
 
-        historical = [l for l in sorted_logs if cutoff_str and l.get("timestamp", "") < cutoff_str]
-        recent = [l for l in sorted_logs if not cutoff_str or l.get("timestamp", "") >= cutoff_str]
-
-        lines = []
-
-        if historical:
-            lines.append(f"=== HISTORICO AGREGADO ({len(historical)} entradas) ===")
-            lines.extend(self._aggregate_entries(historical))
-
-        section_label = (
-            f"=== ACTIVIDAD RECIENTE — ultimos 60s ({len(recent)} entradas) ==="
-            if historical
-            else f"=== LOGS ({len(recent)} entradas) ==="
-        )
-        lines.append(section_label)
-        for log in recent:
+        tail_size = min(50, len(sorted_logs))
+        tail = sorted_logs[-tail_size:]
+        lines.append(f"\n=== ULTIMAS {tail_size} ENTRADAS (actividad mas reciente) ===")
+        for log in tail:
             ts = log.get("timestamp", "?")
             container = log.get("labels", {}).get("container_name", "?")
             msg = log.get("message", "").strip()
