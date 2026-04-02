@@ -1,0 +1,173 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Contenedor atacante: Kali Linux con herramientas de pentesting.
+  # El agente atacante ejecuta comandos aqui via Docker SDK (docker exec).
+  # ---------------------------------------------------------------------------
+  attacker:
+    build:
+      context: ./attacker
+    container_name: attacker
+    hostname: attacker
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.5
+    cap_add:
+      - NET_RAW      # Necesario para nmap SYN scan
+      - NET_ADMIN    # Necesario para manipulacion de red
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ---------------------------------------------------------------------------
+  # DVWA (Damn Vulnerable Web Application): target principal.
+  # Aplicacion web con vulnerabilidades configurables (SQLi, XSS, command
+  # injection, file inclusion, etc). Genera logs de Apache y MySQL que el
+  # observador analiza.
+  # ---------------------------------------------------------------------------
+  dvwa:
+    image: vulnerables/web-dvwa
+    container_name: dvwa
+    hostname: dvwa
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.10
+      monitor_net:
+    depends_on:
+      - loki
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "dvwa"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Mr. Robot: target WordPress simulado para el escenario mrrobot.
+  # Replica los elementos clave del VulnHub Mr. Robot:1 CTF.
+  # Accesible en attack_net 10.10.0.20 para el agente atacante.
+  # ---------------------------------------------------------------------------
+  mrrobot:
+    build:
+      context: ./mrrobot
+    container_name: mrrobot
+    hostname: mrrobot
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.20
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "mrrobot"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Loki: sistema de agregacion de logs. Modo monolitico (single binary).
+  # Recibe logs via HTTP push API. El observador consulta via LogQL.
+  # Usa ~200MB RAM vs ~3GB de Elasticsearch.
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.4.2
+    container_name: loki
+    hostname: loki
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./logging/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    networks:
+      monitor_net:
+        ipv4_address: 10.10.1.10
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Promtail: recolector de logs que lee los archivos de log de Docker
+  # y los envia a Loki. Se monta el socket de Docker para autodiscovery
+  # de containers.
+  # ---------------------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:3.4.2
+    container_name: promtail
+    hostname: promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./logging/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      monitor_net:
+    depends_on:
+      - loki
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ---------------------------------------------------------------------------
+  # Grafana: dashboard de visualizacion. Datasource Loki pre-provisionado.
+  # Accesible en http://localhost:3000 (admin/admin).
+  # Util para debug visual y para el dashboard de la tesis.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: grafana
+    hostname: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./logging/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      monitor_net:
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+networks:
+  # Red de ataque: conecta el atacante con los targets.
+  # El atacante solo ve esta red (no ve la infra de monitoring).
+  attack_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.0.0/24
+
+  # Red de monitoring: conecta targets con Loki/Grafana.
+  # Los targets estan en ambas redes para que sus logs lleguen a Loki.
+  monitor_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+
+volumes:
+  loki_data:
+  grafana_data:
