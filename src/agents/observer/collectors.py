@@ -62,46 +62,18 @@ class LogCollector:
         logger.info(f"[Observador] Logs recolectados: {len(filtered)} (de {len(logs)} total)")
         return filtered
 
-    def summarize_logs(self, logs: list[dict], max_entries: int = 50) -> str:
-        """
-        Resume logs para que quepan en el contexto del LLM.
-
-        Prioriza entradas que parecen relevantes para deteccion de ataques
-        (errores, logins, conexiones, etc.) sobre entradas rutinarias.
-        """
+    def summarize_logs(self, logs: list[dict]) -> str:
+        """Formatea todos los logs de la ventana en orden cronologico para el LLM."""
         if not logs:
             return "No se encontraron logs nuevos en la ventana temporal."
 
-        # Priorizar logs que parecen relevantes
-        priority_keywords = [
-            "wp-login.php", "xmlrpc.php", "wp-admin",
-            "Invalid username", "authentication failure",
-            "401", "403", "404",
-            "' or", "1=1", "union select", "sleep(",
-            "shell.php", "cmd=", "/uploads/",
-            "/etc/passwd", "suid", "python3 -c", "/root/",
-            "robots.txt",
-        ]
-
-        def relevance_score(log: dict) -> int:
-            msg = log.get("message", "").lower()
-            return sum(1 for kw in priority_keywords if kw in msg)
-
-        # Primero por timestamp descendente (recientes primero), luego sort estable
-        # por relevancia descendente: logs recientes de alta relevancia quedan arriba,
-        # desplazando el ruido residual de tacticas anteriores (ej. nikto scan).
-        logs_by_recency = sorted(logs, key=lambda l: l.get("timestamp", ""), reverse=True)
-        logs_sorted = sorted(logs_by_recency, key=lambda l: -relevance_score(l))
-        selected = logs_sorted[:max_entries]
-        # Re-ordenar cronologicamente para presentacion al LLM
-        selected.sort(key=lambda l: l.get("timestamp", ""))
+        selected = sorted(logs, key=lambda l: l.get("timestamp", ""))
 
         lines = []
         for log in selected:
             ts = log.get("timestamp", "?")
             container = log.get("labels", {}).get("container_name", "?")
             msg = log.get("message", "").strip()
-            # Truncar mensajes largos
             if len(msg) > 300:
                 msg = msg[:300] + "..."
             lines.append(f"[{ts}] [{container}] {msg}")
