@@ -36,7 +36,7 @@ class LokiClient:
         query: str,
         start: datetime | None = None,
         end: datetime | None = None,
-        limit: int = 1000,
+        limit: int = 5000,
     ) -> list[dict]:
         """
         Ejecuta una query LogQL sobre un rango temporal.
@@ -58,7 +58,7 @@ class LokiClient:
             "start": self._to_nano(start),
             "end": self._to_nano(end),
             "limit": limit,
-            "direction": "forward",
+            "direction": "backward",
         }
 
         try:

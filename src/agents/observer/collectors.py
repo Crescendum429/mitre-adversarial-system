@@ -46,7 +46,6 @@ class LogCollector:
             query='{job="docker"}',
             start=start,
             end=end,
-            limit=1000,
         )
 
         # Filtrar: solo logs de containers target (excluir infra y atacante)
