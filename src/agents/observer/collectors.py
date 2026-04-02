@@ -97,7 +97,21 @@ class LogCollector:
         return "\n".join(lines)
 
     def _aggregate_entries(self, logs: list[dict]) -> list[str]:
-        """Agrupa logs repetitivos por patron (container, ip, method, path_base, status)."""
+        """
+        Agrega logs por patron. Distingue dos categorias:
+        - Patrones relevantes (status 200/302/500 o path con keywords de ataque):
+          se muestran individualmente, max 150.
+        - Ruido de scan (404/403 en rutas sin keywords): se colapsa en una sola
+          linea por (container, ip, status) indicando conteo y paths unicos.
+
+        Esto reduce miles de requests de nikto/gobuster a un puñado de lineas.
+        """
+        _ATTACK_PATH_KWS = {
+            "shell", "cmd", "exec", "admin", "login", "wp-", "passwd",
+            "shadow", "upload", "config", "include", "backup", "phpmyadmin",
+        }
+        _INTERESTING_STATUSES = {"200", "302", "500", "401"}
+
         groups: dict[tuple, dict] = {}
 
         for log in logs:
@@ -120,15 +134,48 @@ class LogCollector:
             if ts > g["last"]:
                 g["last"] = ts
 
-        lines = []
+        def is_relevant(container, ip, method, path, status):
+            if status in _INTERESTING_STATUSES:
+                return True
+            path_l = path.lower()
+            return any(kw in path_l for kw in _ATTACK_PATH_KWS)
+
+        relevant_lines = []
+        scan_noise: dict[tuple, dict] = {}  # (container, ip, status) -> {requests, paths}
+
         for (container, ip, method, path, status), g in groups.items():
+            if method and not is_relevant(container, ip, method, path, status):
+                nkey = (container, ip, status)
+                if nkey not in scan_noise:
+                    scan_noise[nkey] = {"requests": 0, "paths": 0,
+                                        "first": g["first"], "last": g["last"]}
+                n = scan_noise[nkey]
+                n["requests"] += g["count"]
+                n["paths"] += 1
+                if g["last"] > n["last"]:
+                    n["last"] = g["last"]
+                continue
+
             count = g["count"]
             t1 = g["first"][11:19] if len(g["first"]) >= 19 else g["first"]
             t2 = g["last"][11:19] if len(g["last"]) >= 19 else g["last"]
             suffix = f"  x{count} ({t1}-{t2})" if count > 1 else f"  ({t1})"
             if method:
-                lines.append(f"[{container}] {ip} {method} {path} -> {status}{suffix}")
+                relevant_lines.append(f"[{container}] {ip} {method} {path} -> {status}{suffix}")
             else:
-                lines.append(f"[{container}] {path}{suffix}")
+                relevant_lines.append(f"[{container}] {path}{suffix}")
+
+        # Cap relevant lines para casos extremos
+        lines = relevant_lines[:150]
+        if len(relevant_lines) > 150:
+            lines.append(f"... y {len(relevant_lines) - 150} patrones relevantes adicionales")
+
+        for (container, ip, status), n in scan_noise.items():
+            t1 = n["first"][11:19] if len(n["first"]) >= 19 else n["first"]
+            t2 = n["last"][11:19] if len(n["last"]) >= 19 else n["last"]
+            lines.append(
+                f"[{container}] {ip} scan -> {status}  "
+                f"x{n['requests']} requests ({n['paths']} rutas unicas, {t1}-{t2})"
+            )
 
         return lines

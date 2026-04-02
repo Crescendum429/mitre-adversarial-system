@@ -81,8 +81,10 @@ class DockerClient:
 
         try:
             # exec_run retorna (exit_code, output). demux=True separa stdout/stderr.
+            # Docker SDK exec_run no tiene parametro timeout; se aplica via
+            # el binario timeout(1) de coreutils para cortar comandos lentos.
             exit_code, output = container.exec_run(
-                cmd=["bash", "-c", command],
+                cmd=["timeout", str(timeout), "bash", "-c", command],
                 demux=True,
                 environment={"TERM": "dumb"},
             )
