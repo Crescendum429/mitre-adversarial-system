@@ -107,13 +107,16 @@ Si no hay evidencia de ataque, usa:
 CLASSIFICATION_PROMPT = """SENALES PRE-CALCULADAS (sin LLM):
 {signals}
 
-LOGS DEL PERIODO ANALIZADO:
+LOGS DEL PERIODO ANALIZADO (orden cronologico — los ultimos son los mas recientes):
 {logs}
 
 CLASIFICACIONES PREVIAS (contexto del ataque):
 {history}
 
-Examina los logs del periodo y determina que tacticas MITRE ATT&CK se ejecutaron. \
+Los logs estan ordenados de mas antiguo a mas reciente. \
+Las entradas al FINAL de la lista representan la actividad MAS RECIENTE y determinan \
+la tactica ACTUAL (current_tactic). Las entradas anteriores del mismo periodo pueden \
+representar fases previas del ataque que ya ocurrieron (tactics_in_window). \
 Prioriza la evidencia directa en los logs sobre las clasificaciones previas. \
 Responde SOLO con JSON."""
 
