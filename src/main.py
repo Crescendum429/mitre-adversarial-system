@@ -12,6 +12,20 @@ El flujo es:
 Los dos agentes corren en threads separados y no se comunican entre si.
 El unico punto de contacto es indirecto: el atacante genera actividad que
 produce logs, y el observador lee esos logs de Loki.
+
+---
+Uso de herramientas de IA en el desarrollo:
+
+Este sistema es un proyecto de tesis desarrollado por Jesus Alarcon bajo
+supervision del tutor Roberto Andrade (USFQ, 2026). A lo largo del desarrollo
+se usaron herramientas de IA generativa (Claude Code, ChatGPT) como apoyo en
+tareas especificas: depuracion de errores, revision de fragmentos de codigo,
+busqueda de referencias academicas y redaccion tecnica.
+
+El diseno de la arquitectura, la formulacion de la pregunta de investigacion,
+la seleccion del stack tecnologico, la definicion de las metricas de evaluacion
+y la validacion experimental son trabajo original del autor. El uso de IA fue
+un apoyo puntual, no el motor del proyecto.
 """
 
 import argparse

@@ -30,7 +30,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.agents.observer.collectors import LogCollector
 from src.agents.observer.prompts import OBSERVER_SYSTEM_PROMPT, build_classification_prompt
 from src.agents.observer.state import Classification, ObserverState
-from src.llm.provider import get_chat_model
+from src.llm.provider import get_observer_model
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def _get_collector():
 def _get_model():
     global _model
     if _model is None:
-        _model = get_chat_model()
+        _model = get_observer_model()
     return _model
 
 
