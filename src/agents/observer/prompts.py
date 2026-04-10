@@ -23,7 +23,9 @@ IMPORTANTE:
 REGLA CRITICA DE INTERPRETACION DE HTTP STATUS CODES:
 - GET/HEAD con status 404/403 a CUALQUIER ruta (incluso /shell.php, /wp-admin, /cmd.php) = \
 escaneo automatico = RECONNAISSANCE. El recurso no existe. NO es Execution.
-- GET con status 200/302 a rutas sensibles = acceso real al recurso.
+- GET con status 302 a /wp-admin/ o /wp-login.php = redireccion estructural de WordPress. \
+El scanner encontro que la ruta existe, NO que el atacante accedio. Es RECONNAISSANCE.
+- UNICAMENTE POST con status 302 a /wp-login.php = login exitoso = Initial Access.
 - POST con cualquier status = interaccion activa (intento de login, envio de formulario).
 - Webshell con status 200 = Execution. Webshell con status 200 y cmd=uname/whoami/id = Discovery.
 - Volumen masivo de 404s de una sola IP = herramienta de escaneo (nikto, gobuster) = Reconnaissance.
@@ -132,10 +134,14 @@ INSTRUCCIONES DE ANALISIS:
 2. Si los eventos notables muestran solo GET a paginas generales (robots.txt, login page) con 200, \
    y no hay POSTs exitosos ni webshell activa, la tactica mas probable es Reconnaissance.
 3. Un volumen masivo de 404s con pocos o ningun evento notable = Reconnaissance activo.
-4. Si hay POST a wp-login.php con 302 = Initial Access exitoso.
+4. Si hay POST a wp-login.php con 302 = Initial Access exitoso. GET a wp-login.php/wp-admin/ \
+   con cualquier status = solo Reconnaissance (el scanner encontro la pagina).
 5. Si hay GET a una ruta de webshell (?cmd=) con 200 = Execution o Discovery segun el comando.
 6. Las entradas al FINAL de las "ULTIMAS ENTRADAS CRONOLOGICAS" son la actividad MAS RECIENTE.
 7. Prioriza evidencia directa en los logs sobre clasificaciones previas.
+8. REGLA DE PROGRESION: Los ataques NO retroceden. Si en CLASIFICACIONES PREVIAS ya se confirmo \
+   webshell_execution (Execution/Discovery) o login_success (Initial Access), la tactica actual \
+   no puede ser Reconnaissance. Si ya se vio Execution, la tactica actual es como minimo Execution.
 Responde SOLO con JSON."""
 
 

@@ -139,7 +139,10 @@ def triage_anomalies(state: ObserverState) -> dict:
     ip_404_sizes: dict[str, set] = {}
 
     signals_found: list[str] = []
-    anomaly_count = 0
+    # IPs con tool UA detectado (evita doble conteo en loop por-log)
+    tool_ips: dict[str, str] = {}  # ip -> tool_name
+    post_auth_count = 0
+    webshell_active = False
 
     for log in raw_logs:
         msg = log.get("message", "")
@@ -173,28 +176,35 @@ def triage_anomalies(state: ObserverState) -> dict:
             if body_size.isdigit():
                 ip_404_sizes[ip].add(body_size)
 
-        # Senal 1: user-agent de herramienta de ataque
-        if any(tool in user_agent for tool in _ATTACK_TOOL_UAS):
-            tool_name = next(t for t in _ATTACK_TOOL_UAS if t in user_agent)
-            signals_found.append(f"tool UA: {tool_name} desde {ip}")
-            anomaly_count += ip_total[ip]
+        # Senal 1: user-agent de herramienta de ataque (marcar IP, no contar aqui)
+        if ip not in tool_ips:
+            for tool in _ATTACK_TOOL_UAS:
+                if tool in user_agent:
+                    tool_ips[ip] = tool
+                    break
 
         # Senal 4: POST a ruta de autenticacion
         if method == "POST" and any(p in url for p in _SENSITIVE_POST_PATHS):
-            signals_found.append(f"POST auth: {url[:50]} desde {ip}")
-            anomaly_count += 1
+            post_auth_count += 1
 
         # Senal 5: webshell activa
         if status.startswith("2") and ("cmd=" in url or "cmd%3" in url or "cmd%20" in url):
-            signals_found.append(f"webshell activa: {url[:60]} -> {status}")
-            anomaly_count += 10  # alta prioridad
+            webshell_active = True
+
+    # Calcular anomaly_count como requests de IPs sospechosas (acotado por total)
+    suspicious_ips: set[str] = set()
+
+    # Senal 1: tool UA
+    for ip, tool_name in tool_ips.items():
+        signals_found.append(f"tool UA: {tool_name} desde {ip}")
+        suspicious_ips.add(ip)
 
     # Senal 2: parallelismo por segundo
     for ip, sec_counts in ip_per_second.items():
         max_per_sec = max(sec_counts.values())
         if max_per_sec >= _MAX_REQUESTS_PER_SECOND:
             signals_found.append(f"IP {ip}: {max_per_sec} req/s (herramienta automatizada)")
-            anomaly_count = max(anomaly_count, ip_total[ip])
+            suspicious_ips.add(ip)
 
     # Senal 3: alta tasa 404
     for ip, count_404 in ip_404.items():
@@ -203,7 +213,15 @@ def triage_anomalies(state: ObserverState) -> dict:
             signals_found.append(
                 f"IP {ip}: {count_404}/{total} 404s ({count_404/total:.0%}) — enumeracion"
             )
-            anomaly_count = max(anomaly_count, count_404)
+            suspicious_ips.add(ip)
+
+    # Senal 4: POST a autenticacion
+    if post_auth_count > 0:
+        signals_found.append(f"POST auth: {post_auth_count} intentos")
+
+    # Senal 5: webshell activa
+    if webshell_active:
+        signals_found.append("webshell activa detectada")
 
     # Senal 6: nikto camuflado — 404s con body size uniforme y alto volumen
     for ip, sizes in ip_404_sizes.items():
@@ -212,7 +230,11 @@ def triage_anomalies(state: ObserverState) -> dict:
             signals_found.append(
                 f"IP {ip}: {count_404} 404s con body size uniforme {sizes} — posible nikto"
             )
-            anomaly_count = max(anomaly_count, count_404)
+            suspicious_ips.add(ip)
+
+    # anomaly_count = requests de IPs sospechosas, acotado por total de logs
+    anomaly_count = sum(ip_total[ip] for ip in suspicious_ips)
+    anomaly_count = min(anomaly_count, len(raw_logs))
 
     # Deduplicar senales
     signals_found = list(dict.fromkeys(signals_found))

@@ -134,7 +134,7 @@ class LogCollector:
             method, url, status = m.group(2), m.group(3).lower(), m.group(4)
             if method == "POST":
                 notable.append(log)
-            elif status in _HIGH_SIGNAL_STATUSES:
+            elif status in {"401", "500"}:
                 notable.append(log)
             elif status == "200" and any(kw in url for kw in _EXECUTION_KWS):
                 # Webshell or RCE endpoint returning 200 — high signal
@@ -189,8 +189,13 @@ class LogCollector:
             # POST = actual interaction (login attempt, form submission)
             if method == "POST":
                 return True
-            # Redirect (login success), auth challenge, server error = meaningful
-            if status in {"302", "401", "500"}:
+            # GET→302 = structural WordPress redirect (wp-admin/ → wp-login.php).
+            # A scanner finding this redirect is not evidence of access — it's just discovery
+            # that the path exists. Only POST→302 (already handled above) = login success.
+            if status == "302":
+                return False
+            # Auth challenge, server error = meaningful
+            if status in {"401", "500"}:
                 return True
             # GET 200 to execution-specific paths = webshell/RCE active
             if status == "200":
