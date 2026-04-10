@@ -89,13 +89,17 @@ class DockerClient:
                 environment={"TERM": "dumb"},
             )
 
-            stdout = output[0].decode("utf-8", errors="replace") if output[0] else ""
-            stderr = output[1].decode("utf-8", errors="replace") if output[1] else ""
+            stdout_full = output[0].decode("utf-8", errors="replace") if output[0] else ""
+            stderr_full = output[1].decode("utf-8", errors="replace") if output[1] else ""
 
-            # Truncar output excesivo para no saturar el contexto del LLM
+            # Truncar output excesivo para no saturar el contexto del LLM.
+            # El output completo se conserva en stdout_full para el display.
             max_output = 8000
-            if len(stdout) > max_output:
-                stdout = stdout[:max_output] + f"\n... [truncado, {len(stdout)} chars total]"
+            if len(stdout_full) > max_output:
+                stdout = stdout_full[:max_output] + f"\n... [truncado, {len(stdout_full)} chars total]"
+            else:
+                stdout = stdout_full
+            stderr = stderr_full
 
             result = ExecResult(
                 exit_code=exit_code,
@@ -105,12 +109,14 @@ class DockerClient:
                 container=container_name,
             )
 
-            logger.info(f"[{container_name}] Exit code: {exit_code}, output: {len(stdout)} chars")
+            logger.info(f"[{container_name}] Exit code: {exit_code}, output: {len(stdout_full)} chars")
 
             if os.getenv("SHOW_TOOL_OUTPUT"):
-                output_to_show = stdout.strip() or stderr.strip()
+                # Imprimir el output COMPLETO sin truncar (para visualizacion humana).
+                # El LLM sigue recibiendo la version truncada via ExecResult.stdout.
+                output_to_show = stdout_full.strip() or stderr_full.strip()
                 if output_to_show:
-                    logger.info(f"[{container_name}] ↓↓↓ OUTPUT ↓↓↓\n{output_to_show}")
+                    logger.info(f"[{container_name}] ↓↓↓ OUTPUT ({len(stdout_full)} chars) ↓↓↓\n{output_to_show}")
 
             return result
 

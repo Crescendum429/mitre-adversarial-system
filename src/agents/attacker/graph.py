@@ -2,26 +2,30 @@
 Compilacion del grafo LangGraph del agente atacante.
 
 Este modulo conecta los nodos definidos en nodes.py con edges que definen
-el flujo de ejecucion. El grafo resultante implementa el patron ReAct:
-  razonar -> actuar -> observar -> razonar -> ...
-
-El grafo se compila una vez y se puede ejecutar multiples veces con diferentes
-estados iniciales (diferentes escenarios de ataque).
+el flujo de ejecucion. El grafo implementa ReAct con validacion objetiva:
+  razonar -> actuar -> observar -> validar -> avanzar / replanear
 
 Estructura del grafo:
 
-  START --> plan_tactic --> execute_tools --> validate_result --+
-                ^                                              |
-                |                                              v
-                +---- [has tool_calls] ---------- [routing] ---+
-                |                                              |
-                +---- [no tool_calls]                          |
-                |                                              v
-                +------ plan_tactic <---- [not finished] -- advance_tactic
-                                                               |
-                                                          [finished]
-                                                               |
-                                                              END
+  START --> plan_tactic --> execute_tools --> validate_result
+                ^                                   |
+                |                      [tool_calls] |
+                |                                   |
+                |                   +--- execute_tools (loop)
+                |                   |
+                |                   v
+                |            check_objective
+                |                   |
+                |       [no cumplido] +--> plan_tactic (replan con feedback)
+                |                   |
+                |       [cumplido]   v
+                +------------- advance_tactic
+                                    |
+                              [mas tacticas] --> plan_tactic
+                                    |
+                              [finalizado]
+                                    v
+                                   END
 """
 
 import logging
@@ -30,8 +34,10 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agents.attacker.nodes import (
     advance_tactic,
+    check_objective,
     execute_tools,
     plan_tactic,
+    should_advance,
     should_continue,
     should_loop,
     validate_result,
@@ -45,9 +51,8 @@ logger = logging.getLogger(__name__)
 
 def build_attacker_graph() -> StateGraph:
     """
-    Construye y compila el grafo del agente atacante.
-
-    Retorna un grafo compilado listo para .invoke() o .stream().
+    Construye y compila el grafo del agente atacante con validacion
+    objetiva por tactica.
     """
     graph = StateGraph(AttackerState)
 
@@ -55,6 +60,7 @@ def build_attacker_graph() -> StateGraph:
     graph.add_node("plan_tactic", plan_tactic)
     graph.add_node("execute_tools", execute_tools)
     graph.add_node("validate_result", validate_result)
+    graph.add_node("check_objective", check_objective)
     graph.add_node("advance_tactic", advance_tactic)
 
     # Edges fijos
@@ -62,21 +68,33 @@ def build_attacker_graph() -> StateGraph:
     graph.add_edge("plan_tactic", "execute_tools")
     graph.add_edge("execute_tools", "validate_result")
 
-    # Routing condicional despues de validate_result:
-    # Si el LLM emitio tool_calls -> volver a execute_tools
-    # Si no -> ir a advance_tactic
+    # Routing despues de validate_result:
+    #   tool_calls -> loop a execute_tools
+    #   no tool_calls -> check_objective
     graph.add_conditional_edges(
         "validate_result",
         should_continue,
         {
             "execute_tools": "execute_tools",
-            "advance_tactic": "advance_tactic",
+            "check_objective": "check_objective",
         },
     )
 
-    # Routing condicional despues de advance_tactic:
-    # Si hay mas tacticas -> plan_tactic
-    # Si no -> END
+    # Routing despues de check_objective:
+    #   objetivo cumplido (o intentos agotados) -> advance_tactic
+    #   objetivo pendiente -> plan_tactic (replan con feedback)
+    graph.add_conditional_edges(
+        "check_objective",
+        should_advance,
+        {
+            "advance_tactic": "advance_tactic",
+            "plan_tactic": "plan_tactic",
+        },
+    )
+
+    # Routing despues de advance_tactic:
+    #   hay mas tacticas -> plan_tactic
+    #   no -> END
     graph.add_conditional_edges(
         "advance_tactic",
         should_loop,
@@ -111,8 +129,13 @@ def create_initial_state(
         current_tactic=tactics[0] if tactics else "",
         current_tactic_index=0,
         actions_in_current_tactic=0,
+        attempts_per_tactic={},
         collected_data={},
         action_history=[],
+        tactic_evidence={},
+        tactic_objective_met={},
+        objective_feedback="",
+        flags_found=[],
         planned_action=None,
         tactic_complete=False,
         attack_finished=False,

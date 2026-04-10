@@ -34,8 +34,12 @@ class AttackerState(TypedDict, total=False):
     """
     Estado completo del agente atacante.
 
-    Este estado viaja entre los 4 nodos del grafo:
-      plan_tactic -> execute_action -> validate_result -> advance_tactic
+    Este estado viaja entre los nodos del grafo:
+      plan_tactic -> execute_tools -> validate_result -> check_objective
+                                                              |
+                                            [objetivo cumplido] +-> advance_tactic
+                                                              |
+                                            [objetivo pendiente] +-> plan_tactic (replan)
 
     El campo messages se usa para la interaccion con el LLM (patron ReAct).
     El campo action_history acumula las acciones ejecutadas para ground truth.
@@ -49,10 +53,19 @@ class AttackerState(TypedDict, total=False):
     current_tactic: str
     current_tactic_index: int
     actions_in_current_tactic: int
+    attempts_per_tactic: dict  # tactic -> intentos de replanificacion
 
     # Datos acumulados durante el ataque
     collected_data: dict
     action_history: list[dict]
+    # Evidencia concreta extraida por validadores de objetivos
+    tactic_evidence: dict  # tactic -> {key: value, ...}
+    # Estado de cumplimiento de objetivos
+    tactic_objective_met: dict  # tactic -> bool
+    # Razon por la que el ultimo check de objetivo fallo
+    objective_feedback: str
+    # Flags/keys capturados durante el ataque
+    flags_found: list
 
     # Accion en curso (decidida por el LLM, ejecutada por el executor)
     planned_action: dict | None

