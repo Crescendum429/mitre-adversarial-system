@@ -124,10 +124,20 @@ def create_observer_state(
     window_minutes: int = 5,
     history: list | None = None,
     suspect_list: dict | None = None,
+    simulation_start: datetime | None = None,
 ) -> ObserverState:
-    """Crea el estado inicial para una ejecucion del observador."""
+    """
+    Crea el estado inicial para una ejecucion del observador.
+
+    Si se pasa simulation_start, el window_start se clamp a ese tiempo para
+    evitar que logs de corridas anteriores contaminen el analisis.
+    """
     now = datetime.now(timezone.utc)
     start = now - timedelta(minutes=window_minutes)
+
+    # Clamp: no mirar logs anteriores al inicio de la simulacion
+    if simulation_start is not None and start < simulation_start:
+        start = simulation_start
 
     return ObserverState(
         window_start=start.isoformat(),

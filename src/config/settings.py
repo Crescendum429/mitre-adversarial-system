@@ -25,9 +25,12 @@ class Settings(BaseSettings):
     llm_provider: LLMProvider = LLMProvider.OPENAI
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1"
-    observer_model: str = "gpt-4o-mini"
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-5-20250929"
+    # Observer puede usar un proveedor y modelo distintos al agente principal
+    # (p.ej. atacante=openai/gpt-4.1, observer=anthropic/claude-sonnet)
+    observer_provider: LLMProvider | None = None
+    observer_model: str = "claude-sonnet-4-5-20250929"
     llm_temperature: float = 0.3
     llm_max_tokens: int = 4096
 

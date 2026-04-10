@@ -127,6 +127,7 @@ def run_observer_loop(
     stop_event: threading.Event,
     results: list,
     poll_interval: int | None = None,
+    simulation_start: datetime | None = None,
 ):
     """
     Loop del observador que se ejecuta en un thread separado.
@@ -135,6 +136,9 @@ def run_observer_loop(
     1. Crea un estado con la ventana temporal actual
     2. Ejecuta el grafo del observador
     3. Acumula la clasificacion en results
+
+    El parametro simulation_start evita que logs de corridas anteriores
+    contaminen las primeras ventanas de analisis.
 
     Se detiene cuando stop_event es seteado por el thread principal.
     """
@@ -151,11 +155,17 @@ def run_observer_loop(
                 window_minutes=max(3, interval // 60 + 2),
                 history=history,
                 suspect_list=suspect_list,
+                simulation_start=simulation_start,
             )
             result = graph.invoke(state)
 
             classification = result.get("current_classification")
-            if classification and classification.get("tactic") != "none":
+            triage_result = result.get("triage_result", "no_signal")
+
+            # SIEMPRE registrar un resultado por ciclo, aun cuando el triage
+            # corto circuito o el LLM no clasifico. Esto da visibilidad completa
+            # de cada ventana observada.
+            if classification:
                 tiw = classification.get("tactics_in_window", [])
                 if len(tiw) > 1:
                     names = ", ".join(t.get("tactic", "?") for t in tiw)
@@ -172,6 +182,32 @@ def run_observer_loop(
                 results.append(classification)
                 history = result.get("classification_history", history)
                 suspect_list = result.get("suspect_list", suspect_list)
+            else:
+                # Triage filtro la ventana (no_signal) o el LLM no produjo
+                # clasificacion. Registrar placeholder para que quede la
+                # evidencia del ciclo.
+                placeholder = {
+                    "tactic": "none",
+                    "tactic_id": "",
+                    "confidence": 1.0 if triage_result == "no_signal" else 0.0,
+                    "evidence": [],
+                    "reasoning": (
+                        f"Triage corto circuito ({triage_result}), "
+                        f"sin senales de ataque en la ventana."
+                        if triage_result == "no_signal"
+                        else "LLM no produjo clasificacion."
+                    ),
+                    "recommendation": "Continuar monitoreo normal.",
+                    "timestamp": state.get("window_end", ""),
+                    "window_start": state.get("window_start", ""),
+                    "window_end": state.get("window_end", ""),
+                    "tactics_in_window": [],
+                }
+                console.print(
+                    f"  [dim]Ventana sin actividad relevante "
+                    f"({triage_result}) — registrada como 'none'[/dim]"
+                )
+                results.append(placeholder)
 
         except Exception as e:
             logging.getLogger(__name__).error(f"Error en observador: {e}")
@@ -209,11 +245,12 @@ def compare_results(attacker_state: dict, observer_classifications: list):
     def _abbrev_list(tactics: list[str]) -> str:
         return ", ".join(_ABBREV.get(t.lower().replace(" ", "_"), t) for t in tactics)
 
-    table = Table(title="Resultados: Ground Truth vs Clasificacion", expand=False)
+    table = Table(title="Resultados: Ground Truth vs Clasificacion", expand=True)
     table.add_column("Ventana", style="dim", no_wrap=True)
     table.add_column("Real (actual)", style="red", no_wrap=True)
-    table.add_column("Real (ventana)", style="dim red", max_width=36)
-    table.add_column("Obs (actual)", style="blue", max_width=16)
+    table.add_column("Real (ventana)", style="dim red", overflow="fold", min_width=20)
+    table.add_column("Obs (actual)", style="blue", no_wrap=True)
+    table.add_column("Obs (ventana)", style="dim blue", overflow="fold", min_width=20)
     table.add_column("Conf", justify="right", no_wrap=True)
     table.add_column("Match", justify="center", no_wrap=True)
 
@@ -224,6 +261,8 @@ def compare_results(attacker_state: dict, observer_classifications: list):
     ]
 
     strict_correct = 0
+    window_correct = 0
+    evaluable = 0  # ventanas con ground truth real (excluye pre-ataque sin tacticas)
 
     for cls in observer_classifications:
         real_in_window = _real_tactics_in_window(
@@ -233,36 +272,86 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         )
 
         observed_current = cls.get("tactic", "?")
+        observed_in_window = [
+            t.get("tactic", "") for t in cls.get("tactics_in_window", [])
+        ]
+        if not observed_in_window and observed_current and observed_current != "none":
+            observed_in_window = [observed_current]
+
         # La tactica "actual" real es la ultima ejecutada en la ventana
         last_real = real_in_window[-1] if real_in_window else "unknown"
+        is_pre_attack = last_real in ("unknown", "")
+        is_none_obs = observed_current == "none"
 
-        real_current_abbrev = _ABBREV.get(last_real.lower().replace(" ", "_"), last_real)
-        real_window_abbrev = _abbrev_list(real_in_window[:-1]) if len(real_in_window) > 1 else ""
-        obs_abbrev = _ABBREV.get(observed_current.lower().replace(" ", "_"), observed_current)
+        real_current_abbrev = (
+            "-" if is_pre_attack else _ABBREV.get(last_real.lower().replace(" ", "_"), last_real)
+        )
+        real_window_abbrev = (
+            _abbrev_list(real_in_window[:-1]) if len(real_in_window) > 1 else ""
+        )
+        obs_abbrev = (
+            "-" if is_none_obs else _ABBREV.get(observed_current.lower().replace(" ", "_"), observed_current)
+        )
+        # Tacticas detectadas en ventana excluyendo la "actual" para evitar redundancia
+        obs_window_list = [
+            t for t in observed_in_window if not _tactics_match(t, observed_current)
+        ]
+        obs_window_abbrev = _abbrev_list(obs_window_list) if obs_window_list else ""
 
-        # Match estricto: obs (actual) debe coincidir con la ultima tactica real
-        strict_ok = _tactics_match(last_real, observed_current)
-        if strict_ok:
-            strict_correct += 1
-
-        match_style = "green" if strict_ok else "red"
-        match_label = "OK" if strict_ok else "MISS"
+        # Ventanas pre-ataque (sin ground truth) y "none" cuando no hay actividad real
+        # son correctas por definicion: no hay nada que clasificar.
+        if is_pre_attack:
+            strict_ok = is_none_obs
+            window_ok = is_none_obs
+            match_label = "N/A" if is_none_obs else "FP"
+            match_style = "dim" if is_none_obs else "yellow"
+        else:
+            evaluable += 1
+            strict_ok = _tactics_match(last_real, observed_current)
+            if strict_ok:
+                strict_correct += 1
+            # Match de ventana: todas las tacticas reales deben estar detectadas
+            window_ok = all(
+                any(_tactics_match(rt, ot) for ot in observed_in_window)
+                for rt in real_in_window
+            )
+            if window_ok:
+                window_correct += 1
+            match_style = "green" if strict_ok else "red"
+            match_label = "OK" if strict_ok else "MISS"
 
         table.add_row(
             cls.get("timestamp", "")[:19],
             real_current_abbrev,
             real_window_abbrev,
             obs_abbrev,
+            obs_window_abbrev,
             f"{cls.get('confidence', 0):.0%}",
             f"[{match_style}]{match_label}[/{match_style}]",
         )
 
     console.print(table)
     console.print("[dim]Match estricto: Obs(actual) == ultima tactica real en ventana[/dim]")
+    console.print("[dim]Match ventana: todas las tacticas reales presentes en Obs(ventana)[/dim]")
+    console.print("[dim]N/A = ventana pre-ataque sin ground truth | FP = falso positivo[/dim]")
 
     if observer_classifications:
         total = len(observer_classifications)
-        console.print(f"\nAccuracy (estricta): {strict_correct}/{total} ({strict_correct/total:.0%})")
+        console.print(
+            f"\nVentanas totales registradas: {total} "
+            f"(evaluables con ground truth: {evaluable})"
+        )
+        if evaluable > 0:
+            console.print(
+                f"Accuracy actual (estricta): {strict_correct}/{evaluable} "
+                f"({strict_correct/evaluable:.0%})"
+            )
+            console.print(
+                f"Accuracy ventana (tacticas completas): {window_correct}/{evaluable} "
+                f"({window_correct/evaluable:.0%})"
+            )
+        else:
+            console.print("No hay ventanas evaluables.")
 
 
 def _real_tactics_in_window(window_start: str, window_end: str, timeline: list[dict]) -> list[str]:
@@ -296,14 +385,20 @@ def _window_midpoint(cls: dict) -> str:
 
 
 def _find_closest_tactic(timestamp: str, timeline: list[dict]) -> str:
-    """Encuentra la tactica del atacante mas cercana a un timestamp dado."""
+    """
+    Encuentra la tactica del atacante activa antes de un timestamp dado.
+
+    Retorna "unknown" si el timestamp es anterior a cualquier accion del
+    atacante (ventana pre-ataque).
+    """
     if not timeline or not timestamp:
         return "unknown"
-    # Buscar la ultima accion del atacante antes del timestamp del observador
-    closest = timeline[0]["tactic"]
+    closest = "unknown"
     for entry in timeline:
         if entry["timestamp"] <= timestamp:
             closest = entry["tactic"]
+        else:
+            break
     return closest
 
 
@@ -390,10 +485,14 @@ def main():
     observer_results = []
     stop_event = threading.Event()
 
+    # Timestamp de inicio de esta simulacion: el observador no debe mirar logs
+    # anteriores a este punto (evita contaminacion de corridas previas).
+    simulation_start = datetime.now(timezone.utc)
+
     # Iniciar observador en thread separado
     observer_thread = threading.Thread(
         target=run_observer_loop,
-        args=(stop_event, observer_results, args.observer_interval),
+        args=(stop_event, observer_results, args.observer_interval, simulation_start),
         daemon=True,
     )
     observer_thread.start()

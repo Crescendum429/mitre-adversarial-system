@@ -24,6 +24,7 @@ import logging
 import re
 from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -59,15 +60,34 @@ _TRIAGE_LOG_RE = re.compile(
     r'"(\w+)\s+(\S+)\s+HTTP/[^"]+"\s+(\d{3})\s+(\d+|-)\s+"[^"]*"\s+"([^"]*)"'
 )
 
-# User-agents de herramientas de ataque que aparecen literalmente en logs
-_ATTACK_TOOL_UAS = ("gobuster", "wpscan", "sqlmap", "nikto", "masscan", "nessus",
-                    "burpsuite", "zaproxy", "hydra")
+# Firmas literales que SI aparecen en logs Apache reales. Verificado empiricamente:
+# - gobuster default UA: "gobuster/3.8.2"
+# - wpscan default UA: "WPScan v3.8.28 (https://wpscan.com/wordpress-security-scanner)"
+# - nmap NSE default UA: "Mozilla/5.0 (compatible; Nmap Scripting Engine; ...)"
+# - curl (utilidad del atacante): "curl/8.19.0"
+# NO incluye: nikto (randomiza UAs de navegadores reales), sqlmap/burp/zap/hydra (no usados)
+_TOOL_UA_SIGNATURES = {
+    "gobuster": "gobuster",
+    "wpscan": "wpscan",
+    "nmap_nse": "nmap scripting engine",
+    "curl": "curl/",
+}
+
+# Metodos HTTP estandar. Cualquier metodo fuera de este set es un scanner.
+# Nikto envia metodos aleatorios: PROPFIND, TRACK, TRACE, SEARCH, LVIG, XGFU, DEBUG, etc.
+_STANDARD_HTTP_METHODS = frozenset({"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "PATCH"})
 
 # Rutas sensibles para POST (autenticacion)
 _SENSITIVE_POST_PATHS = ("/wp-login", "/login", "/admin", "/xmlrpc", "/wp-admin")
 
-# Una IP que genera >8 requests en el mismo segundo = herramienta automatizada
-_MAX_REQUESTS_PER_SECOND = 8
+# Shellshock signature en user-agent o URL: () { :; }; o () { _; }
+_SHELLSHOCK_RE = re.compile(r"\(\s*\)\s*\{\s*[:;_]")
+
+# Una IP que genera >5 requests en el mismo segundo = herramienta automatizada
+_MAX_REQUESTS_PER_SECOND = 5
+
+# Una IP con >5 UAs distintos = rotacion de UA (nikto)
+_UA_ROTATION_THRESHOLD = 5
 
 # Una IP con >15 requests totales en la ventana es sospechosa
 _TRIAGE_MIN_REQUESTS = 15
@@ -75,6 +95,128 @@ _TRIAGE_MIN_REQUESTS = 15
 # 404 ratio: si >40% de los requests de una IP son 404 y hay al menos 8 = scanner
 _TRIAGE_404_RATIO = 0.40
 _TRIAGE_404_MIN = 8
+
+
+# Patrones de comandos en webshell que indican sub-tacticas MITRE concretas.
+# El orden importa: el primer match determina la clasificacion. Se evalua contra
+# el valor decodificado del parametro ?cmd= de la webshell.
+# Privilege Escalation primero porque es mas especifico (usa sudo/suid).
+_CMD_PRIV_ESC_PATTERNS = [
+    r"\bsudo\b",
+    r"\bsu\s+\w",
+    r"-perm\s+-[u0]?=?[us4]",     # find -perm -u=s (SUID)
+    r"/etc/sudoers",
+    r"\bsuid\b",
+    r"\bgtfobins",
+    r"\bcapsh\b",
+    r"linpeas",
+    r"linux-exploit-suggester",
+    r"pkexec",
+    r"dirty(cow|pipe)",
+]
+_CMD_CRED_ACCESS_PATTERNS = [
+    r"/etc/shadow",
+    r"/etc/passwd",
+    r"\bpassword",
+    r"\.raw-md5",
+    r"\.md5",
+    r"hash",
+    r"credentials?",
+    r"id_rsa",
+    r"\.ssh/",
+    r"mimikatz",
+    r"\bsecrets?\b",
+    r"/root/\.",
+    r"/home/\w+/\.",
+    r"wp-config\.php",
+    r"\bdump\b",
+]
+_CMD_DISCOVERY_PATTERNS = [
+    r"\buname\b",
+    r"\bwhoami\b",
+    r"\bid\b",
+    r"\bhostname\b",
+    r"\bifconfig\b",
+    r"\bip\s+a",
+    r"\bnetstat\b",
+    r"\bps\s+[aux]",
+    r"\buptime\b",
+    r"\bls\b",
+    r"\bfind\b",
+    r"\bcat\s+/",
+    r"/proc/",
+    r"\benv\b",
+    r"lsb_release",
+    r"^\s*pwd",
+]
+_CMD_COLLECTION_PATTERNS = [
+    r"\btar\s",
+    r"\bzip\s",
+    r"\b7z\s",
+    r"\brar\s",
+    r"\bbase64\b.*\b/",
+]
+_CMD_EXFIL_PATTERNS = [
+    r"\bcurl\b.*\b(put|post)\b",
+    r"\bwget\b.*\b-O\b",
+    r"\bnc\s+.*\b\d+\b",
+    r"\bftp\b",
+]
+_CMD_IMPACT_PATTERNS = [
+    r"\brm\s+-rf",
+    r"\bdd\s+if=",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bmkfs",
+    r":\(\)\{",  # fork bomb
+]
+
+
+def classify_webshell_cmd(cmd: str) -> tuple[str, str]:
+    """
+    Mapea un comando ejecutado en webshell a la sub-tactica MITRE correspondiente.
+
+    El parametro cmd ya debe venir URL-decoded. Evalua patrones en orden de
+    especificidad: los mas especificos (Privilege Escalation, Credential Access)
+    primero, luego los mas generales (Discovery, Execution).
+
+    Returns: (tactica, tactic_id)
+    """
+    cmd_l = cmd.lower()
+    for pat in _CMD_PRIV_ESC_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Privilege Escalation", "TA0004")
+    for pat in _CMD_CRED_ACCESS_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Credential Access", "TA0006")
+    for pat in _CMD_IMPACT_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Impact", "TA0040")
+    for pat in _CMD_EXFIL_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Exfiltration", "TA0010")
+    for pat in _CMD_COLLECTION_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Collection", "TA0009")
+    for pat in _CMD_DISCOVERY_PATTERNS:
+        if re.search(pat, cmd_l):
+            return ("Discovery", "TA0007")
+    return ("Execution", "TA0002")
+
+
+def extract_webshell_cmd(url: str) -> str | None:
+    """
+    Extrae y decodifica el parametro ?cmd=... de una URL de webshell.
+
+    Retorna None si no hay cmd= en la URL.
+    """
+    match = re.search(r"[?&]cmd=([^&\s]+)", url)
+    if not match:
+        return None
+    try:
+        return unquote(match.group(1))
+    except Exception:
+        return match.group(1)
 
 
 def collect_logs(state: ObserverState) -> dict:
@@ -106,23 +248,36 @@ def collect_logs(state: ObserverState) -> dict:
 
 def triage_anomalies(state: ObserverState) -> dict:
     """
-    Nodo de triaje: heuristicas basadas en estructura real de logs Apache.
+    Nodo de triaje: heuristicas calibradas con patrones reales de logs Apache.
 
-    Calibrado con observacion directa de trafico de nikto, gobuster, curl y
-    wpscan contra el lab Mr. Robot. Senales (cualquiera activa el triage):
+    Observaciones empiricas del laboratorio mrrobot (25300+ requests analizados):
+    - Gobuster/WPScan/Nmap NSE envian su nombre literal en el user-agent
+    - Nikto randomiza UAs de navegadores reales (29 UAs distintos por scan)
+    - Nikto usa ~18800 respuestas 404 con exactamente 488 bytes (template uniforme)
+    - Nikto envia metodos HTTP no estandar (PROPFIND, TRACK, LVIG, XGFU, DEBUG)
+    - Nikto incluye payloads Shellshock "() { :; };" en el user-agent
+    - Nmap envia paths "/nmaplowercheck{random}" caracteristicos
 
-    1. User-agent de herramienta de ataque conocida (gobuster, wpscan, sqlmap...)
-       → deteccion directa, 0 falsos positivos
-    2. IP generando >8 requests en el mismo segundo
-       → nikto paraleliza; ningun browser normal hace esto
-    3. IP con >15 requests totales en la ventana y >40% son 404
-       → patron tipico de enumeracion automatizada
-    4. POST a ruta de autenticacion (/wp-login, /login, /admin, /xmlrpc)
-       → intento de login activo
-    5. URL con cmd= o cmd%3D y status 2xx
-       → webshell respondiendo a comandos
-    6. IP con >15 requests con body size uniforme en 404s
-       → nikto con user-agent camuflado (todos sus 404s tienen el mismo byte count)
+    Senales (cualquiera activa el triage):
+
+    T1. TOOL_UA: User-agent contiene firma literal de herramienta conocida
+        → gobuster/, wpscan, nmap scripting engine, curl/
+    T2. UA_ROTATION: Una IP usa >5 user-agents distintos en la ventana
+        → rotacion de UA = nikto o scanner equivalente
+    T3. WEIRD_METHODS: IP usa metodos HTTP no estandar
+        → PROPFIND, TRACK, DEBUG, LVIG, etc = scanner probing
+    T4. SHELLSHOCK: Payload () { :; }; en user-agent o URL
+        → intento de explotacion activo
+    T5. HIGH_VELOCITY: IP con >5 requests en el mismo segundo
+        → paralelismo tipico de herramientas automatizadas
+    T6. SCAN_404: IP con >15 requests y >40% de 404s
+        → enumeracion de directorios/paths
+    T7. UNIFORM_404: >20 respuestas 404 de una IP con body size uniforme
+        → template de wordlist scanner
+    T8. AUTH_POST: POST a ruta de autenticacion (/wp-login, /admin, etc)
+        → intento de credential access
+    T9. WEBSHELL_ACTIVE: URL contiene cmd=/cmd%3 y status 2xx
+        → ejecucion de comandos via webshell
     """
     raw_logs = state.get("raw_logs", [])
 
@@ -130,17 +285,16 @@ def triage_anomalies(state: ObserverState) -> dict:
         logger.info("[Observador] Triaje: sin logs, ciclo terminado")
         return {"triage_result": "no_signal", "anomaly_count": 0}
 
-    # Estructuras para analisis por IP
+    # Perfil por IP para analisis agregado
     ip_total: Counter = Counter()
     ip_404: Counter = Counter()
-    # ip -> {segundo -> count}  para detectar parallelismo
     ip_per_second: dict[str, Counter] = {}
-    # ip -> set de body sizes en 404s para detectar nikto camuflado
-    ip_404_sizes: dict[str, set] = {}
+    ip_404_sizes: dict[str, Counter] = {}
+    ip_uas: dict[str, set[str]] = {}
+    ip_weird_methods: dict[str, set[str]] = {}
+    ip_tools: dict[str, str] = {}  # ip -> firma literal detectada
+    ip_shellshock: Counter = Counter()
 
-    signals_found: list[str] = []
-    # IPs con tool UA detectado (evita doble conteo en loop por-log)
-    tool_ips: dict[str, str] = {}  # ip -> tool_name
     post_auth_count = 0
     webshell_active = False
 
@@ -151,7 +305,6 @@ def triage_anomalies(state: ObserverState) -> dict:
             continue
 
         ip = m.group(1)
-        # Ignorar loopback (requests internos de Apache)
         if ip.startswith("127."):
             continue
 
@@ -163,94 +316,125 @@ def triage_anomalies(state: ObserverState) -> dict:
         user_agent = m.group(9).lower()
 
         ip_total[ip] += 1
+
         second_key = f"{hour}:{minute}"
+        ip_per_second.setdefault(ip, Counter())[second_key] += 1
 
-        if ip not in ip_per_second:
-            ip_per_second[ip] = Counter()
-        ip_per_second[ip][second_key] += 1
+        if user_agent and user_agent != "-":
+            ip_uas.setdefault(ip, set()).add(user_agent)
 
-        if status == "404":
-            ip_404[ip] += 1
-            if ip not in ip_404_sizes:
-                ip_404_sizes[ip] = set()
-            if body_size.isdigit():
-                ip_404_sizes[ip].add(body_size)
-
-        # Senal 1: user-agent de herramienta de ataque (marcar IP, no contar aqui)
-        if ip not in tool_ips:
-            for tool in _ATTACK_TOOL_UAS:
-                if tool in user_agent:
-                    tool_ips[ip] = tool
+        # T1: firma literal de herramienta en UA
+        if ip not in ip_tools:
+            for tool_name, sig in _TOOL_UA_SIGNATURES.items():
+                if sig in user_agent:
+                    ip_tools[ip] = tool_name
                     break
 
-        # Senal 4: POST a ruta de autenticacion
+        # T3: metodo HTTP fuera de lo estandar
+        if method not in _STANDARD_HTTP_METHODS:
+            ip_weird_methods.setdefault(ip, set()).add(method)
+
+        # T4: shellshock en UA o URL
+        if _SHELLSHOCK_RE.search(user_agent) or _SHELLSHOCK_RE.search(url):
+            ip_shellshock[ip] += 1
+
+        # 404 tracking
+        if status == "404":
+            ip_404[ip] += 1
+            if body_size.isdigit():
+                ip_404_sizes.setdefault(ip, Counter())[body_size] += 1
+
+        # T8: POST a ruta de autenticacion
         if method == "POST" and any(p in url for p in _SENSITIVE_POST_PATHS):
             post_auth_count += 1
 
-        # Senal 5: webshell activa
+        # T9: webshell activa
         if status.startswith("2") and ("cmd=" in url or "cmd%3" in url or "cmd%20" in url):
             webshell_active = True
 
-    # Calcular anomaly_count como requests de IPs sospechosas (acotado por total)
+    signals_found: list[str] = []
     suspicious_ips: set[str] = set()
 
-    # Senal 1: tool UA
-    for ip, tool_name in tool_ips.items():
-        signals_found.append(f"tool UA: {tool_name} desde {ip}")
+    # T1: herramientas identificadas por firma literal
+    for ip, tool_name in ip_tools.items():
+        signals_found.append(f"T1 tool_ua: {tool_name} desde {ip} ({ip_total[ip]} reqs)")
         suspicious_ips.add(ip)
 
-    # Senal 2: parallelismo por segundo
+    # T2: rotacion de user-agents (nikto)
+    for ip, uas in ip_uas.items():
+        if len(uas) >= _UA_ROTATION_THRESHOLD:
+            signals_found.append(
+                f"T2 ua_rotation: IP {ip} uso {len(uas)} UAs distintos — scanner con rotacion"
+            )
+            suspicious_ips.add(ip)
+
+    # T3: metodos HTTP no estandar
+    for ip, methods in ip_weird_methods.items():
+        if methods:
+            examples = ", ".join(sorted(methods)[:5])
+            signals_found.append(
+                f"T3 weird_methods: IP {ip} uso metodos no estandar: {examples}"
+            )
+            suspicious_ips.add(ip)
+
+    # T4: shellshock
+    for ip, count in ip_shellshock.items():
+        signals_found.append(f"T4 shellshock: IP {ip} envio {count} payloads Shellshock")
+        suspicious_ips.add(ip)
+
+    # T5: alta velocidad de requests
     for ip, sec_counts in ip_per_second.items():
         max_per_sec = max(sec_counts.values())
         if max_per_sec >= _MAX_REQUESTS_PER_SECOND:
-            signals_found.append(f"IP {ip}: {max_per_sec} req/s (herramienta automatizada)")
+            signals_found.append(
+                f"T5 velocity: IP {ip} alcanzo {max_per_sec} req/s — automatizacion"
+            )
             suspicious_ips.add(ip)
 
-    # Senal 3: alta tasa 404
+    # T6: alta tasa de 404
     for ip, count_404 in ip_404.items():
         total = ip_total.get(ip, 1)
         if total >= _TRIAGE_MIN_REQUESTS and count_404 / total >= _TRIAGE_404_RATIO:
             signals_found.append(
-                f"IP {ip}: {count_404}/{total} 404s ({count_404/total:.0%}) — enumeracion"
+                f"T6 scan_404: IP {ip} {count_404}/{total} 404s ({count_404/total:.0%})"
             )
             suspicious_ips.add(ip)
 
-    # Senal 4: POST a autenticacion
+    # T7: body size uniforme en 404s (nikto template)
+    for ip, size_counter in ip_404_sizes.items():
+        total_404 = sum(size_counter.values())
+        if total_404 >= 20:
+            top_size, top_count = size_counter.most_common(1)[0]
+            concentration = top_count / total_404
+            if concentration >= 0.70:
+                signals_found.append(
+                    f"T7 uniform_404: IP {ip} {top_count}/{total_404} 404s "
+                    f"con size={top_size} bytes ({concentration:.0%})"
+                )
+                suspicious_ips.add(ip)
+
+    # T8: POST a autenticacion
     if post_auth_count > 0:
-        signals_found.append(f"POST auth: {post_auth_count} intentos")
+        signals_found.append(f"T8 auth_post: {post_auth_count} POSTs a rutas de login")
 
-    # Senal 5: webshell activa
+    # T9: webshell activa
     if webshell_active:
-        signals_found.append("webshell activa detectada")
-
-    # Senal 6: nikto camuflado — 404s con body size uniforme y alto volumen
-    for ip, sizes in ip_404_sizes.items():
-        count_404 = ip_404.get(ip, 0)
-        if count_404 >= 20 and len(sizes) <= 2:
-            signals_found.append(
-                f"IP {ip}: {count_404} 404s con body size uniforme {sizes} — posible nikto"
-            )
-            suspicious_ips.add(ip)
+        signals_found.append("T9 webshell_active: cmd= con status 2xx detectado")
 
     # anomaly_count = requests de IPs sospechosas, acotado por total de logs
     anomaly_count = sum(ip_total[ip] for ip in suspicious_ips)
     anomaly_count = min(anomaly_count, len(raw_logs))
 
-    # Deduplicar senales
-    signals_found = list(dict.fromkeys(signals_found))
-
     if signals_found:
         ratio = anomaly_count / max(len(raw_logs), 1)
         logger.info(
-            f"[Observador] Triaje: senal detectada "
+            f"[Observador] Triaje: {len(signals_found)} senales "
             f"({anomaly_count}/{len(raw_logs)} logs anomalos, ratio={ratio:.1%})"
         )
-        logger.debug(f"[Observador] Senales: {signals_found[:3]}")
+        logger.debug(f"[Observador] Senales activas: {signals_found}")
         return {"triage_result": "signal", "anomaly_count": anomaly_count}
 
-    logger.info(
-        f"[Observador] Triaje: sin senal relevante ({len(raw_logs)} logs)"
-    )
+    logger.info(f"[Observador] Triaje: sin senal relevante ({len(raw_logs)} logs)")
     return {"triage_result": "no_signal", "anomaly_count": 0}
 
 
@@ -364,6 +548,11 @@ def detect_anomalies(state: ObserverState) -> dict:
     ip_profiles: dict[str, dict] = {}
     seen_404_urls: dict[str, set] = {}
     ip_per_second: dict[str, Counter] = {}
+    ip_uas: dict[str, set[str]] = {}
+    ip_weird_methods: dict[str, set[str]] = {}
+    ip_404_sizes: dict[str, Counter] = {}
+    # Comandos ejecutados via webshell, ordenados cronologicamente
+    webshell_commands: list[dict] = []
 
     def get_profile(ip: str) -> dict:
         if ip not in ip_profiles:
@@ -371,8 +560,12 @@ def detect_anomalies(state: ObserverState) -> dict:
                 "total": 0,
                 "attack_score": 0.0,
                 "tool_detected": "",
+                "distinct_uas": 0,
+                "weird_methods": 0,
+                "shellshock_attempts": 0,
                 "webshell_scan": 0,
                 "webshell_execution": 0,
+                "webshell_sub_tactics": [],
                 "login_failed": 0,
                 "login_success": 0,
                 "sqli_attempts": 0,
@@ -394,31 +587,53 @@ def detect_anomalies(state: ObserverState) -> dict:
         method = m.group(5).upper()
         url = m.group(6)
         status = int(m.group(7))
+        body_size = m.group(8)
         user_agent = m.group(9).lower()
         url_lower = url.lower()
 
         profile = get_profile(ip)
         profile["total"] += 1
 
-        # Velocidad por minuto:segundo (proxy para req/s)
         sec_key = f"{hour}:{minute}"
-        if ip not in ip_per_second:
-            ip_per_second[ip] = Counter()
-        ip_per_second[ip][sec_key] += 1
+        ip_per_second.setdefault(ip, Counter())[sec_key] += 1
 
-        # Detectar herramienta por user-agent
+        if user_agent and user_agent != "-":
+            ip_uas.setdefault(ip, set()).add(user_agent)
+
+        # Firma literal de herramienta en UA
         if not profile["tool_detected"]:
-            for tool in _ATTACK_TOOL_UAS:
-                if tool in user_agent:
-                    profile["tool_detected"] = tool
+            for tool_name, sig in _TOOL_UA_SIGNATURES.items():
+                if sig in user_agent:
+                    profile["tool_detected"] = tool_name
                     profile["attack_score"] += 10
                     break
+
+        # Metodo HTTP no estandar
+        if method not in _STANDARD_HTTP_METHODS:
+            ip_weird_methods.setdefault(ip, set()).add(method)
+
+        # Shellshock
+        if _SHELLSHOCK_RE.search(user_agent) or _SHELLSHOCK_RE.search(url_lower):
+            profile["shellshock_attempts"] += 1
+            profile["attack_score"] += 5
 
         # Webshell
         if "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower:
             if status == 200:
                 profile["webshell_execution"] += 1
                 profile["attack_score"] += 10
+                # Extraer comando y clasificar sub-tactica
+                cmd = extract_webshell_cmd(url)
+                if cmd:
+                    sub_tactic, sub_id = classify_webshell_cmd(cmd)
+                    profile["webshell_sub_tactics"].append(sub_tactic)
+                    webshell_commands.append({
+                        "timestamp": log.get("timestamp", ""),
+                        "ip": ip,
+                        "cmd": cmd[:120],
+                        "sub_tactic": sub_tactic,
+                        "sub_tactic_id": sub_id,
+                    })
             else:
                 profile["webshell_scan"] += 1
                 profile["attack_score"] += 0.5
@@ -442,11 +657,24 @@ def detect_anomalies(state: ObserverState) -> dict:
             profile["attack_score"] += 2
 
         if status == 404:
-            if ip not in seen_404_urls:
-                seen_404_urls[ip] = set()
-            seen_404_urls[ip].add(url)
+            seen_404_urls.setdefault(ip, set()).add(url)
+            if body_size.isdigit():
+                ip_404_sizes.setdefault(ip, Counter())[body_size] += 1
 
-    # Registrar velocidad maxima y penalizar enumeracion masiva
+    # Rotacion de UA (nikto)
+    for ip, uas in ip_uas.items():
+        if ip in ip_profiles:
+            ip_profiles[ip]["distinct_uas"] = len(uas)
+            if len(uas) >= _UA_ROTATION_THRESHOLD:
+                ip_profiles[ip]["attack_score"] += 8
+
+    # Metodos HTTP no estandar
+    for ip, methods in ip_weird_methods.items():
+        if ip in ip_profiles and methods:
+            ip_profiles[ip]["weird_methods"] = len(methods)
+            ip_profiles[ip]["attack_score"] += 4
+
+    # Velocidad de requests
     for ip, sec_counts in ip_per_second.items():
         if ip in ip_profiles:
             max_rps = max(sec_counts.values())
@@ -454,11 +682,21 @@ def detect_anomalies(state: ObserverState) -> dict:
             if max_rps >= _MAX_REQUESTS_PER_SECOND:
                 ip_profiles[ip]["attack_score"] += min(max_rps, 20)
 
+    # 404 enumeration
     for ip, urls in seen_404_urls.items():
         if ip in ip_profiles:
             ip_profiles[ip]["scanning_404"] = len(urls)
-            # Score moderado: muchos 404s solos no son tan sospechosos como 200s/302s
             ip_profiles[ip]["attack_score"] += min(len(urls) * 0.05, 5)
+
+    # Body size uniforme en 404s (template de wordlist scanner)
+    for ip, size_counter in ip_404_sizes.items():
+        total_404 = sum(size_counter.values())
+        if ip in ip_profiles and total_404 >= 20:
+            top_size, top_count = size_counter.most_common(1)[0]
+            concentration = top_count / total_404
+            if concentration >= 0.70:
+                ip_profiles[ip]["uniform_404_ratio"] = round(concentration, 2)
+                ip_profiles[ip]["attack_score"] += 6
 
     suspicious = {
         ip: {k: v for k, v in prof.items() if k != "attack_score" and v != 0}
@@ -523,6 +761,10 @@ def detect_anomalies(state: ObserverState) -> dict:
     }
     if top_suspicious:
         signals["suspicious_ips"] = top_suspicious
+    if webshell_commands:
+        # Ordenar cronologicamente y quedarse con los mas recientes
+        webshell_commands.sort(key=lambda c: c.get("timestamp", ""))
+        signals["webshell_commands"] = webshell_commands[-15:]
 
     active = [k for k in signals if k != "request_velocity"]
     logger.info(f"[Observador] Senales detectadas: {active}")
