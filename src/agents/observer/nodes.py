@@ -52,12 +52,29 @@ def _get_model():
     return _model
 
 
-ATTACK_KEYWORDS = [
-    "scan", "nmap", "nikto", "hydra", "sqlmap", "shell",
-    "login", "auth", "password", "denied", "admin", "root",
-    "exec", "command", "injection", "exploit", "payload",
-    "wget", "curl", "chmod", "python", "bash",
-]
+# Regex completo que captura todos los campos del log Apache Combined:
+# ip - - [fecha hora] "METHOD /url HTTP/x" STATUS BYTES "referer" "user-agent"
+_TRIAGE_LOG_RE = re.compile(
+    r'^(\S+)\s+\S+\s+\S+\s+\[(\d{2}/\w+/\d{4}):(\d{2}):(\d{2}):\d{2}\s+[^\]]+\]\s+'
+    r'"(\w+)\s+(\S+)\s+HTTP/[^"]+"\s+(\d{3})\s+(\d+|-)\s+"[^"]*"\s+"([^"]*)"'
+)
+
+# User-agents de herramientas de ataque que aparecen literalmente en logs
+_ATTACK_TOOL_UAS = ("gobuster", "wpscan", "sqlmap", "nikto", "masscan", "nessus",
+                    "burpsuite", "zaproxy", "hydra")
+
+# Rutas sensibles para POST (autenticacion)
+_SENSITIVE_POST_PATHS = ("/wp-login", "/login", "/admin", "/xmlrpc", "/wp-admin")
+
+# Una IP que genera >8 requests en el mismo segundo = herramienta automatizada
+_MAX_REQUESTS_PER_SECOND = 8
+
+# Una IP con >15 requests totales en la ventana es sospechosa
+_TRIAGE_MIN_REQUESTS = 15
+
+# 404 ratio: si >40% de los requests de una IP son 404 y hay al menos 8 = scanner
+_TRIAGE_404_RATIO = 0.40
+_TRIAGE_404_MIN = 8
 
 
 def collect_logs(state: ObserverState) -> dict:
@@ -89,14 +106,23 @@ def collect_logs(state: ObserverState) -> dict:
 
 def triage_anomalies(state: ObserverState) -> dict:
     """
-    Nodo de triaje: heuristicas baratas sin LLM.
+    Nodo de triaje: heuristicas basadas en estructura real de logs Apache.
 
-    Determina si los logs contienen senales de actividad anomala suficientes
-    para justificar una llamada al LLM. La mayoria de los ciclos de polling
-    en un servidor con trafico normal terminan aqui con costo computacional
-    casi nulo.
+    Calibrado con observacion directa de trafico de nikto, gobuster, curl y
+    wpscan contra el lab Mr. Robot. Senales (cualquiera activa el triage):
 
-    Umbral: al menos 3 entradas con keywords de ataque, o mas del 10% del total.
+    1. User-agent de herramienta de ataque conocida (gobuster, wpscan, sqlmap...)
+       → deteccion directa, 0 falsos positivos
+    2. IP generando >8 requests en el mismo segundo
+       → nikto paraleliza; ningun browser normal hace esto
+    3. IP con >15 requests totales en la ventana y >40% son 404
+       → patron tipico de enumeracion automatizada
+    4. POST a ruta de autenticacion (/wp-login, /login, /admin, /xmlrpc)
+       → intento de login activo
+    5. URL con cmd= o cmd%3D y status 2xx
+       → webshell respondiendo a comandos
+    6. IP con >15 requests con body size uniforme en 404s
+       → nikto con user-agent camuflado (todos sus 404s tienen el mismo byte count)
     """
     raw_logs = state.get("raw_logs", [])
 
@@ -104,26 +130,106 @@ def triage_anomalies(state: ObserverState) -> dict:
         logger.info("[Observador] Triaje: sin logs, ciclo terminado")
         return {"triage_result": "no_signal", "anomaly_count": 0}
 
-    flagged = [
-        log for log in raw_logs
-        if any(kw in log.get("message", "").lower() for kw in ATTACK_KEYWORDS)
-    ]
+    # Estructuras para analisis por IP
+    ip_total: Counter = Counter()
+    ip_404: Counter = Counter()
+    # ip -> {segundo -> count}  para detectar parallelismo
+    ip_per_second: dict[str, Counter] = {}
+    # ip -> set de body sizes en 404s para detectar nikto camuflado
+    ip_404_sizes: dict[str, set] = {}
 
-    count = len(flagged)
-    ratio = count / len(raw_logs)
+    signals_found: list[str] = []
+    anomaly_count = 0
 
-    if count >= 3 or (count > 0 and ratio > 0.1):
+    for log in raw_logs:
+        msg = log.get("message", "")
+        m = _TRIAGE_LOG_RE.match(msg)
+        if not m:
+            continue
+
+        ip = m.group(1)
+        # Ignorar loopback (requests internos de Apache)
+        if ip.startswith("127."):
+            continue
+
+        hour, minute = m.group(3), m.group(4)
+        method = m.group(5).upper()
+        url = m.group(6).lower()
+        status = m.group(7)
+        body_size = m.group(8)
+        user_agent = m.group(9).lower()
+
+        ip_total[ip] += 1
+        second_key = f"{hour}:{minute}"
+
+        if ip not in ip_per_second:
+            ip_per_second[ip] = Counter()
+        ip_per_second[ip][second_key] += 1
+
+        if status == "404":
+            ip_404[ip] += 1
+            if ip not in ip_404_sizes:
+                ip_404_sizes[ip] = set()
+            if body_size.isdigit():
+                ip_404_sizes[ip].add(body_size)
+
+        # Senal 1: user-agent de herramienta de ataque
+        if any(tool in user_agent for tool in _ATTACK_TOOL_UAS):
+            tool_name = next(t for t in _ATTACK_TOOL_UAS if t in user_agent)
+            signals_found.append(f"tool UA: {tool_name} desde {ip}")
+            anomaly_count += ip_total[ip]
+
+        # Senal 4: POST a ruta de autenticacion
+        if method == "POST" and any(p in url for p in _SENSITIVE_POST_PATHS):
+            signals_found.append(f"POST auth: {url[:50]} desde {ip}")
+            anomaly_count += 1
+
+        # Senal 5: webshell activa
+        if status.startswith("2") and ("cmd=" in url or "cmd%3" in url or "cmd%20" in url):
+            signals_found.append(f"webshell activa: {url[:60]} -> {status}")
+            anomaly_count += 10  # alta prioridad
+
+    # Senal 2: parallelismo por segundo
+    for ip, sec_counts in ip_per_second.items():
+        max_per_sec = max(sec_counts.values())
+        if max_per_sec >= _MAX_REQUESTS_PER_SECOND:
+            signals_found.append(f"IP {ip}: {max_per_sec} req/s (herramienta automatizada)")
+            anomaly_count = max(anomaly_count, ip_total[ip])
+
+    # Senal 3: alta tasa 404
+    for ip, count_404 in ip_404.items():
+        total = ip_total.get(ip, 1)
+        if total >= _TRIAGE_MIN_REQUESTS and count_404 / total >= _TRIAGE_404_RATIO:
+            signals_found.append(
+                f"IP {ip}: {count_404}/{total} 404s ({count_404/total:.0%}) — enumeracion"
+            )
+            anomaly_count = max(anomaly_count, count_404)
+
+    # Senal 6: nikto camuflado — 404s con body size uniforme y alto volumen
+    for ip, sizes in ip_404_sizes.items():
+        count_404 = ip_404.get(ip, 0)
+        if count_404 >= 20 and len(sizes) <= 2:
+            signals_found.append(
+                f"IP {ip}: {count_404} 404s con body size uniforme {sizes} — posible nikto"
+            )
+            anomaly_count = max(anomaly_count, count_404)
+
+    # Deduplicar senales
+    signals_found = list(dict.fromkeys(signals_found))
+
+    if signals_found:
+        ratio = anomaly_count / max(len(raw_logs), 1)
         logger.info(
             f"[Observador] Triaje: senal detectada "
-            f"({count}/{len(raw_logs)} logs anomalos, ratio={ratio:.1%})"
+            f"({anomaly_count}/{len(raw_logs)} logs anomalos, ratio={ratio:.1%})"
         )
-        return {"triage_result": "signal", "anomaly_count": count}
+        logger.debug(f"[Observador] Senales: {signals_found[:3]}")
+        return {"triage_result": "signal", "anomaly_count": anomaly_count}
 
     logger.info(
-        f"[Observador] Triaje: sin senal relevante "
-        f"({count}/{len(raw_logs)} logs anomalos)"
+        f"[Observador] Triaje: sin senal relevante ({len(raw_logs)} logs)"
     )
-    return {"triage_result": "no_signal", "anomaly_count": count}
+    return {"triage_result": "no_signal", "anomaly_count": 0}
 
 
 def refine_analysis(state: ObserverState) -> dict:
@@ -168,10 +274,22 @@ def refine_analysis(state: ObserverState) -> dict:
     if ip_counts:
         lines.append(f"\nIPs mas activas: {dict(ip_counts.most_common(5))}")
 
-    # Top 20 entradas mas sospechosas (mayor densidad de keywords)
+    # Top 20 entradas mas sospechosas: prioriza status 2xx/302/401 y metodos POST,
+    # y paths con indicadores de ataque que SI aparecen en logs HTTP reales.
+    _HTTP_SIGNAL_KWS = [
+        "cmd=", "shell", "wp-login", "wp-admin", "xmlrpc",
+        "passwd", "shadow", "upload", "eval", "base64",
+    ]
+
     def anomaly_score(log: dict) -> int:
         msg = log.get("message", "").lower()
-        return sum(1 for kw in ATTACK_KEYWORDS if kw in msg)
+        score = sum(1 for kw in _HTTP_SIGNAL_KWS if kw in msg)
+        # POST vale doble, status 200/302 a ruta sospechosa vale doble
+        if '"post ' in msg:
+            score += 2
+        if '" 200 ' in msg or '" 302 ' in msg:
+            score += 1
+        return score
 
     top = sorted(
         [l for l in raw_logs if anomaly_score(l) > 0],
@@ -218,55 +336,85 @@ def detect_anomalies(state: ObserverState) -> dict:
     if not raw_logs:
         return {"anomaly_signals": {}, "suspect_list": state.get("suspect_list", {})}
 
-    APACHE_PATTERN = re.compile(
-        r'^(\d{1,3}(?:\.\d{1,3}){3})\s+\S+\s+\S+\s+\[.*?\]\s+"(\w+)\s+(\S+)\s+HTTP/[^"]+"\s+(\d{3})'
-    )
     SQLI_MARKERS = ["' or", "1=1", "union select", "sleep(", "%27"]
     SUSPICION_THRESHOLD = 3
 
     ip_profiles: dict[str, dict] = {}
     seen_404_urls: dict[str, set] = {}
+    ip_per_second: dict[str, Counter] = {}
 
     def get_profile(ip: str) -> dict:
         if ip not in ip_profiles:
             ip_profiles[ip] = {
                 "total": 0,
                 "attack_score": 0.0,
+                "tool_detected": "",
                 "webshell_scan": 0,
                 "webshell_execution": 0,
                 "login_failed": 0,
                 "login_success": 0,
                 "sqli_attempts": 0,
+                "max_req_per_sec": 0,
             }
         return ip_profiles[ip]
 
     for log in raw_logs:
         msg = log.get("message", "")
-        m = APACHE_PATTERN.match(msg)
+        m = _TRIAGE_LOG_RE.match(msg)
         if not m:
             continue
 
-        ip, method, url, status = m.group(1), m.group(2).upper(), m.group(3), int(m.group(4))
+        ip = m.group(1)
+        if ip.startswith("127."):
+            continue
+
+        hour, minute = m.group(3), m.group(4)
+        method = m.group(5).upper()
+        url = m.group(6)
+        status = int(m.group(7))
+        user_agent = m.group(9).lower()
         url_lower = url.lower()
+
         profile = get_profile(ip)
         profile["total"] += 1
 
-        if "shell.php" in url_lower or "cmd=" in url_lower:
+        # Velocidad por minuto:segundo (proxy para req/s)
+        sec_key = f"{hour}:{minute}"
+        if ip not in ip_per_second:
+            ip_per_second[ip] = Counter()
+        ip_per_second[ip][sec_key] += 1
+
+        # Detectar herramienta por user-agent
+        if not profile["tool_detected"]:
+            for tool in _ATTACK_TOOL_UAS:
+                if tool in user_agent:
+                    profile["tool_detected"] = tool
+                    profile["attack_score"] += 10
+                    break
+
+        # Webshell
+        if "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower:
             if status == 200:
                 profile["webshell_execution"] += 1
-                profile["attack_score"] += 5
+                profile["attack_score"] += 10
             else:
                 profile["webshell_scan"] += 1
-                profile["attack_score"] += 1
+                profile["attack_score"] += 0.5
 
-        elif "wp-login.php" in url_lower and method == "POST":
+        # Login attempts
+        if "wp-login" in url_lower and method == "POST":
             if status == 302:
                 profile["login_success"] += 1
-                profile["attack_score"] += 5
+                profile["attack_score"] += 10
             else:
                 profile["login_failed"] += 1
                 profile["attack_score"] += 1
 
+        # Admin panel access
+        if "wp-admin" in url_lower and status == 200 and method == "GET":
+            profile["attack_score"] += 3
+
+        # SQLi
         if any(marker in url_lower for marker in SQLI_MARKERS):
             profile["sqli_attempts"] += 1
             profile["attack_score"] += 2
@@ -276,10 +424,19 @@ def detect_anomalies(state: ObserverState) -> dict:
                 seen_404_urls[ip] = set()
             seen_404_urls[ip].add(url)
 
+    # Registrar velocidad maxima y penalizar enumeracion masiva
+    for ip, sec_counts in ip_per_second.items():
+        if ip in ip_profiles:
+            max_rps = max(sec_counts.values())
+            ip_profiles[ip]["max_req_per_sec"] = max_rps
+            if max_rps >= _MAX_REQUESTS_PER_SECOND:
+                ip_profiles[ip]["attack_score"] += min(max_rps, 20)
+
     for ip, urls in seen_404_urls.items():
         if ip in ip_profiles:
             ip_profiles[ip]["scanning_404"] = len(urls)
-            ip_profiles[ip]["attack_score"] += len(urls) * 0.1
+            # Score moderado: muchos 404s solos no son tan sospechosos como 200s/302s
+            ip_profiles[ip]["attack_score"] += min(len(urls) * 0.05, 5)
 
     suspicious = {
         ip: {k: v for k, v in prof.items() if k != "attack_score" and v != 0}

@@ -160,8 +160,12 @@ def _format_signals(signals: dict) -> str:
         total = data.get("total", 0)
         confirmed = data.get("confirmed_actions", {})
 
+        tool = data.get("tool_detected", "")
+        max_rps = data.get("max_req_per_sec", 0)
+        tool_str = f" | herramienta={tool}" if tool else ""
+        rps_str = f" | max={max_rps}req/s" if max_rps >= 5 else ""
         lines.append(
-            f"  IP {ip} [AMENAZA:{threat} | {windows} ventanas | score_acum={cumulative}]"
+            f"  IP {ip} [AMENAZA:{threat} | {windows} ventanas | score_acum={cumulative}{tool_str}{rps_str}]"
             f" (esta ventana: score={score}, requests={total}):"
         )
         if confirmed:
