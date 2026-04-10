@@ -320,9 +320,14 @@ def detect_anomalies(state: ObserverState) -> dict:
         entry = suspect_list[ip]
         confirmed = entry.get("confirmed_actions", {})
         windows = entry["windows_flagged"]
+        has_active_indicators = bool(
+            confirmed
+            or data.get("login_failed", 0) > 5
+            or data.get("sqli_attempts", 0) > 0
+        )
         if confirmed:
             data["threat_level"] = "HIGH"
-        elif windows >= 3:
+        elif has_active_indicators and windows >= 2:
             data["threat_level"] = "MEDIUM"
         else:
             data["threat_level"] = "LOW"

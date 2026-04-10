@@ -83,9 +83,23 @@ class LogCollector:
         lines = [f"=== RESUMEN AGREGADO ({len(sorted_logs)} entradas totales) ==="]
         lines.extend(self._aggregate_entries(sorted_logs))
 
-        tail_size = min(50, len(sorted_logs))
+        # Notable events: successful responses and POSTs (not scan noise)
+        # These are the events that indicate real attacker progress
+        notable = self._notable_entries(sorted_logs)
+        if notable:
+            lines.append(f"\n=== EVENTOS NOTABLES ({len(notable)} con status 2xx/401 o POST) ===")
+            lines.append("(Estos son los unicos requests que obtuvieron respuesta real — excluye escaneo 404/403)")
+            for log in notable:
+                ts = log.get("timestamp", "?")
+                container = log.get("labels", {}).get("container_name", "?")
+                msg = log.get("message", "").strip()
+                if len(msg) > 400:
+                    msg = msg[:400] + "..."
+                lines.append(f"[{ts}] [{container}] {msg}")
+
+        tail_size = min(30, len(sorted_logs))
         tail = sorted_logs[-tail_size:]
-        lines.append(f"\n=== ULTIMAS {tail_size} ENTRADAS (actividad mas reciente) ===")
+        lines.append(f"\n=== ULTIMAS {tail_size} ENTRADAS CRONOLOGICAS (mas recientes al final) ===")
         for log in tail:
             ts = log.get("timestamp", "?")
             container = log.get("labels", {}).get("container_name", "?")
@@ -95,6 +109,37 @@ class LogCollector:
             lines.append(f"[{ts}] [{container}] {msg}")
 
         return "\n".join(lines)
+
+    def _notable_entries(self, logs: list[dict]) -> list[dict]:
+        """
+        Returns entries that indicate real attacker progress — not just scanner noise.
+
+        Criteria (ordered by signal strength):
+        - POST requests: actual form interaction (login attempt, data submission)
+        - Status 302: redirect after login success or resource access
+        - Status 401: authentication challenge (attacker hit protected resource)
+        - Status 500: server error (potential vulnerability triggered)
+        - GET with execution keywords in URL + status 200: webshell/RCE active
+
+        Excludes: GET → 200 to generic pages (scanner found page, not attacker progress).
+        """
+        _EXECUTION_KWS = {"cmd=", "shell", "exec", "passwd", "shadow", "cmd%"}
+        _HIGH_SIGNAL_STATUSES = {"302", "401", "500"}
+        notable = []
+        for log in logs:
+            msg = log.get("message", "")
+            m = _APACHE_LOG_RE.match(msg)
+            if not m:
+                continue
+            method, url, status = m.group(2), m.group(3).lower(), m.group(4)
+            if method == "POST":
+                notable.append(log)
+            elif status in _HIGH_SIGNAL_STATUSES:
+                notable.append(log)
+            elif status == "200" and any(kw in url for kw in _EXECUTION_KWS):
+                # Webshell or RCE endpoint returning 200 — high signal
+                notable.append(log)
+        return notable[-20:]
 
     def _aggregate_entries(self, logs: list[dict]) -> list[str]:
         """
@@ -134,11 +179,24 @@ class LogCollector:
             if ts > g["last"]:
                 g["last"] = ts
 
+        _EXECUTION_PATH_KWS = {"cmd=", "shell", "exec", "passwd", "shadow", "cmd%"}
+
         def is_relevant(container, ip, method, path, status):
-            if status in _INTERESTING_STATUSES:
+            # 404/403 always collapse to scan noise regardless of path content.
+            # A scanner probing /shell.php and getting 404 is reconnaissance, not execution.
+            if status in {"404", "403"}:
+                return False
+            # POST = actual interaction (login attempt, form submission)
+            if method == "POST":
                 return True
-            path_l = path.lower()
-            return any(kw in path_l for kw in _ATTACK_PATH_KWS)
+            # Redirect (login success), auth challenge, server error = meaningful
+            if status in {"302", "401", "500"}:
+                return True
+            # GET 200 to execution-specific paths = webshell/RCE active
+            if status == "200":
+                path_l = path.lower()
+                return any(kw in path_l for kw in _EXECUTION_PATH_KWS)
+            return False
 
         relevant_lines = []
         scan_noise: dict[tuple, dict] = {}  # (container, ip, status) -> {requests, paths}

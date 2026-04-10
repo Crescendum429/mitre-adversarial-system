@@ -405,9 +405,10 @@ def main():
     attacker_state = run_attacker(tactics=tactics, target=target)
 
     # Dar tiempo al observador para clasificar las ultimas acciones.
-    # Dos ciclos completos: el que estaba en curso termina + uno mas que ve
-    # el estado final del ataque con window_end despues de todas las tacticas.
-    time.sleep(args.observer_interval * 2 + 10)
+    # Tres ciclos completos: el que estaba en curso termina + dos mas que ven
+    # el estado final del ataque, dando al observador tiempo suficiente para
+    # capturar tacticas que el atacante completo rapidamente.
+    time.sleep(args.observer_interval * 3 + 15)
     stop_event.set()
     observer_thread.join(timeout=10)
 

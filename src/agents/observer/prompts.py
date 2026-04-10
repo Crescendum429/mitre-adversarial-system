@@ -20,20 +20,32 @@ IMPORTANTE:
 - Si los logs no muestran actividad maliciosa, clasifica como "none".
 - Usa las clasificaciones previas como contexto de progresion del ataque, no como certeza.
 
+REGLA CRITICA DE INTERPRETACION DE HTTP STATUS CODES:
+- GET/HEAD con status 404/403 a CUALQUIER ruta (incluso /shell.php, /wp-admin, /cmd.php) = \
+escaneo automatico = RECONNAISSANCE. El recurso no existe. NO es Execution.
+- GET con status 200/302 a rutas sensibles = acceso real al recurso.
+- POST con cualquier status = interaccion activa (intento de login, envio de formulario).
+- Webshell con status 200 = Execution. Webshell con status 200 y cmd=uname/whoami/id = Discovery.
+- Volumen masivo de 404s de una sola IP = herramienta de escaneo (nikto, gobuster) = Reconnaissance.
+
 LAS 14 TACTICAS MITRE ATT&CK:
 
-1. Reconnaissance (TA0043): Recopilacion de informacion del objetivo.
-   Observables: escaneos de puertos, queries DNS masivas, conexiones a multiples puertos.
+1. Reconnaissance (TA0043): Recopilacion de informacion del objetivo ANTES de obtener acceso.
+   Observables: escaneos de puertos (nmap), enumeracion web masiva (nikto/gobuster con cientos \
+de rutas 404), fingerprinting de tecnologias. CLAVE: muchos 404s de una IP = Reconnaissance.
 
 2. Resource Development (TA0042): Preparacion de infraestructura de ataque.
    Observables: generalmente no visible en logs del target.
 
-3. Initial Access (TA0001): Obtener acceso al sistema.
-   Observables: intentos de login fallidos seguidos de exito, explotacion de vulnerabilidades \
-web (SQLi, RCE), uso de credenciales robadas.
+3. Initial Access (TA0001): Primer acceso exitoso al sistema.
+   Observables: POST a /wp-login.php con status 302 (login exitoso), explotacion de \
+vulnerabilidad web que retorna 200/302 en ruta sensible, credenciales validas usadas.
+   DISTINCION vs Reconnaissance: Initial Access requiere respuesta exitosa (200/302), \
+no solo probing (404).
 
-4. Execution (TA0002): Ejecucion de codigo malicioso.
-   Observables: ejecucion de shells, scripts, interpretes de comandos, procesos inusuales.
+4. Execution (TA0002): Ejecucion de codigo malicioso en el sistema comprometido.
+   Observables: webshell respondiendo HTTP 200 a requests con ?cmd= o similar, \
+procesos inusuales iniciados. CLAVE: la ruta de webshell con status 200 (no 404).
 
 5. Persistence (TA0003): Mantener acceso al sistema.
    Observables: creacion de cuentas, modificacion de cron/scheduled tasks, instalacion \
@@ -48,9 +60,10 @@ de backdoors.
 8. Credential Access (TA0006): Robo de credenciales.
    Observables: acceso a archivos de passwords, dump de hashes, keylogging.
 
-9. Discovery (TA0007): Exploracion del sistema comprometido.
-   Observables: enumeracion de archivos, comandos de informacion del sistema \
-(uname, whoami, cat /etc/passwd), listado de procesos y red.
+9. Discovery (TA0007): Exploracion del sistema ya comprometido para mapear el entorno.
+   Observables: webshell (status 200) ejecutando comandos de sistema como uname, whoami, id, \
+cat /etc/passwd, ls /home, ifconfig. DISTINCION vs Execution: si el ?cmd= contiene \
+comandos de enumeracion del sistema = Discovery. Si es el primer acceso via webshell = Execution.
 
 10. Lateral Movement (TA0008): Movimiento entre sistemas.
     Observables: conexiones SSH/RDP internas, uso de credenciales en otros hosts.
@@ -107,17 +120,22 @@ Si no hay evidencia de ataque, usa:
 CLASSIFICATION_PROMPT = """SENALES PRE-CALCULADAS (sin LLM):
 {signals}
 
-LOGS DEL PERIODO ANALIZADO (orden cronologico — los ultimos son los mas recientes):
+LOGS DEL PERIODO ANALIZADO:
 {logs}
 
-CLASIFICACIONES PREVIAS (contexto del ataque):
+CLASIFICACIONES PREVIAS (contexto de progresion del ataque):
 {history}
 
-Los logs estan ordenados de mas antiguo a mas reciente. \
-Las entradas al FINAL de la lista representan la actividad MAS RECIENTE y determinan \
-la tactica ACTUAL (current_tactic). Las entradas anteriores del mismo periodo pueden \
-representar fases previas del ataque que ya ocurrieron (tactics_in_window). \
-Prioriza la evidencia directa en los logs sobre las clasificaciones previas. \
+INSTRUCCIONES DE ANALISIS:
+1. La seccion "EVENTOS NOTABLES" lista los unicos requests con respuesta real (2xx/401/POST). \
+   Estos son los eventos que indican progreso del ataque — analigalos primero.
+2. Si los eventos notables muestran solo GET a paginas generales (robots.txt, login page) con 200, \
+   y no hay POSTs exitosos ni webshell activa, la tactica mas probable es Reconnaissance.
+3. Un volumen masivo de 404s con pocos o ningun evento notable = Reconnaissance activo.
+4. Si hay POST a wp-login.php con 302 = Initial Access exitoso.
+5. Si hay GET a una ruta de webshell (?cmd=) con 200 = Execution o Discovery segun el comando.
+6. Las entradas al FINAL de las "ULTIMAS ENTRADAS CRONOLOGICAS" son la actividad MAS RECIENTE.
+7. Prioriza evidencia directa en los logs sobre clasificaciones previas.
 Responde SOLO con JSON."""
 
 
