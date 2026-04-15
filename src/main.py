@@ -99,12 +99,16 @@ def run_attacker(
     console.print(f"  Target: {initial_state['target']}")
     console.print(f"  Tacticas: {initial_state['tactic_sequence']}")
 
-    # stream() emite el estado actualizado despues de cada nodo (solo los campos que cambio)
-    # Acumulamos action_history separadamente porque el ultimo nodo (advance_tactic)
-    # no lo incluye en su retorno.
-    final_state = {}
+    # Inicializar final_state con initial_state para preservar campos que no
+    # cambian entre eventos (tactic_sequence, target, etc)
+    final_state = dict(initial_state)
     accumulated_history = []
-    for event in graph.stream(initial_state, {"recursion_limit": 100}):
+    accumulated_evidence = {}
+    accumulated_collected = {}
+    accumulated_flags = []
+    accumulated_met = {}
+    accumulated_attempts = {}
+    for event in graph.stream(initial_state, {"recursion_limit": 200}):
         for node_name, node_state in event.items():
             if node_name == "advance_tactic":
                 tactic = node_state.get("current_tactic", "")
@@ -116,11 +120,128 @@ def run_attacker(
                     accumulated_history = history
                     last = history[-1]
                     console.print(f"  [cyan]Ejecutado: {last.get('technique', '?')}[/cyan]")
+            elif node_name == "check_objective":
+                ev = node_state.get("tactic_evidence", {})
+                if ev:
+                    accumulated_evidence.update(ev)
+                cd = node_state.get("collected_data", {})
+                if cd:
+                    accumulated_collected.update(cd)
+                flags = node_state.get("flags_found", [])
+                if flags:
+                    accumulated_flags = flags
+                met = node_state.get("tactic_objective_met", {})
+                if met:
+                    accumulated_met.update(met)
+                attempts = node_state.get("attempts_per_tactic", {})
+                if attempts:
+                    accumulated_attempts.update(attempts)
             final_state.update(node_state)
 
     final_state["action_history"] = accumulated_history
+    if accumulated_evidence:
+        final_state["tactic_evidence"] = accumulated_evidence
+    if accumulated_collected:
+        final_state["collected_data"] = accumulated_collected
+    if accumulated_flags:
+        final_state["flags_found"] = accumulated_flags
+    if accumulated_met:
+        final_state["tactic_objective_met"] = accumulated_met
+    if accumulated_attempts:
+        final_state["attempts_per_tactic"] = accumulated_attempts
     console.print("[bold red]AGENTE ATACANTE FINALIZADO[/bold red]\n")
     return final_state
+
+
+def print_attack_summary(attacker_state: dict):
+    """
+    Imprime un resumen rico del ataque con objetivos cumplidos por tactica,
+    evidencia concreta extraida y flags/keys capturados.
+    """
+    tactic_evidence = attacker_state.get("tactic_evidence", {})
+    tactic_met = attacker_state.get("tactic_objective_met", {})
+    tactic_sequence = attacker_state.get("tactic_sequence", [])
+    action_history = attacker_state.get("action_history", [])
+    flags = attacker_state.get("flags_found", [])
+    attempts = attacker_state.get("attempts_per_tactic", {})
+
+    # Contar acciones por tactica
+    actions_per_tactic: dict = {}
+    for a in action_history:
+        t = a.get("tactic", "unknown")
+        actions_per_tactic[t] = actions_per_tactic.get(t, 0) + 1
+
+    summary = Table(title="Resumen del Ataque — Objetivos por Tactica", expand=True)
+    summary.add_column("Tactica", style="bold", no_wrap=True)
+    summary.add_column("Estado", no_wrap=True)
+    summary.add_column("Acciones", justify="right", no_wrap=True)
+    summary.add_column("Replan", justify="right", no_wrap=True)
+    summary.add_column("Evidencia clave", overflow="fold")
+
+    for tactic in tactic_sequence:
+        met = tactic_met.get(tactic, None)
+        if met is True:
+            status = "[green]OK[/green]"
+        elif met is False:
+            status = "[red]FALLO[/red]"
+        else:
+            status = "[dim]--[/dim]"
+
+        ev = tactic_evidence.get(tactic, {})
+        ev_parts = []
+        for k, v in ev.items():
+            if isinstance(v, bool):
+                if v:
+                    ev_parts.append(k)
+            elif isinstance(v, list):
+                ev_parts.append(f"{k}={len(v)}")
+            else:
+                ev_parts.append(f"{k}={str(v)[:40]}")
+        ev_str = ", ".join(ev_parts) if ev_parts else "[dim](vacia)[/dim]"
+
+        attempt_count = attempts.get(tactic, 0)
+        summary.add_row(
+            tactic,
+            status,
+            str(actions_per_tactic.get(tactic, 0)),
+            str(attempt_count),
+            ev_str,
+        )
+
+    console.print(summary)
+
+    # Recolectar keys encontradas buscando los campos key_* en tactic_evidence
+    keys_found = {}
+    for tactic, evidence in tactic_evidence.items():
+        for k, v in evidence.items():
+            if k.startswith("key_") and v:
+                # key_1, key_2, key_3, ...
+                keys_found[k] = (v, tactic)
+
+    if keys_found:
+        console.print(
+            f"\n[bold green]Flags/Keys capturados ({len(keys_found)}):[/bold green]"
+        )
+        for key_name in sorted(keys_found.keys()):
+            value, tactic = keys_found[key_name]
+            console.print(f"  {key_name.replace('_', '-')} ({tactic}): {value}")
+    elif flags:
+        console.print(
+            f"\n[bold green]Flags/Keys capturados ({len(flags)}):[/bold green]"
+        )
+        for f in flags:
+            console.print(f"  - {f}")
+    else:
+        console.print("[dim]No se capturaron flags durante el ataque.[/dim]")
+
+    total_actions = len(action_history)
+    total_tactics = len(tactic_sequence)
+    met_count = sum(1 for t in tactic_sequence if tactic_met.get(t) is True)
+    console.print(
+        f"\n[bold]Resumen ejecutivo:[/bold] "
+        f"{met_count}/{total_tactics} objetivos cumplidos, "
+        f"{total_actions} acciones totales ejecutadas"
+    )
 
 
 def run_observer_loop(
@@ -478,7 +599,7 @@ def main():
     if args.attacker_only:
         # Solo atacante, sin observador
         attacker_state = run_attacker(tactics=tactics, target=target)
-        console.print(f"\nAcciones ejecutadas: {len(attacker_state.get('action_history', []))}")
+        print_attack_summary(attacker_state)
         return
 
     # Ejecucion completa: atacante + observador en paralelo
@@ -511,7 +632,10 @@ def main():
     stop_event.set()
     observer_thread.join(timeout=10)
 
-    # Comparar resultados
+    # Resumen del ataque: objetivos cumplidos, evidencia extraida, flags
+    print_attack_summary(attacker_state)
+
+    # Comparar resultados del observador
     compare_results(attacker_state, observer_results)
 
 
