@@ -13,27 +13,27 @@ from src.config.settings import LLMProvider, settings
 
 
 def _with_retry(model: BaseChatModel) -> BaseChatModel:
-    """
-    Envuelve un modelo con reintentos exponenciales ante rate limits.
-
-    Tier 1 de OpenAI tiene 30K TPM para gpt-4.1; el atacante puede exceder
-    este limite durante replanificaciones con contexto largo. Los reintentos
-    con jitter evitan que el ataque se aborte por limites transitorios.
-    """
+    """Envuelve un modelo con reintentos exponenciales ante errores transitorios."""
+    retry_types: list = []
     try:
-        from openai import RateLimitError as OpenAIRateLimitError
+        from openai import APIConnectionError, APITimeoutError, RateLimitError
+        retry_types.extend([APIConnectionError, APITimeoutError, RateLimitError])
     except Exception:
-        OpenAIRateLimitError = Exception  # type: ignore
-
+        pass
     try:
-        from anthropic import RateLimitError as AnthropicRateLimitError
+        from anthropic import APIConnectionError as AnthropicConnErr
+        from anthropic import APITimeoutError as AnthropicTimeoutErr
+        from anthropic import RateLimitError as AnthropicRateErr
+        retry_types.extend([AnthropicConnErr, AnthropicTimeoutErr, AnthropicRateErr])
     except Exception:
-        AnthropicRateLimitError = Exception  # type: ignore
+        pass
+    if not retry_types:
+        retry_types = [Exception]
 
     return model.with_retry(
-        retry_if_exception_type=(OpenAIRateLimitError, AnthropicRateLimitError),
+        retry_if_exception_type=tuple(retry_types),
         wait_exponential_jitter=True,
-        stop_after_attempt=6,
+        stop_after_attempt=8,
     )
 
 

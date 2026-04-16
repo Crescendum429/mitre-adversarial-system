@@ -29,8 +29,14 @@ RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
     ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto && \
     chmod +x /opt/nikto/program/nikto.pl
 
+RUN git clone --depth 1 https://github.com/v0re/dirb.git /opt/dirb-src && \
+    mkdir -p /usr/share/wordlists/dirb && \
+    cp /opt/dirb-src/wordlists/common.txt /usr/share/wordlists/dirb/common.txt && \
+    cp /opt/dirb-src/wordlists/big.txt /usr/share/wordlists/dirb/big.txt 2>/dev/null || true && \
+    rm -rf /opt/dirb-src
+
 WORKDIR /opt
 
-RUN mkdir -p /opt/wordlists && printf 'admin\npassword\n123456\nelliot\nmrrobot\nER28-0652\nabcdefghijklmnopqrstuvwxyz\n' > /opt/wordlists/mrrobot.txt
+RUN mkdir -p /opt/wordlists
 
 CMD ["sleep", "infinity"]

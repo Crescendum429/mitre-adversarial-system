@@ -97,14 +97,19 @@ _TRIAGE_404_RATIO = 0.40
 _TRIAGE_404_MIN = 8
 
 
-# Patrones de comandos en webshell que indican sub-tacticas MITRE concretas.
-# El orden importa: el primer match determina la clasificacion. Se evalua contra
-# el valor decodificado del parametro ?cmd= de la webshell.
-# Privilege Escalation primero porque es mas especifico (usa sudo/suid).
+# Patrones de comandos webshell ordenados por especificidad. El primer match
+# determina la clasificacion. Los patrones mas especificos (acceso a recursos
+# protegidos de root, exploits, credenciales) evaluan antes que los genericos.
 _CMD_PRIV_ESC_PATTERNS = [
-    r"\bsudo\b",
-    r"\bsu\s+\w",
-    r"-perm\s+-[u0]?=?[us4]",     # find -perm -u=s (SUID)
+    r"setuid\s*\(\s*0",
+    r"os\.setuid",
+    r"os\.setgid",
+    r"exec\s*['\"]?/bin/(ba)?sh",
+    r"/root/(?!\.\.)[\w\-\.]+",
+    r"-perm\s+-[u0]?=?[us4]",
+    r"-perm\s+-?4000",
+    r"\bsudo\s+",
+    r"\bsu\s+-",
     r"/etc/sudoers",
     r"\bsuid\b",
     r"\bgtfobins",
@@ -113,62 +118,75 @@ _CMD_PRIV_ESC_PATTERNS = [
     r"linux-exploit-suggester",
     r"pkexec",
     r"dirty(cow|pipe)",
+    r"cve-\d{4}-\d{4,5}",
 ]
+
 _CMD_CRED_ACCESS_PATTERNS = [
     r"/etc/shadow",
-    r"/etc/passwd",
-    r"\bpassword",
+    r"password\.raw-md5",
     r"\.raw-md5",
-    r"\.md5",
-    r"hash",
-    r"credentials?",
+    r"/home/\w+/password",
+    r"/home/\w+/\.ssh",
     r"id_rsa",
-    r"\.ssh/",
-    r"mimikatz",
-    r"\bsecrets?\b",
-    r"/root/\.",
-    r"/home/\w+/\.",
+    r"\.ssh/(?:id_|authorized_keys)",
     r"wp-config\.php",
-    r"\bdump\b",
+    r"mimikatz",
+    r"\bcreds?\b",
+    r"(?:cat|more|less|head|tail|strings|xxd)\s+[^\s|]*(?:password|hash|credential|secret)",
+    r"(?:cat|more|less|head|tail)\s+[^\s|]*\.(?:md5|sha\d+|hash)",
+    r"john\s",
+    r"hashcat",
+    r"/etc/passwd\b",
 ]
-_CMD_DISCOVERY_PATTERNS = [
-    r"\buname\b",
-    r"\bwhoami\b",
-    r"\bid\b",
-    r"\bhostname\b",
-    r"\bifconfig\b",
-    r"\bip\s+a",
-    r"\bnetstat\b",
-    r"\bps\s+[aux]",
-    r"\buptime\b",
-    r"\bls\b",
-    r"\bfind\b",
-    r"\bcat\s+/",
-    r"/proc/",
-    r"\benv\b",
-    r"lsb_release",
-    r"^\s*pwd",
-]
-_CMD_COLLECTION_PATTERNS = [
-    r"\btar\s",
-    r"\bzip\s",
-    r"\b7z\s",
-    r"\brar\s",
-    r"\bbase64\b.*\b/",
-]
+
 _CMD_EXFIL_PATTERNS = [
-    r"\bcurl\b.*\b(put|post)\b",
-    r"\bwget\b.*\b-O\b",
-    r"\bnc\s+.*\b\d+\b",
-    r"\bftp\b",
+    r"\bcurl\s+[^|]*(?:-X\s+)?(?:PUT|POST)",
+    r"\bwget\s+[^|]*--post",
+    r"\bnc\s+[\w\.]+\s+\d+",
+    r"\bncat\s+[\w\.]+\s+\d+",
+    r"\bftp\s+[\w\.]+",
+    r"scp\s+[\w\.\-/]+\s+[^@]+@",
 ]
+
 _CMD_IMPACT_PATTERNS = [
-    r"\brm\s+-rf",
-    r"\bdd\s+if=",
+    r"\brm\s+-rf?\s+/",
+    r"\bdd\s+if=.*of=/dev/",
     r"\bshutdown\b",
     r"\breboot\b",
     r"\bmkfs",
-    r":\(\)\{",  # fork bomb
+    r":\(\)\s*\{",
+    r"chmod\s+-R\s+000",
+]
+
+_CMD_COLLECTION_PATTERNS = [
+    r"\btar\s+.*\b(?:cz|cv)",
+    r"\bzip\s+-r",
+    r"\b7z\s+a",
+    r"\brar\s+a",
+    r"find\s+.*-exec\s+cat",
+]
+
+_CMD_DISCOVERY_PATTERNS = [
+    r"\buname\b",
+    r"\bwhoami\b",
+    r"\bhostname\b",
+    r"\bifconfig\b",
+    r"\bip\s+(?:a|addr|link)\b",
+    r"\bnetstat\b",
+    r"\bss\s+-",
+    r"\bps\s+(?:aux|-ef)",
+    r"\buptime\b",
+    r"\blsb_release\b",
+    r"\benv\b",
+    r"\bmount\b",
+    r"/proc/(?:version|cpuinfo|meminfo|self)",
+    r"(?:^|[\s;|])id(?:\s|$|;|\|)",
+    r"(?:^|[\s;|])ls(?:\s|$|;|\|)",
+    r"(?:^|[\s;|])pwd(?:\s|$|;|\|)",
+    r"(?:^|[\s;|])find(?:\s|$|;|\|)",
+    r"(?:cat|more|less|head|tail)\s+/etc/(?:os-release|hostname|issue|resolv\.conf)",
+    r"(?:cat|ls)\s+/home",
+    r"(?:cat|ls)\s+/var/www",
 ]
 
 
@@ -176,11 +194,11 @@ def classify_webshell_cmd(cmd: str) -> tuple[str, str]:
     """
     Mapea un comando ejecutado en webshell a la sub-tactica MITRE correspondiente.
 
-    El parametro cmd ya debe venir URL-decoded. Evalua patrones en orden de
-    especificidad: los mas especificos (Privilege Escalation, Credential Access)
-    primero, luego los mas generales (Discovery, Execution).
+    Evaluacion ordenada por especificidad:
+      Privilege Escalation → Credential Access → Impact → Exfiltration →
+      Collection → Discovery → Execution (default)
 
-    Returns: (tactica, tactic_id)
+    El valor de cmd debe venir URL-decoded.
     """
     cmd_l = cmd.lower()
     for pat in _CMD_PRIV_ESC_PATTERNS:
@@ -421,7 +439,18 @@ def triage_anomalies(state: ObserverState) -> dict:
     if webshell_active:
         signals_found.append("T9 webshell_active: cmd= con status 2xx detectado")
 
-    # anomaly_count = requests de IPs sospechosas, acotado por total de logs
+    # T10: IP previamente confirmada como sospechosa sigue activa en esta ventana.
+    # Una vez que una IP disparo el triage, cualquier actividad posterior de esa
+    # IP debe mantener el flujo activo, aunque el tráfico sea bajo.
+    prior_suspects = state.get("suspect_list", {})
+    for ip in ip_total:
+        if ip in prior_suspects and ip not in suspicious_ips:
+            signals_found.append(
+                f"T10 known_attacker: IP {ip} ya marcada en ventanas previas "
+                f"({ip_total[ip]} reqs en esta ventana)"
+            )
+            suspicious_ips.add(ip)
+
     anomaly_count = sum(ip_total[ip] for ip in suspicious_ips)
     anomaly_count = min(anomaly_count, len(raw_logs))
 
@@ -839,9 +868,10 @@ def generate_recommendation(state: ObserverState) -> dict:
     history = list(state.get("classification_history", []))
 
     if classification:
-        classification["timestamp"] = datetime.now(timezone.utc).isoformat()
+        window_end = state.get("window_end", "") or datetime.now(timezone.utc).isoformat()
+        classification["timestamp"] = window_end
         classification["window_start"] = state.get("window_start", "")
-        classification["window_end"] = state.get("window_end", "")
+        classification["window_end"] = window_end
         history.append(classification)
 
     return {

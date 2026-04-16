@@ -68,6 +68,7 @@ def verify_infrastructure(scenario: str = "basic"):
     scenario_containers = {
         "basic": base + ["dvwa"],
         "recon_only": base + ["dvwa"],
+        "dvwa": base + ["dvwa"],
         "full": base + ["dvwa"],
         "mrrobot": base + ["mrrobot"],
     }
@@ -108,7 +109,7 @@ def run_attacker(
     accumulated_flags = []
     accumulated_met = {}
     accumulated_attempts = {}
-    for event in graph.stream(initial_state, {"recursion_limit": 200}):
+    for event in graph.stream(initial_state, {"recursion_limit": 500}):
         for node_name, node_state in event.items():
             if node_name == "advance_tactic":
                 tactic = node_state.get("current_tactic", "")
@@ -264,76 +265,98 @@ def run_observer_loop(
     Se detiene cuando stop_event es seteado por el thread principal.
     """
     interval = poll_interval or settings.observer_poll_interval
+    interval_delta = timedelta(seconds=interval)
     graph = build_observer_graph()
     history = []
     suspect_list = {}
 
+    start_time = simulation_start or datetime.now(timezone.utc)
+    last_end = start_time
+
     console.print("[bold blue]AGENTE OBSERVADOR INICIADO[/bold blue]")
 
-    while not stop_event.is_set():
-        try:
-            state = create_observer_state(
-                window_minutes=max(3, interval // 60 + 2),
-                history=history,
-                suspect_list=suspect_list,
-                simulation_start=simulation_start,
-            )
-            result = graph.invoke(state)
+    def process_window(ws: datetime, we: datetime) -> None:
+        nonlocal history, suspect_list
+        state = create_observer_state(
+            history=history,
+            suspect_list=suspect_list,
+            simulation_start=simulation_start,
+            window_start=ws,
+            window_end=we,
+        )
+        result = graph.invoke(state)
+        classification = result.get("current_classification")
+        triage_result = result.get("triage_result", "no_signal")
 
-            classification = result.get("current_classification")
-            triage_result = result.get("triage_result", "no_signal")
-
-            # SIEMPRE registrar un resultado por ciclo, aun cuando el triage
-            # corto circuito o el LLM no clasifico. Esto da visibilidad completa
-            # de cada ventana observada.
-            if classification:
-                tiw = classification.get("tactics_in_window", [])
-                if len(tiw) > 1:
-                    names = ", ".join(t.get("tactic", "?") for t in tiw)
-                    console.print(
-                        f"  [blue]En ventana: {names} | "
-                        f"Actual: {classification['tactic']} "
-                        f"({classification['confidence']:.0%})[/blue]"
-                    )
-                else:
-                    console.print(
-                        f"  [blue]Clasificacion: {classification['tactic']} "
-                        f"(confianza: {classification['confidence']:.0%})[/blue]"
-                    )
-                results.append(classification)
-                history = result.get("classification_history", history)
-                suspect_list = result.get("suspect_list", suspect_list)
-            else:
-                # Triage filtro la ventana (no_signal) o el LLM no produjo
-                # clasificacion. Registrar placeholder para que quede la
-                # evidencia del ciclo.
-                placeholder = {
-                    "tactic": "none",
-                    "tactic_id": "",
-                    "confidence": 1.0 if triage_result == "no_signal" else 0.0,
-                    "evidence": [],
-                    "reasoning": (
-                        f"Triage corto circuito ({triage_result}), "
-                        f"sin senales de ataque en la ventana."
-                        if triage_result == "no_signal"
-                        else "LLM no produjo clasificacion."
-                    ),
-                    "recommendation": "Continuar monitoreo normal.",
-                    "timestamp": state.get("window_end", ""),
-                    "window_start": state.get("window_start", ""),
-                    "window_end": state.get("window_end", ""),
-                    "tactics_in_window": [],
-                }
+        if classification:
+            tiw = classification.get("tactics_in_window", [])
+            if len(tiw) > 1:
+                names = ", ".join(t.get("tactic", "?") for t in tiw)
                 console.print(
-                    f"  [dim]Ventana sin actividad relevante "
-                    f"({triage_result}) — registrada como 'none'[/dim]"
+                    f"  [blue]En ventana: {names} | "
+                    f"Actual: {classification['tactic']} "
+                    f"({classification['confidence']:.0%})[/blue]"
                 )
-                results.append(placeholder)
+            else:
+                console.print(
+                    f"  [blue]Clasificacion: {classification['tactic']} "
+                    f"(confianza: {classification['confidence']:.0%})[/blue]"
+                )
+            results.append(classification)
+            history = result.get("classification_history", history)
+            suspect_list = result.get("suspect_list", suspect_list)
+        else:
+            placeholder = {
+                "tactic": "none",
+                "tactic_id": "",
+                "confidence": 1.0 if triage_result == "no_signal" else 0.0,
+                "evidence": [],
+                "reasoning": (
+                    f"Triage corto circuito ({triage_result})."
+                    if triage_result == "no_signal"
+                    else "LLM no produjo clasificacion."
+                ),
+                "recommendation": "Continuar monitoreo normal.",
+                "timestamp": we.isoformat(),
+                "window_start": ws.isoformat(),
+                "window_end": we.isoformat(),
+                "tactics_in_window": [],
+            }
+            console.print(
+                f"  [dim]Ventana sin actividad ({triage_result}) — "
+                f"registrada como 'none'[/dim]"
+            )
+            results.append(placeholder)
 
+    while not stop_event.is_set():
+        now = datetime.now(timezone.utc)
+        next_end = last_end + interval_delta
+
+        if next_end > now:
+            stop_event.wait((next_end - now).total_seconds())
+            continue
+
+        try:
+            process_window(last_end, next_end)
         except Exception as e:
             logging.getLogger(__name__).error(f"Error en observador: {e}")
 
-        stop_event.wait(interval)
+        last_end = next_end
+
+    now = datetime.now(timezone.utc)
+    pending = 0
+    while last_end < now:
+        next_end = min(last_end + interval_delta, now)
+        try:
+            process_window(last_end, next_end)
+            pending += 1
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error en observador (flush): {e}")
+            break
+        last_end = next_end
+
+    if pending:
+        console.print(f"[dim]Observador: {pending} ventanas pendientes procesadas[/dim]")
 
     console.print("[bold blue]AGENTE OBSERVADOR FINALIZADO[/bold blue]\n")
 
@@ -342,11 +365,9 @@ def compare_results(attacker_state: dict, observer_classifications: list):
     """
     Compara el ground truth del atacante con las clasificaciones del observador.
 
-    Metrica: accuracy por ventana — alguna tactica detectada por el observador coincide
-    con alguna tactica real activa durante esa ventana de observacion.
-
-    Se usa ventana completa (no punto medio) porque el atacante puede avanzar varias
-    tacticas dentro de un solo ciclo de polling.
+    Accuracy calculada solo sobre ventanas que caen dentro del rango del ataque
+    real (desde la primera accion hasta la ultima). Las ventanas fuera de ese
+    rango se muestran pero marcadas como N/A.
     """
     _ABBREV = {
         "reconnaissance": "recon",
@@ -381,16 +402,23 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         for a in action_history
     ]
 
+    attack_start = min((a["timestamp"] for a in attacker_timeline), default="")
+    attack_end = max((a["timestamp"] for a in attacker_timeline), default="")
+
+    # Ordenar clasificaciones cronologicamente por window_end
+    sorted_cls = sorted(
+        observer_classifications,
+        key=lambda c: c.get("window_end", c.get("timestamp", "")),
+    )
+
     strict_correct = 0
     window_correct = 0
-    evaluable = 0  # ventanas con ground truth real (excluye pre-ataque sin tacticas)
+    evaluable = 0
 
-    for cls in observer_classifications:
-        real_in_window = _real_tactics_in_window(
-            cls.get("window_start", ""),
-            cls.get("window_end", ""),
-            attacker_timeline,
-        )
+    for cls in sorted_cls:
+        ws = cls.get("window_start", "")
+        we = cls.get("window_end", "")
+        real_in_window = _real_tactics_in_window(ws, we, attacker_timeline)
 
         observed_current = cls.get("tactic", "?")
         observed_in_window = [
@@ -399,9 +427,9 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         if not observed_in_window and observed_current and observed_current != "none":
             observed_in_window = [observed_current]
 
-        # La tactica "actual" real es la ultima ejecutada en la ventana
         last_real = real_in_window[-1] if real_in_window else "unknown"
         is_pre_attack = last_real in ("unknown", "")
+        is_post_attack = bool(attack_end) and ws > attack_end
         is_none_obs = observed_current == "none"
 
         real_current_abbrev = (
@@ -413,25 +441,20 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         obs_abbrev = (
             "-" if is_none_obs else _ABBREV.get(observed_current.lower().replace(" ", "_"), observed_current)
         )
-        # Tacticas detectadas en ventana excluyendo la "actual" para evitar redundancia
         obs_window_list = [
             t for t in observed_in_window if not _tactics_match(t, observed_current)
         ]
         obs_window_abbrev = _abbrev_list(obs_window_list) if obs_window_list else ""
 
-        # Ventanas pre-ataque (sin ground truth) y "none" cuando no hay actividad real
-        # son correctas por definicion: no hay nada que clasificar.
-        if is_pre_attack:
-            strict_ok = is_none_obs
-            window_ok = is_none_obs
-            match_label = "N/A" if is_none_obs else "FP"
+        if is_pre_attack or is_post_attack:
+            label = "N/A" if is_none_obs else "FP"
+            match_label = label
             match_style = "dim" if is_none_obs else "yellow"
         else:
             evaluable += 1
             strict_ok = _tactics_match(last_real, observed_current)
             if strict_ok:
                 strict_correct += 1
-            # Match de ventana: todas las tacticas reales deben estar detectadas
             window_ok = all(
                 any(_tactics_match(rt, ot) for ot in observed_in_window)
                 for rt in real_in_window
@@ -571,6 +594,17 @@ def main():
         "recon_only": {
             "tactics": ["reconnaissance"],
             "target": None,
+        },
+        "dvwa": {
+            "tactics": [
+                "reconnaissance",
+                "initial_access",
+                "execution",
+                "discovery",
+                "credential_access",
+                "privilege_escalation",
+            ],
+            "target": "10.10.0.10",
         },
         "mrrobot": {
             "tactics": [

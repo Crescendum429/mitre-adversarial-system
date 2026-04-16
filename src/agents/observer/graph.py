@@ -125,23 +125,29 @@ def create_observer_state(
     history: list | None = None,
     suspect_list: dict | None = None,
     simulation_start: datetime | None = None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> ObserverState:
     """
     Crea el estado inicial para una ejecucion del observador.
 
-    Si se pasa simulation_start, el window_start se clamp a ese tiempo para
-    evitar que logs de corridas anteriores contaminen el analisis.
+    Si se pasan window_start y window_end, se usan directamente (modo ventanas
+    contiguas). Si no, se calcula como [now - window_minutes, now]. En ambos
+    casos, si simulation_start es posterior a window_start, se aplica clamp.
     """
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(minutes=window_minutes)
+    if window_start is not None and window_end is not None:
+        start = window_start
+        end = window_end
+    else:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=window_minutes)
 
-    # Clamp: no mirar logs anteriores al inicio de la simulacion
     if simulation_start is not None and start < simulation_start:
         start = simulation_start
 
     return ObserverState(
         window_start=start.isoformat(),
-        window_end=now.isoformat(),
+        window_end=end.isoformat(),
         raw_logs=[],
         log_summary="",
         triage_result="no_signal",

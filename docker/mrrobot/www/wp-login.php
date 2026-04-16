@@ -5,7 +5,7 @@ $error = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $log = $_POST['log'] ?? '';
     $pwd = $_POST['pwd'] ?? '';
-    if ($log === 'elliot' && $pwd === 'ER28-0652') {
+    if ($log === 'elliot' && $pwd === '__PASSWORD_PLACEHOLDER__') {
         $_SESSION['user'] = 'elliot';
         setcookie('wp_token', 'elliot:authenticated', time() + 3600, '/');
         header('Location: /wp-admin/');

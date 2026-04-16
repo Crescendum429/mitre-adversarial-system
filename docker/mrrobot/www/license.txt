@@ -1,5 +1,9 @@
-what you do just pull code from duty code? yadayadayadayada no, not since they mentioned it on the show...yadayadayadayada
-that's it? what about the password?
-oh right, the password
+Copyright (c) 2015 E Corp. All rights reserved.
 
-ZWxsaW90OkVSMjgtMDY1Mgo=
+This software is distributed under the MIT License.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
