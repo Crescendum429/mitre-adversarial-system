@@ -99,6 +99,20 @@ Cualquier comando con "setuid(0)" o "os.setuid" es PRIVILEGE ESCALATION, incluso
 el subcomando es aparentemente inocente (cat, ls, id). El hecho de elevar a root antes \
 de ejecutar cualquier cosa ES la escalacion.
 
+REGLA DE CONTINUIDAD DE FASE POST-COMPROMISO:
+Una vez una IP ha confirmado compromiso (webshell_execution en sub_tactics previas), \
+TODAS las ventanas subsecuentes con actividad de esa IP deben clasificar con tactica \
+>= Execution. Nunca retrocedas a Reconnaissance o Initial Access aunque la ventana \
+actual solo muestre GETs aparentemente benignos (ej: GET a /wp-login.php con 200). \
+Esos requests pueden ser "cover traffic" o mantenimiento de sesion.
+
+DESEMPATE CRITICO — webshell con multiples sub-tacticas en la misma ventana:
+Si observas webshell_commands con mezcla de Discovery + Privilege Escalation + \
+Credential Access, current_tactic debe ser la MAS AVANZADA del kill chain entre ellas:
+  Priority order: Impact > Collection > Exfiltration > Persistence >
+  Privilege Escalation > Credential Access > Discovery > Execution
+No reduzcas a Discovery solo porque hay volumen de comandos de enumeracion.
+
 LAS 14 TACTICAS MITRE ATT&CK:
 
 1. Reconnaissance (TA0043): Recopilacion de informacion del objetivo ANTES de obtener acceso.

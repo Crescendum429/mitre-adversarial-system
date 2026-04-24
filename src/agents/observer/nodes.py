@@ -22,6 +22,7 @@ y un loop de refinamiento para casos de baja confianza:
 import json
 import logging
 import re
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import unquote
@@ -37,6 +38,23 @@ logger = logging.getLogger(__name__)
 
 _collector = None
 _model = None
+
+
+# Contadores por nodo para reportar al final de la corrida.
+import threading as _threading
+OBSERVER_NODE_STATS = {
+    "collect_calls": 0,
+    "triage_signal": 0,
+    "triage_no_signal": 0,
+    "refine_calls": 0,
+    "classify_calls": 0,
+}
+_OBS_STATS_LOCK = _threading.Lock()
+
+
+def reset_observer_stats() -> None:
+    for k in list(OBSERVER_NODE_STATS.keys()):
+        OBSERVER_NODE_STATS[k] = 0
 
 
 def _get_collector():
@@ -83,10 +101,47 @@ _SENSITIVE_POST_PATHS = ("/wp-login", "/login", "/admin", "/xmlrpc", "/wp-admin"
 # Shellshock signature en user-agent o URL: () { :; }; o () { _; }
 _SHELLSHOCK_RE = re.compile(r"\(\s*\)\s*\{\s*[:;_]")
 
+# CVE-2021-44228 Log4Shell JNDI injection: ${jndi:ldap://...}, ${jndi:rmi://...},
+# ${jndi:dns://...}. Aparece en headers (User-Agent, X-Api-Version) o URL query.
+# Ref: Apache, CVE-2021-44228, NIST SP 800-155.
+_LOG4SHELL_RE = re.compile(
+    r"\$\{(?:jndi|lower|upper|env|sys|date|::-)[:\s\}]",
+    re.IGNORECASE,
+)
+
+# CVE-2017-5638 Struts2 OGNL: payload en Content-Type con %{...}
+# CVE-2022-26134 Confluence OGNL: payload en URI con ${...}
+# Ambos se detectan por expresion OGNL en lugar raro del request.
+_OGNL_RE = re.compile(
+    r"%\{.*?(?:Runtime|ProcessBuilder|ognl|#_?memberAccess|@java\.lang)",
+    re.IGNORECASE | re.DOTALL,
+)
+_OGNL_CONFLUENCE_RE = re.compile(
+    r"\$\{.*?(?:Runtime|ProcessBuilder|ognl|getRuntime|exec\()",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# CVE-2014-6271 Shellshock extendido — incluye variantes con distintos
+# caracteres entre () y {.
+_SHELLSHOCK_EXTENDED_RE = re.compile(r"\(\s*\)\s*\{[^}]{0,20}\}[\s;]", re.IGNORECASE)
+
+# Apache Solr Velocity RCE (CVE-2019-17558): params.resource.loader.enabled=true
+_SOLR_VELOCITY_RE = re.compile(
+    r"params\.resource\.loader\.enabled|VelocityResponseWriter",
+    re.IGNORECASE,
+)
+
+# Spring4Shell (CVE-2022-22965): class.module.classLoader.resources...
+_SPRING4SHELL_RE = re.compile(
+    r"class\.module\.classLoader|class\.getResource",
+    re.IGNORECASE,
+)
+
 # Una IP que genera >5 requests en el mismo segundo = herramienta automatizada
 _MAX_REQUESTS_PER_SECOND = 5
 
-# Una IP con >5 UAs distintos = rotacion de UA (nikto)
+# Una IP con >=5 UAs distintos = rotacion de UA (nikto). Calibrado en mrrobot:
+# Nikto envia 29 UAs distintos por scan, pero queremos detectar scans parciales.
 _UA_ROTATION_THRESHOLD = 5
 
 # Una IP con >15 requests totales en la ventana es sospechosa
@@ -95,6 +150,14 @@ _TRIAGE_MIN_REQUESTS = 15
 # 404 ratio: si >40% de los requests de una IP son 404 y hay al menos 8 = scanner
 _TRIAGE_404_RATIO = 0.40
 _TRIAGE_404_MIN = 8
+
+# Un IP marcado como sospechoso en una ventana se mantiene en el suspect_list
+# durante este numero de ventanas silenciosas. Pasado ese punto, se purga
+# para evitar acumulacion infinita de estado.
+_SUSPECT_TTL_WINDOWS = 5
+
+# Marcadores SQLi compartidos entre triage y detect
+_SQLI_MARKERS = ("' or", "1=1", "union select", "sleep(", "%27")
 
 
 # Patrones de comandos webshell ordenados por especificidad. El primer match
@@ -226,15 +289,197 @@ def extract_webshell_cmd(url: str) -> str | None:
     """
     Extrae y decodifica el parametro ?cmd=... de una URL de webshell.
 
+    Soporta tres formatos:
+      1. `?cmd=id` — sin encoding
+      2. `?cmd=cat%20%2Fetc%2Fpasswd` — valor URL-encoded (comun)
+      3. `?cmd%3Did` — `=` doblemente encoded como `%3D` (raro pero sucede)
+
+    Importante: matchea sobre la URL CRUDA (encoded) y solo decodifica el
+    valor capturado. Decodificar la URL antes rompe el regex porque `%20`
+    se vuelve espacio y `[^&\\s]+` se corta.
+
     Retorna None si no hay cmd= en la URL.
     """
+    # Formato 1 y 2: cmd=valor (el valor puede estar URL-encoded)
     match = re.search(r"[?&]cmd=([^&\s]+)", url)
+    if not match:
+        # Formato 3: cmd%3D<valor> (el = esta URL-encoded como %3D)
+        match = re.search(r"[?&]cmd%3[dD]([^&\s]+)", url)
     if not match:
         return None
     try:
         return unquote(match.group(1))
     except Exception:
         return match.group(1)
+
+
+def _decay_suspects(
+    suspect_list: dict, active_ips: set[str] | None = None
+) -> dict:
+    """
+    Aplica TTL al suspect_list para evitar acumulacion infinita de IPs.
+    IPs ausentes en la ventana actual incrementan silent_windows; cuando
+    superan _SUSPECT_TTL_WINDOWS y no tienen acciones confirmadas, se purgan.
+    Las IPs con confirmed_actions (webshell_execution, login_success) nunca
+    expiran porque representan compromiso confirmado.
+    """
+    active = active_ips or set()
+    out: dict = {}
+    for ip, entry in suspect_list.items():
+        new_entry = dict(entry)
+        if ip not in active:
+            new_entry["silent_windows"] = new_entry.get("silent_windows", 0) + 1
+            confirmed = new_entry.get("confirmed_actions") or {}
+            if not confirmed and new_entry["silent_windows"] >= _SUSPECT_TTL_WINDOWS:
+                continue
+        out[ip] = new_entry
+    return out
+
+
+def _build_ip_profiles(raw_logs: list[dict]) -> dict:
+    """
+    Pasada unica sobre raw_logs: construye perfiles por IP usados tanto por
+    el triage como por la deteccion. Antes ambos nodos parseaban los mismos
+    logs por separado (~60% codigo duplicado). Ahora comparten la pasada.
+
+    Devuelve un dict con:
+      - ip_profiles: contadores por IP (total, 404, login, webshell, sqli, etc)
+      - ip_per_second: dict[ip, Counter[secondkey]]
+      - ip_uas: dict[ip, set[user_agent]]
+      - ip_weird_methods: dict[ip, set[method]]
+      - ip_404_sizes: dict[ip, Counter[body_size]]
+      - seen_404_urls: dict[ip, set[url]]
+      - webshell_commands: lista cronologica de cmds ejecutados via webshell
+      - post_auth_count: total de POSTs a rutas de autenticacion
+      - auth_post_per_ip: Counter de POSTs a /login por IP (para detectar bruteforce)
+    """
+    ip_profiles: dict[str, dict] = {}
+    ip_per_second: dict[str, Counter] = {}
+    ip_uas: dict[str, set[str]] = {}
+    ip_weird_methods: dict[str, set[str]] = {}
+    ip_404_sizes: dict[str, Counter] = {}
+    seen_404_urls: dict[str, set] = {}
+    webshell_commands: list[dict] = []
+    auth_post_per_ip: Counter = Counter()
+    post_auth_count = 0
+
+    def get_profile(ip: str) -> dict:
+        if ip not in ip_profiles:
+            ip_profiles[ip] = {
+                "total": 0,
+                "404_count": 0,
+                "shellshock_attempts": 0,
+                "log4shell_attempts": 0,
+                "ognl_attempts": 0,
+                "solr_velocity_attempts": 0,
+                "spring4shell_attempts": 0,
+                "tool_detected": "",
+                "webshell_scan": 0,
+                "webshell_execution": 0,
+                "webshell_sub_tactics": [],
+                "login_failed": 0,
+                "login_success": 0,
+                "sqli_attempts": 0,
+            }
+        return ip_profiles[ip]
+
+    for log in raw_logs:
+        msg = log.get("message", "")
+        m = _TRIAGE_LOG_RE.match(msg)
+        if not m:
+            continue
+
+        ip = m.group(1)
+        if ip.startswith("127."):
+            continue
+
+        hour, minute = m.group(3), m.group(4)
+        method = m.group(5).upper()
+        url = m.group(6)
+        status = int(m.group(7))
+        body_size = m.group(8)
+        user_agent = m.group(9).lower()
+        url_lower = url.lower()
+
+        profile = get_profile(ip)
+        profile["total"] += 1
+
+        ip_per_second.setdefault(ip, Counter())[f"{hour}:{minute}"] += 1
+        if user_agent and user_agent != "-":
+            ip_uas.setdefault(ip, set()).add(user_agent)
+
+        if not profile["tool_detected"]:
+            for tool_name, sig in _TOOL_UA_SIGNATURES.items():
+                if sig in user_agent:
+                    profile["tool_detected"] = tool_name
+                    break
+
+        if method not in _STANDARD_HTTP_METHODS:
+            ip_weird_methods.setdefault(ip, set()).add(method)
+
+        if _SHELLSHOCK_RE.search(user_agent) or _SHELLSHOCK_RE.search(url_lower):
+            profile["shellshock_attempts"] += 1
+
+        # CVE-specific injection signatures en URL o User-Agent.
+        # Ref: CVE-2021-44228 (Log4Shell), CVE-2017-5638 (Struts2),
+        # CVE-2022-26134 (Confluence), CVE-2019-17558 (Solr), CVE-2022-22965 (Spring).
+        full_request = f"{url} {user_agent}"
+        if _LOG4SHELL_RE.search(full_request):
+            profile["log4shell_attempts"] += 1
+        if _OGNL_RE.search(full_request) or _OGNL_CONFLUENCE_RE.search(full_request):
+            profile["ognl_attempts"] += 1
+        if _SOLR_VELOCITY_RE.search(full_request):
+            profile["solr_velocity_attempts"] += 1
+        if _SPRING4SHELL_RE.search(full_request):
+            profile["spring4shell_attempts"] += 1
+
+        if "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower:
+            if status == 200:
+                profile["webshell_execution"] += 1
+                cmd = extract_webshell_cmd(url)
+                if cmd:
+                    sub_tactic, sub_id = classify_webshell_cmd(cmd)
+                    profile["webshell_sub_tactics"].append(sub_tactic)
+                    webshell_commands.append({
+                        "timestamp": log.get("timestamp", ""),
+                        "ip": ip,
+                        "cmd": cmd[:120],
+                        "sub_tactic": sub_tactic,
+                        "sub_tactic_id": sub_id,
+                    })
+            else:
+                profile["webshell_scan"] += 1
+
+        if "wp-login" in url_lower and method == "POST":
+            if status == 302:
+                profile["login_success"] += 1
+            else:
+                profile["login_failed"] += 1
+
+        if any(marker in url_lower for marker in _SQLI_MARKERS):
+            profile["sqli_attempts"] += 1
+
+        if method == "POST" and any(p in url_lower for p in _SENSITIVE_POST_PATHS):
+            post_auth_count += 1
+            auth_post_per_ip[ip] += 1
+
+        if status == 404:
+            profile["404_count"] += 1
+            seen_404_urls.setdefault(ip, set()).add(url)
+            if body_size.isdigit():
+                ip_404_sizes.setdefault(ip, Counter())[body_size] += 1
+
+    return {
+        "ip_profiles": ip_profiles,
+        "ip_per_second": ip_per_second,
+        "ip_uas": ip_uas,
+        "ip_weird_methods": ip_weird_methods,
+        "ip_404_sizes": ip_404_sizes,
+        "seen_404_urls": seen_404_urls,
+        "webshell_commands": webshell_commands,
+        "auth_post_per_ip": auth_post_per_ip,
+        "post_auth_count": post_auth_count,
+    }
 
 
 def collect_logs(state: ObserverState) -> dict:
@@ -255,6 +500,8 @@ def collect_logs(state: ObserverState) -> dict:
     summary = collector.summarize_logs(raw_logs)
 
     has_new = len(raw_logs) > 0
+    with _OBS_STATS_LOCK:
+        OBSERVER_NODE_STATS["collect_calls"] += 1
     logger.info(f"[Observador] Logs recolectados: {len(raw_logs)}, nuevos: {has_new}")
 
     return {
@@ -300,86 +547,37 @@ def triage_anomalies(state: ObserverState) -> dict:
     raw_logs = state.get("raw_logs", [])
 
     if not raw_logs:
+        with _OBS_STATS_LOCK:
+            OBSERVER_NODE_STATS["triage_no_signal"] += 1
         logger.info("[Observador] Triaje: sin logs, ciclo terminado")
         return {"triage_result": "no_signal", "anomaly_count": 0}
 
-    # Perfil por IP para analisis agregado
-    ip_total: Counter = Counter()
-    ip_404: Counter = Counter()
-    ip_per_second: dict[str, Counter] = {}
-    ip_404_sizes: dict[str, Counter] = {}
-    ip_uas: dict[str, set[str]] = {}
-    ip_weird_methods: dict[str, set[str]] = {}
-    ip_tools: dict[str, str] = {}  # ip -> firma literal detectada
-    ip_shellshock: Counter = Counter()
+    # Ablation: en modo pure-LLM saltamos las heuristicas T1-T10 y siempre
+    # pasamos al LLM. Esto sirve como baseline para medir el aporte del triage.
+    if not state.get("use_heuristics", True):
+        with _OBS_STATS_LOCK:
+            OBSERVER_NODE_STATS["triage_signal"] += 1
+        logger.info(
+            f"[Observador] Triaje (pure-LLM): {len(raw_logs)} logs, pass-through"
+        )
+        return {"triage_result": "signal", "anomaly_count": len(raw_logs)}
 
-    post_auth_count = 0
-    webshell_active = False
-
-    for log in raw_logs:
-        msg = log.get("message", "")
-        m = _TRIAGE_LOG_RE.match(msg)
-        if not m:
-            continue
-
-        ip = m.group(1)
-        if ip.startswith("127."):
-            continue
-
-        hour, minute = m.group(3), m.group(4)
-        method = m.group(5).upper()
-        url = m.group(6).lower()
-        status = m.group(7)
-        body_size = m.group(8)
-        user_agent = m.group(9).lower()
-
-        ip_total[ip] += 1
-
-        second_key = f"{hour}:{minute}"
-        ip_per_second.setdefault(ip, Counter())[second_key] += 1
-
-        if user_agent and user_agent != "-":
-            ip_uas.setdefault(ip, set()).add(user_agent)
-
-        # T1: firma literal de herramienta en UA
-        if ip not in ip_tools:
-            for tool_name, sig in _TOOL_UA_SIGNATURES.items():
-                if sig in user_agent:
-                    ip_tools[ip] = tool_name
-                    break
-
-        # T3: metodo HTTP fuera de lo estandar
-        if method not in _STANDARD_HTTP_METHODS:
-            ip_weird_methods.setdefault(ip, set()).add(method)
-
-        # T4: shellshock en UA o URL
-        if _SHELLSHOCK_RE.search(user_agent) or _SHELLSHOCK_RE.search(url):
-            ip_shellshock[ip] += 1
-
-        # 404 tracking
-        if status == "404":
-            ip_404[ip] += 1
-            if body_size.isdigit():
-                ip_404_sizes.setdefault(ip, Counter())[body_size] += 1
-
-        # T8: POST a ruta de autenticacion
-        if method == "POST" and any(p in url for p in _SENSITIVE_POST_PATHS):
-            post_auth_count += 1
-
-        # T9: webshell activa
-        if status.startswith("2") and ("cmd=" in url or "cmd%3" in url or "cmd%20" in url):
-            webshell_active = True
+    p = _build_ip_profiles(raw_logs)
+    profiles = p["ip_profiles"]
 
     signals_found: list[str] = []
     suspicious_ips: set[str] = set()
 
-    # T1: herramientas identificadas por firma literal
-    for ip, tool_name in ip_tools.items():
-        signals_found.append(f"T1 tool_ua: {tool_name} desde {ip} ({ip_total[ip]} reqs)")
-        suspicious_ips.add(ip)
+    # T1: herramientas identificadas por firma literal en UA
+    for ip, prof in profiles.items():
+        if prof["tool_detected"]:
+            signals_found.append(
+                f"T1 tool_ua: {prof['tool_detected']} desde {ip} ({prof['total']} reqs)"
+            )
+            suspicious_ips.add(ip)
 
     # T2: rotacion de user-agents (nikto)
-    for ip, uas in ip_uas.items():
+    for ip, uas in p["ip_uas"].items():
         if len(uas) >= _UA_ROTATION_THRESHOLD:
             signals_found.append(
                 f"T2 ua_rotation: IP {ip} uso {len(uas)} UAs distintos — scanner con rotacion"
@@ -387,7 +585,7 @@ def triage_anomalies(state: ObserverState) -> dict:
             suspicious_ips.add(ip)
 
     # T3: metodos HTTP no estandar
-    for ip, methods in ip_weird_methods.items():
+    for ip, methods in p["ip_weird_methods"].items():
         if methods:
             examples = ", ".join(sorted(methods)[:5])
             signals_found.append(
@@ -396,12 +594,54 @@ def triage_anomalies(state: ObserverState) -> dict:
             suspicious_ips.add(ip)
 
     # T4: shellshock
-    for ip, count in ip_shellshock.items():
-        signals_found.append(f"T4 shellshock: IP {ip} envio {count} payloads Shellshock")
-        suspicious_ips.add(ip)
+    for ip, prof in profiles.items():
+        if prof["shellshock_attempts"]:
+            signals_found.append(
+                f"T4 shellshock: IP {ip} envio {prof['shellshock_attempts']} payloads Shellshock"
+            )
+            suspicious_ips.add(ip)
+
+    # T4b: Log4Shell (CVE-2021-44228). Payload ${jndi:ldap://...} en cualquier
+    # header o URL. Caracteristica unica: no hay falsos positivos porque ${jndi:
+    # no es sintaxis valida HTTP/HTML.
+    for ip, prof in profiles.items():
+        if prof.get("log4shell_attempts", 0):
+            signals_found.append(
+                f"T4b log4shell: IP {ip} envio {prof['log4shell_attempts']} payloads JNDI "
+                f"(${{jndi:...}}) — CVE-2021-44228 intento de RCE"
+            )
+            suspicious_ips.add(ip)
+
+    # T4c: OGNL injection (Struts2 CVE-2017-5638, Confluence CVE-2022-26134).
+    # Payload %{...Runtime} en Content-Type (Struts) o URI (Confluence).
+    for ip, prof in profiles.items():
+        if prof.get("ognl_attempts", 0):
+            signals_found.append(
+                f"T4c ognl_injection: IP {ip} envio {prof['ognl_attempts']} payloads OGNL "
+                f"— CVE-2017-5638/CVE-2022-26134 RCE pre-auth"
+            )
+            suspicious_ips.add(ip)
+
+    # T4d: Solr Velocity Template (CVE-2019-17558).
+    for ip, prof in profiles.items():
+        if prof.get("solr_velocity_attempts", 0):
+            signals_found.append(
+                f"T4d solr_velocity: IP {ip} habilito VelocityResponseWriter "
+                f"— CVE-2019-17558 RCE Solr"
+            )
+            suspicious_ips.add(ip)
+
+    # T4e: Spring4Shell (CVE-2022-22965).
+    for ip, prof in profiles.items():
+        if prof.get("spring4shell_attempts", 0):
+            signals_found.append(
+                f"T4e spring4shell: IP {ip} manipulo class.module.classLoader "
+                f"— CVE-2022-22965"
+            )
+            suspicious_ips.add(ip)
 
     # T5: alta velocidad de requests
-    for ip, sec_counts in ip_per_second.items():
+    for ip, sec_counts in p["ip_per_second"].items():
         max_per_sec = max(sec_counts.values())
         if max_per_sec >= _MAX_REQUESTS_PER_SECOND:
             signals_found.append(
@@ -410,8 +650,9 @@ def triage_anomalies(state: ObserverState) -> dict:
             suspicious_ips.add(ip)
 
     # T6: alta tasa de 404
-    for ip, count_404 in ip_404.items():
-        total = ip_total.get(ip, 1)
+    for ip, prof in profiles.items():
+        total = prof["total"]
+        count_404 = prof["404_count"]
         if total >= _TRIAGE_MIN_REQUESTS and count_404 / total >= _TRIAGE_404_RATIO:
             signals_found.append(
                 f"T6 scan_404: IP {ip} {count_404}/{total} 404s ({count_404/total:.0%})"
@@ -419,7 +660,7 @@ def triage_anomalies(state: ObserverState) -> dict:
             suspicious_ips.add(ip)
 
     # T7: body size uniforme en 404s (nikto template)
-    for ip, size_counter in ip_404_sizes.items():
+    for ip, size_counter in p["ip_404_sizes"].items():
         total_404 = sum(size_counter.values())
         if total_404 >= 20:
             top_size, top_count = size_counter.most_common(1)[0]
@@ -431,30 +672,41 @@ def triage_anomalies(state: ObserverState) -> dict:
                 )
                 suspicious_ips.add(ip)
 
-    # T8: POST a autenticacion
-    if post_auth_count > 0:
-        signals_found.append(f"T8 auth_post: {post_auth_count} POSTs a rutas de login")
+    # T8: POST a autenticacion (bruteforce si misma IP repite)
+    if p["post_auth_count"] > 0:
+        signals_found.append(
+            f"T8 auth_post: {p['post_auth_count']} POSTs a rutas de login"
+        )
+        for ip, count in p["auth_post_per_ip"].items():
+            if count >= 3:
+                suspicious_ips.add(ip)
 
     # T9: webshell activa
-    if webshell_active:
-        signals_found.append("T9 webshell_active: cmd= con status 2xx detectado")
+    webshell_ips = [ip for ip, prof in profiles.items() if prof["webshell_execution"]]
+    if webshell_ips:
+        signals_found.append(
+            f"T9 webshell_active: ejecucion confirmada desde {','.join(webshell_ips)}"
+        )
+        suspicious_ips.update(webshell_ips)
 
     # T10: IP previamente confirmada como sospechosa sigue activa en esta ventana.
     # Una vez que una IP disparo el triage, cualquier actividad posterior de esa
-    # IP debe mantener el flujo activo, aunque el tráfico sea bajo.
+    # IP debe mantener el flujo activo, aunque el trafico sea bajo.
     prior_suspects = state.get("suspect_list", {})
-    for ip in ip_total:
+    for ip, prof in profiles.items():
         if ip in prior_suspects and ip not in suspicious_ips:
             signals_found.append(
                 f"T10 known_attacker: IP {ip} ya marcada en ventanas previas "
-                f"({ip_total[ip]} reqs en esta ventana)"
+                f"({prof['total']} reqs en esta ventana)"
             )
             suspicious_ips.add(ip)
 
-    anomaly_count = sum(ip_total[ip] for ip in suspicious_ips)
+    anomaly_count = sum(profiles[ip]["total"] for ip in suspicious_ips if ip in profiles)
     anomaly_count = min(anomaly_count, len(raw_logs))
 
     if signals_found:
+        with _OBS_STATS_LOCK:
+            OBSERVER_NODE_STATS["triage_signal"] += 1
         ratio = anomaly_count / max(len(raw_logs), 1)
         logger.info(
             f"[Observador] Triaje: {len(signals_found)} senales "
@@ -463,6 +715,8 @@ def triage_anomalies(state: ObserverState) -> dict:
         logger.debug(f"[Observador] Senales activas: {signals_found}")
         return {"triage_result": "signal", "anomaly_count": anomaly_count}
 
+    with _OBS_STATS_LOCK:
+        OBSERVER_NODE_STATS["triage_no_signal"] += 1
     logger.info(f"[Observador] Triaje: sin senal relevante ({len(raw_logs)} logs)")
     return {"triage_result": "no_signal", "anomaly_count": 0}
 
@@ -486,6 +740,8 @@ def refine_analysis(state: ObserverState) -> dict:
     raw_logs = state.get("raw_logs", [])
     refinement_count = state.get("refinement_count", 0) + 1
     prev_classification = state.get("current_classification")
+    with _OBS_STATS_LOCK:
+        OBSERVER_NODE_STATS["refine_calls"] += 1
 
     if not raw_logs:
         return {"refinement_count": refinement_count}
@@ -569,167 +825,72 @@ def detect_anomalies(state: ObserverState) -> dict:
     raw_logs = state.get("raw_logs", [])
 
     if not raw_logs:
-        return {"anomaly_signals": {}, "suspect_list": state.get("suspect_list", {})}
+        return {
+            "anomaly_signals": {},
+            "suspect_list": _decay_suspects(state.get("suspect_list", {})),
+        }
 
-    SQLI_MARKERS = ["' or", "1=1", "union select", "sleep(", "%27"]
+    # Ablation: en modo pure-LLM no computamos signals ni suspect_list.
+    # El LLM clasifica solo con el log_summary crudo.
+    if not state.get("use_heuristics", True):
+        return {
+            "anomaly_signals": {},
+            "suspect_list": state.get("suspect_list", {}),
+        }
+
     SUSPICION_THRESHOLD = 3
 
-    ip_profiles: dict[str, dict] = {}
-    seen_404_urls: dict[str, set] = {}
-    ip_per_second: dict[str, Counter] = {}
-    ip_uas: dict[str, set[str]] = {}
-    ip_weird_methods: dict[str, set[str]] = {}
-    ip_404_sizes: dict[str, Counter] = {}
-    # Comandos ejecutados via webshell, ordenados cronologicamente
-    webshell_commands: list[dict] = []
+    p = _build_ip_profiles(raw_logs)
+    ip_profiles = p["ip_profiles"]
+    webshell_commands = p["webshell_commands"]
 
-    def get_profile(ip: str) -> dict:
-        if ip not in ip_profiles:
-            ip_profiles[ip] = {
-                "total": 0,
-                "attack_score": 0.0,
-                "tool_detected": "",
-                "distinct_uas": 0,
-                "weird_methods": 0,
-                "shellshock_attempts": 0,
-                "webshell_scan": 0,
-                "webshell_execution": 0,
-                "webshell_sub_tactics": [],
-                "login_failed": 0,
-                "login_success": 0,
-                "sqli_attempts": 0,
-                "max_req_per_sec": 0,
-            }
-        return ip_profiles[ip]
+    # Scoring sobre los perfiles construidos en la pasada compartida
+    for ip, prof in ip_profiles.items():
+        score = 0.0
+        if prof["tool_detected"]:
+            score += 10
+        score += 5 * prof["shellshock_attempts"]
+        score += 10 * prof["webshell_execution"]
+        score += 0.5 * prof["webshell_scan"]
+        score += 10 * prof["login_success"]
+        score += 1 * prof["login_failed"]
+        score += 2 * prof["sqli_attempts"]
 
-    for log in raw_logs:
-        msg = log.get("message", "")
-        m = _TRIAGE_LOG_RE.match(msg)
-        if not m:
-            continue
+        distinct_uas = len(p["ip_uas"].get(ip, ()))
+        if distinct_uas >= _UA_ROTATION_THRESHOLD:
+            score += 8
+        prof["distinct_uas"] = distinct_uas
 
-        ip = m.group(1)
-        if ip.startswith("127."):
-            continue
+        weird = p["ip_weird_methods"].get(ip, set())
+        prof["weird_methods"] = len(weird)
+        if weird:
+            score += 4
 
-        hour, minute = m.group(3), m.group(4)
-        method = m.group(5).upper()
-        url = m.group(6)
-        status = int(m.group(7))
-        body_size = m.group(8)
-        user_agent = m.group(9).lower()
-        url_lower = url.lower()
+        sec_counts = p["ip_per_second"].get(ip, {})
+        max_rps = max(sec_counts.values()) if sec_counts else 0
+        prof["max_req_per_sec"] = max_rps
+        if max_rps >= _MAX_REQUESTS_PER_SECOND:
+            score += min(max_rps, 20)
 
-        profile = get_profile(ip)
-        profile["total"] += 1
+        urls_404 = p["seen_404_urls"].get(ip, set())
+        if urls_404:
+            prof["scanning_404"] = len(urls_404)
+            score += min(len(urls_404) * 0.05, 5)
 
-        sec_key = f"{hour}:{minute}"
-        ip_per_second.setdefault(ip, Counter())[sec_key] += 1
-
-        if user_agent and user_agent != "-":
-            ip_uas.setdefault(ip, set()).add(user_agent)
-
-        # Firma literal de herramienta en UA
-        if not profile["tool_detected"]:
-            for tool_name, sig in _TOOL_UA_SIGNATURES.items():
-                if sig in user_agent:
-                    profile["tool_detected"] = tool_name
-                    profile["attack_score"] += 10
-                    break
-
-        # Metodo HTTP no estandar
-        if method not in _STANDARD_HTTP_METHODS:
-            ip_weird_methods.setdefault(ip, set()).add(method)
-
-        # Shellshock
-        if _SHELLSHOCK_RE.search(user_agent) or _SHELLSHOCK_RE.search(url_lower):
-            profile["shellshock_attempts"] += 1
-            profile["attack_score"] += 5
-
-        # Webshell
-        if "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower:
-            if status == 200:
-                profile["webshell_execution"] += 1
-                profile["attack_score"] += 10
-                # Extraer comando y clasificar sub-tactica
-                cmd = extract_webshell_cmd(url)
-                if cmd:
-                    sub_tactic, sub_id = classify_webshell_cmd(cmd)
-                    profile["webshell_sub_tactics"].append(sub_tactic)
-                    webshell_commands.append({
-                        "timestamp": log.get("timestamp", ""),
-                        "ip": ip,
-                        "cmd": cmd[:120],
-                        "sub_tactic": sub_tactic,
-                        "sub_tactic_id": sub_id,
-                    })
-            else:
-                profile["webshell_scan"] += 1
-                profile["attack_score"] += 0.5
-
-        # Login attempts
-        if "wp-login" in url_lower and method == "POST":
-            if status == 302:
-                profile["login_success"] += 1
-                profile["attack_score"] += 10
-            else:
-                profile["login_failed"] += 1
-                profile["attack_score"] += 1
-
-        # Admin panel access
-        if "wp-admin" in url_lower and status == 200 and method == "GET":
-            profile["attack_score"] += 3
-
-        # SQLi
-        if any(marker in url_lower for marker in SQLI_MARKERS):
-            profile["sqli_attempts"] += 1
-            profile["attack_score"] += 2
-
-        if status == 404:
-            seen_404_urls.setdefault(ip, set()).add(url)
-            if body_size.isdigit():
-                ip_404_sizes.setdefault(ip, Counter())[body_size] += 1
-
-    # Rotacion de UA (nikto)
-    for ip, uas in ip_uas.items():
-        if ip in ip_profiles:
-            ip_profiles[ip]["distinct_uas"] = len(uas)
-            if len(uas) >= _UA_ROTATION_THRESHOLD:
-                ip_profiles[ip]["attack_score"] += 8
-
-    # Metodos HTTP no estandar
-    for ip, methods in ip_weird_methods.items():
-        if ip in ip_profiles and methods:
-            ip_profiles[ip]["weird_methods"] = len(methods)
-            ip_profiles[ip]["attack_score"] += 4
-
-    # Velocidad de requests
-    for ip, sec_counts in ip_per_second.items():
-        if ip in ip_profiles:
-            max_rps = max(sec_counts.values())
-            ip_profiles[ip]["max_req_per_sec"] = max_rps
-            if max_rps >= _MAX_REQUESTS_PER_SECOND:
-                ip_profiles[ip]["attack_score"] += min(max_rps, 20)
-
-    # 404 enumeration
-    for ip, urls in seen_404_urls.items():
-        if ip in ip_profiles:
-            ip_profiles[ip]["scanning_404"] = len(urls)
-            ip_profiles[ip]["attack_score"] += min(len(urls) * 0.05, 5)
-
-    # Body size uniforme en 404s (template de wordlist scanner)
-    for ip, size_counter in ip_404_sizes.items():
+        size_counter = p["ip_404_sizes"].get(ip, Counter())
         total_404 = sum(size_counter.values())
-        if ip in ip_profiles and total_404 >= 20:
+        if total_404 >= 20:
             top_size, top_count = size_counter.most_common(1)[0]
             concentration = top_count / total_404
             if concentration >= 0.70:
-                ip_profiles[ip]["uniform_404_ratio"] = round(concentration, 2)
-                ip_profiles[ip]["attack_score"] += 6
+                prof["uniform_404_ratio"] = round(concentration, 2)
+                score += 6
+
+        prof["attack_score"] = round(score, 1)
 
     suspicious = {
         ip: {k: v for k, v in prof.items() if k != "attack_score" and v != 0}
-        | {"attack_score": round(prof["attack_score"], 1)}
+        | {"attack_score": prof["attack_score"]}
         for ip, prof in ip_profiles.items()
         if prof["attack_score"] >= SUSPICION_THRESHOLD
     }
@@ -737,8 +898,9 @@ def detect_anomalies(state: ObserverState) -> dict:
         sorted(suspicious.items(), key=lambda x: -x[1].get("attack_score", 0))[:5]
     )
 
-    # Actualizar lista de sospechosos persistente con datos de este ciclo
-    suspect_list = dict(state.get("suspect_list", {}))
+    # Decay primero: incrementa silent_windows en IPs ausentes y purga las
+    # que llevan demasiadas ventanas sin actividad.
+    suspect_list = _decay_suspects(state.get("suspect_list", {}), active_ips=set(top_suspicious))
     now_str = state.get("window_end", "")
 
     for ip, data in top_suspicious.items():
@@ -748,6 +910,7 @@ def detect_anomalies(state: ObserverState) -> dict:
                 "cumulative_score": 0.0,
                 "first_seen": now_str,
                 "confirmed_actions": {},
+                "silent_windows": 0,
             }
         entry = suspect_list[ip]
         entry["windows_flagged"] += 1
@@ -755,13 +918,14 @@ def detect_anomalies(state: ObserverState) -> dict:
             entry["cumulative_score"] + data.get("attack_score", 0), 1
         )
         entry["last_seen"] = now_str
+        entry["silent_windows"] = 0
         for action in ("webshell_execution", "login_success"):
             if data.get(action):
                 entry["confirmed_actions"][action] = (
                     entry["confirmed_actions"].get(action, 0) + data[action]
                 )
 
-    # Enriquecer las señales actuales con contexto historico
+    # Enriquecer las senales actuales con contexto historico
     for ip, data in top_suspicious.items():
         entry = suspect_list[ip]
         confirmed = entry.get("confirmed_actions", {})
@@ -832,10 +996,16 @@ def classify_tactic(state: ObserverState) -> dict:
     ]
 
     model = _get_model()
+    _start_call = time.monotonic()
     response = model.invoke(messages)
+    _latency_ms = int((time.monotonic() - _start_call) * 1000)
+    with _OBS_STATS_LOCK:
+        OBSERVER_NODE_STATS["classify_calls"] += 1
 
     # Parsear la respuesta JSON del LLM
     classification = _parse_classification(response.content)
+    if classification is not None:
+        classification["llm_latency_ms"] = _latency_ms
 
     if classification:
         tiw = classification.get("tactics_in_window", [])
@@ -877,6 +1047,7 @@ def generate_recommendation(state: ObserverState) -> dict:
     return {
         "classification_history": history,
         "current_classification": classification,
+        "refinement_count": 0,
     }
 
 

@@ -13,6 +13,8 @@ El flujo es:
 
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 
 import docker
@@ -33,6 +35,22 @@ class ExecResult:
     command: str
     container: str
     timed_out: bool = False
+    duration_ms: int = 0  # tiempo total del exec_run, incluido timeout(1)
+
+
+# Contadores globales de tool execution para reportes al final de corrida.
+DOCKER_STATS: dict[str, float | int] = {
+    "exec_count": 0,
+    "total_seconds": 0.0,
+    "timed_out_count": 0,
+    "error_count": 0,
+}
+_DOCKER_STATS_LOCK = threading.Lock()
+
+
+def reset_docker_stats() -> None:
+    with _DOCKER_STATS_LOCK:
+        DOCKER_STATS.update(exec_count=0, total_seconds=0.0, timed_out_count=0, error_count=0)
 
 
 class DockerClient:
@@ -79,6 +97,7 @@ class DockerClient:
 
         logger.info(f"[{container_name}] Ejecutando: {command}")
 
+        _t0 = time.monotonic()
         try:
             # exec_run retorna (exit_code, output). demux=True separa stdout/stderr.
             # Docker SDK exec_run no tiene parametro timeout; se aplica via
@@ -101,13 +120,29 @@ class DockerClient:
                 stdout = stdout_full
             stderr = stderr_full
 
+            # timeout(1) de coreutils devuelve exit code 124 cuando mata al hijo por tiempo
+            timed_out = exit_code == 124
+            _dur = time.monotonic() - _t0
+            with _DOCKER_STATS_LOCK:
+                DOCKER_STATS["exec_count"] = int(DOCKER_STATS["exec_count"]) + 1
+                DOCKER_STATS["total_seconds"] = float(DOCKER_STATS["total_seconds"]) + _dur
+                if timed_out:
+                    DOCKER_STATS["timed_out_count"] = int(DOCKER_STATS["timed_out_count"]) + 1
+
             result = ExecResult(
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
                 command=command,
                 container=container_name,
+                timed_out=timed_out,
+                duration_ms=int(_dur * 1000),
             )
+
+            if timed_out:
+                logger.warning(
+                    f"[{container_name}] Comando excedio timeout de {timeout}s: {command}"
+                )
 
             logger.info(f"[{container_name}] Exit code: {exit_code}, output: {len(stdout_full)} chars")
 
@@ -122,12 +157,17 @@ class DockerClient:
 
         except (APIError, ContainerError) as e:
             logger.error(f"[{container_name}] Error ejecutando '{command}': {e}")
+            with _DOCKER_STATS_LOCK:
+                DOCKER_STATS["exec_count"] = int(DOCKER_STATS["exec_count"]) + 1
+                DOCKER_STATS["error_count"] = int(DOCKER_STATS["error_count"]) + 1
+                DOCKER_STATS["total_seconds"] = float(DOCKER_STATS["total_seconds"]) + (time.monotonic() - _t0)
             return ExecResult(
                 exit_code=-1,
                 stdout="",
                 stderr=str(e),
                 command=command,
                 container=container_name,
+                duration_ms=int((time.monotonic() - _t0) * 1000),
             )
 
     def is_container_running(self, container_name: str) -> bool:
@@ -137,27 +177,3 @@ class DockerClient:
             return container.status == "running"
         except NotFound:
             return False
-
-    def get_container_ip(self, container_name: str, network: str = "docker_attack_net") -> str:
-        """Obtiene la IP de un container en una red especifica."""
-        try:
-            container = self._client.containers.get(container_name)
-            networks = container.attrs["NetworkSettings"]["Networks"]
-            if network in networks:
-                return networks[network]["IPAddress"]
-        except (NotFound, KeyError):
-            pass
-        return ""
-
-    def list_lab_containers(self) -> list[dict]:
-        """Lista los containers del lab con su estado."""
-        lab_names = {"attacker", "dvwa", "loki", "grafana", "promtail"}
-        result = []
-        for container in self._client.containers.list(all=True):
-            if container.name in lab_names:
-                result.append({
-                    "name": container.name,
-                    "status": container.status,
-                    "image": container.image.tags[0] if container.image.tags else "unknown",
-                })
-        return result

@@ -2,41 +2,70 @@
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from rich.console import Console
 
-from src.agents.attacker.objectives import check_tactic_objective
+from src.agents.attacker.memory import (
+    compute_target_fingerprint,
+    lookup_playbook,
+    record_run_completion,
+    record_tactic_success,
+    upsert_playbook_recon,
+)
+from src.agents.attacker.objectives import check_tactic_objective, scan_for_flags
 from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT, build_tactic_prompt
 from src.agents.attacker.state import AttackerState
 from src.agents.attacker.tools import ATTACKER_TOOLS
 from src.config.mitre_mapping import get_tactic_by_name
 from src.config.settings import settings
-from src.llm.provider import _with_retry, get_chat_model
+from src.llm.provider import get_chat_model
 
 logger = logging.getLogger(__name__)
 _console = Console()
 
 _SOFT_WARN_ACTIONS = 15
 _HARD_WARN_ACTIONS = 30
-_MAX_REPLAN_ATTEMPTS = 5
+_MAX_REPLAN_ATTEMPTS = 15
 
 _model_with_tools = None
+_model_lock = __import__("threading").Lock()
 
 
 def _get_model():
+    """Singleton thread-safe del modelo con tools bound.
+
+    El lock previene doble inicializacion cuando plan_tactic y validate_result
+    corren concurrentemente (raro pero posible con LangGraph streams).
+    """
     global _model_with_tools
-    if _model_with_tools is None:
-        base = get_chat_model()
-        inner = base.bound if hasattr(base, "bound") else base
-        _model_with_tools = _with_retry(inner.bind_tools(ATTACKER_TOOLS))
+    if _model_with_tools is not None:
+        return _model_with_tools
+    with _model_lock:
+        if _model_with_tools is None:
+            # _InstrumentedChatModel.bind_tools maneja el unwrap de retry
+            # internamente y re-aplica el proxy, preservando el conteo de tokens.
+            _model_with_tools = get_chat_model().bind_tools(ATTACKER_TOOLS)
     return _model_with_tools
+
+
+def reset_model_singleton():
+    """Limpia el singleton del modelo. Usado entre tests/runs con distinto provider."""
+    global _model_with_tools
+    with _model_lock:
+        _model_with_tools = None
 
 
 def plan_tactic(state: AttackerState) -> dict:
     """Planifica la siguiente accion. En replanificaciones purga mensajes previos."""
     tactic_name = state.get("current_tactic", "reconnaissance")
+    # Marca el inicio de la tactica si no fue marcada todavia (primer plan_tactic
+    # de esa tactica). Los replans reutilizan el mismo timestamp de arranque.
+    tactic_started_at = dict(state.get("tactic_started_at", {}))
+    if tactic_name not in tactic_started_at:
+        tactic_started_at[tactic_name] = time.monotonic()
     target_ip = state.get("target", settings.target_ip)
     collected_data = state.get("collected_data", {})
     objective_feedback = state.get("objective_feedback", "")
@@ -63,6 +92,8 @@ def plan_tactic(state: AttackerState) -> dict:
             content=ATTACKER_SYSTEM_PROMPT.format(target_ip=target_ip)
         ))
 
+    matched_playbook = state.get("matched_playbook") if state.get("use_memory", True) else None
+
     tactic_prompt = build_tactic_prompt(
         tactic_name,
         target_ip,
@@ -70,6 +101,7 @@ def plan_tactic(state: AttackerState) -> dict:
         objective_feedback=objective_feedback,
         recent_actions=recent_actions,
         replan_attempt=attempts,
+        playbook=matched_playbook,
     )
     new_messages.append(HumanMessage(content=tactic_prompt))
 
@@ -93,6 +125,7 @@ def plan_tactic(state: AttackerState) -> dict:
     return {
         "messages": new_messages + [response],
         "objective_feedback": "",
+        "tactic_started_at": tactic_started_at,
     }
 
 
@@ -190,6 +223,15 @@ def check_objective(state: AttackerState) -> dict:
     tactic_objective_met[tactic_name] = success
 
     flags = list(state.get("flags_found", []))
+    # Scanner transversal: las keys pueden aparecer en outputs de cualquier
+    # tactica (ej: key-1 en robots.txt durante recon, key-2 en /home/robot).
+    # scan_for_flags asocia cada key-N-of-3.txt con el hash mas cercano.
+    auto_keys = scan_for_flags({**state, "tactic_evidence": tactic_evidence})
+    for k, v in auto_keys.items():
+        if k not in evidence:
+            evidence[k] = v
+        if v not in flags:
+            flags.append(v)
     for k, v in evidence.items():
         if k.startswith("key_") and v and v not in flags:
             flags.append(v)
@@ -197,17 +239,28 @@ def check_objective(state: AttackerState) -> dict:
     attempts = dict(state.get("attempts_per_tactic", {}))
     current_attempts = attempts.get(tactic_name, 0)
 
+    # Calcula duracion de la tactica (solo cuando se cierra: exito o rendicion)
+    started_at = state.get("tactic_started_at", {}).get(tactic_name)
+    tactic_duration = dict(state.get("tactic_duration_seconds", {}))
+    if started_at is not None and tactic_name not in tactic_duration:
+        tactic_duration[tactic_name] = round(time.monotonic() - started_at, 2)
+
     if success:
         _console.print(
             f"[bold green]✓ OBJETIVO CUMPLIDO — {tactic_name}[/bold green]: {reason}"
         )
         logger.info(f"[Atacante] Objetivo cumplido: {tactic_name} — {reason}")
+
+        memory_update = _handle_memory_on_success(state, tactic_name, evidence)
+
         return {
             "collected_data": collected,
             "tactic_evidence": tactic_evidence,
             "tactic_objective_met": tactic_objective_met,
             "flags_found": flags,
             "tactic_complete": True,
+            "tactic_duration_seconds": tactic_duration,
+            **memory_update,
         }
 
     # Objetivo no cumplido: decidir replanificacion o rendicion
@@ -230,6 +283,7 @@ def check_objective(state: AttackerState) -> dict:
             "flags_found": flags,
             "attempts_per_tactic": attempts,
             "tactic_complete": True,
+            "tactic_duration_seconds": tactic_duration,
             "objective_feedback": "",
         }
 
@@ -266,6 +320,11 @@ def advance_tactic(state: AttackerState) -> dict:
     next_index = current_index + 1
     if next_index >= len(tactic_sequence):
         logger.info("[Atacante] Todas las tacticas completadas. Ataque finalizado.")
+        if state.get("use_memory", True):
+            fp = state.get("target_fingerprint", "")
+            met = state.get("tactic_objective_met", {})
+            all_ok = all(met.get(t) is True for t in tactic_sequence)
+            record_run_completion(fp, all_ok)
         return {
             "attack_finished": True,
             "tactic_complete": True,
@@ -307,3 +366,67 @@ def should_loop(state: AttackerState) -> str:
     if state.get("attack_finished", False):
         return "end"
     return "plan_tactic"
+
+
+def _handle_memory_on_success(state: AttackerState, tactic: str, evidence: dict) -> dict:
+    """Lookup de playbook tras Recon, recording de payload tras cualquier tactica."""
+    if not state.get("use_memory", True):
+        return {}
+
+    actions_used = state.get("actions_in_current_tactic", 0)
+    target_ip = state.get("target", "")
+    update: dict = {}
+
+    if tactic == "reconnaissance":
+        fp = compute_target_fingerprint(evidence)
+        if fp:
+            existing = lookup_playbook(fp)
+            upsert_playbook_recon(fp, target_ip, evidence, actions_used)
+            update["target_fingerprint"] = fp
+            if existing is not None:
+                update["matched_playbook"] = existing
+                runs = existing.get("run_count", 0)
+                summary = existing.get("target_summary", "?")
+                _console.print(
+                    f"[bold yellow]🧠 MEMORIA: target conocido (fp={fp}, "
+                    f"{runs} runs previas) — {summary}[/bold yellow]"
+                )
+                logger.info(
+                    f"[Memory] Match para {fp}: {runs} runs previas; "
+                    f"playbook con {len(existing.get('tactics', {}))} tacticas registradas"
+                )
+            else:
+                logger.info(f"[Memory] Target nuevo, fingerprint registrado: {fp}")
+        return update
+
+    fp = state.get("target_fingerprint", "")
+    if not fp:
+        return {}
+
+    last_action = _last_action_for_tactic(state, tactic)
+    if last_action is None:
+        return {}
+
+    args = _parse_command_args(last_action.get("command", ""))
+    record_tactic_success(
+        fingerprint=fp,
+        tactic=tactic,
+        tool=last_action.get("technique", ""),
+        args=args,
+        evidence=evidence,
+        actions_used=actions_used,
+    )
+    return {}
+
+
+def _last_action_for_tactic(state: AttackerState, tactic: str) -> dict | None:
+    history = state.get("action_history", [])
+    matches = [a for a in history if a.get("tactic", "").lower() == tactic.lower()]
+    return matches[-1] if matches else None
+
+
+def _parse_command_args(command_json: str) -> dict:
+    try:
+        return json.loads(command_json)
+    except Exception:
+        return {}

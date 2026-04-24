@@ -41,4 +41,11 @@ class AttackerState(TypedDict, total=False):
     attack_finished: bool
     error: str | None
 
+    target_fingerprint: str
+    matched_playbook: dict | None
+    use_memory: bool
+
+    tactic_started_at: dict   # tactic -> epoch monotonic al inicio
+    tactic_duration_seconds: dict  # tactic -> segundos acumulados
+
     messages: Annotated[list, add_messages]

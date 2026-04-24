@@ -16,7 +16,7 @@ de los SOCs automatizados (Vinay 2025, arXiv:2512.06659):
 from typing import TypedDict
 
 
-class Classification(TypedDict):
+class Classification(TypedDict, total=False):
     """Resultado de una clasificacion de tactica MITRE."""
 
     tactic: str
@@ -29,6 +29,7 @@ class Classification(TypedDict):
     window_start: str        # inicio de la ventana de logs analizada
     window_end: str          # fin de la ventana de logs analizada
     tactics_in_window: list  # todas las tacticas detectadas en esta ventana
+    llm_latency_ms: int      # tiempo que el LLM tardo en esta clasificacion
 
 
 class ObserverState(TypedDict, total=False):
@@ -70,3 +71,9 @@ class ObserverState(TypedDict, total=False):
     refinement_count: int   # cuantas veces se refirio el analisis por baja confianza
     has_new_logs: bool
     error: str | None
+
+    # Ablation: cuando False, triage_anomalies es pass-through (senal siempre que
+    # haya logs) y detect_anomalies no calcula suspect_list ni sub-tacticas de
+    # webshell. Permite medir el aporte de las heuristicas T1-T10 vs clasificacion
+    # LLM pura sobre log_summary crudo.
+    use_heuristics: bool

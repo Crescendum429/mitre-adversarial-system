@@ -63,6 +63,12 @@ def setup_logging(verbose: bool = False):
 
 def verify_infrastructure(scenario: str = "basic"):
     """Verifica que los containers requeridos por el escenario estan corriendo."""
+    missing_creds = settings.validate_credentials()
+    if missing_creds:
+        console.print(
+            f"[red]Credenciales LLM faltantes en .env: {', '.join(missing_creds)}[/red]"
+        )
+        sys.exit(1)
     dc = DockerClient()
     base = ["attacker", "loki"]
     scenario_containers = {
@@ -71,6 +77,10 @@ def verify_infrastructure(scenario: str = "basic"):
         "dvwa": base + ["dvwa"],
         "full": base + ["dvwa"],
         "mrrobot": base + ["mrrobot"],
+        "dc1": base + ["dc1"],
+        "bpent": base + ["bpent"],
+        "log4shell": base + ["log4shell"],
+        "confluence": base + ["confluence", "confluence-db"],
     }
     required = scenario_containers.get(scenario, base + ["dvwa"])
     missing = [name for name in required if not dc.is_container_running(name)]
@@ -86,6 +96,7 @@ def verify_infrastructure(scenario: str = "basic"):
 def run_attacker(
     tactics: list[str] | None = None,
     target: str | None = None,
+    use_memory: bool = True,
 ) -> dict:
     """
     Ejecuta el agente atacante y retorna el estado final.
@@ -94,14 +105,18 @@ def run_attacker(
     Cada paso del grafo emite un evento que podemos loguear.
     """
     graph = build_attacker_graph()
-    initial_state = create_initial_state(target=target, tactics=tactics)
+    initial_state = create_initial_state(target=target, tactics=tactics, use_memory=use_memory)
 
     console.print("\n[bold red]AGENTE ATACANTE INICIADO[/bold red]")
     console.print(f"  Target: {initial_state['target']}")
     console.print(f"  Tacticas: {initial_state['tactic_sequence']}")
+    _attacker_t0 = time.monotonic()
 
-    # Inicializar final_state con initial_state para preservar campos que no
-    # cambian entre eventos (tactic_sequence, target, etc)
+    # graph.stream emite eventos parciales por nodo. Acumulamos los campos que
+    # crecen (history, evidence, flags) porque un simple .update() perderia
+    # los valores previos si el ultimo evento no los incluye. recursion_limit
+    # alto (500) permite replanificacion sobre secuencias largas (14 tacticas
+    # x varios intentos cada una).
     final_state = dict(initial_state)
     accumulated_history = []
     accumulated_evidence = {}
@@ -109,7 +124,7 @@ def run_attacker(
     accumulated_flags = []
     accumulated_met = {}
     accumulated_attempts = {}
-    for event in graph.stream(initial_state, {"recursion_limit": 500}):
+    for event in graph.stream(initial_state, {"recursion_limit": 800}):
         for node_name, node_state in event.items():
             if node_name == "advance_tactic":
                 tactic = node_state.get("current_tactic", "")
@@ -150,6 +165,7 @@ def run_attacker(
         final_state["tactic_objective_met"] = accumulated_met
     if accumulated_attempts:
         final_state["attempts_per_tactic"] = accumulated_attempts
+    final_state["attacker_elapsed_seconds"] = round(time.monotonic() - _attacker_t0, 2)
     console.print("[bold red]AGENTE ATACANTE FINALIZADO[/bold red]\n")
     return final_state
 
@@ -177,7 +193,7 @@ def print_attack_summary(attacker_state: dict):
     summary.add_column("Estado", no_wrap=True)
     summary.add_column("Acciones", justify="right", no_wrap=True)
     summary.add_column("Replan", justify="right", no_wrap=True)
-    summary.add_column("Evidencia clave", overflow="fold")
+    summary.add_column("Evidencia", overflow="fold")
 
     for tactic in tactic_sequence:
         met = tactic_met.get(tactic, None)
@@ -239,7 +255,7 @@ def print_attack_summary(attacker_state: dict):
     total_tactics = len(tactic_sequence)
     met_count = sum(1 for t in tactic_sequence if tactic_met.get(t) is True)
     console.print(
-        f"\n[bold]Resumen ejecutivo:[/bold] "
+        f"\n[bold]Resumen:[/bold] "
         f"{met_count}/{total_tactics} objetivos cumplidos, "
         f"{total_actions} acciones totales ejecutadas"
     )
@@ -250,6 +266,8 @@ def run_observer_loop(
     results: list,
     poll_interval: int | None = None,
     simulation_start: datetime | None = None,
+    state_lock: "threading.RLock | None" = None,
+    use_heuristics: bool = True,
 ):
     """
     Loop del observador que se ejecuta en un thread separado.
@@ -260,15 +278,18 @@ def run_observer_loop(
     3. Acumula la clasificacion en results
 
     El parametro simulation_start evita que logs de corridas anteriores
-    contaminen las primeras ventanas de analisis.
+    contaminen las primeras ventanas de analisis. state_lock protege el
+    shared mutable state (history, suspect_list, results) contra la race
+    condition con el thread principal que hace join() al final.
 
     Se detiene cuando stop_event es seteado por el thread principal.
     """
     interval = poll_interval or settings.observer_poll_interval
     interval_delta = timedelta(seconds=interval)
     graph = build_observer_graph()
-    history = []
-    suspect_list = {}
+    history: list = []
+    suspect_list: dict = {}
+    lock = state_lock or threading.RLock()
 
     start_time = simulation_start or datetime.now(timezone.utc)
     last_end = start_time
@@ -277,12 +298,17 @@ def run_observer_loop(
 
     def process_window(ws: datetime, we: datetime) -> None:
         nonlocal history, suspect_list
+        with lock:
+            current_history = list(history)
+            current_suspect = dict(suspect_list)
+
         state = create_observer_state(
-            history=history,
-            suspect_list=suspect_list,
+            history=current_history,
+            suspect_list=current_suspect,
             simulation_start=simulation_start,
             window_start=ws,
             window_end=we,
+            use_heuristics=use_heuristics,
         )
         result = graph.invoke(state)
         classification = result.get("current_classification")
@@ -302,9 +328,10 @@ def run_observer_loop(
                     f"  [blue]Clasificacion: {classification['tactic']} "
                     f"(confianza: {classification['confidence']:.0%})[/blue]"
                 )
-            results.append(classification)
-            history = result.get("classification_history", history)
-            suspect_list = result.get("suspect_list", suspect_list)
+            with lock:
+                results.append(classification)
+                history = list(result.get("classification_history", current_history))
+                suspect_list = dict(result.get("suspect_list", current_suspect))
         else:
             placeholder = {
                 "tactic": "none",
@@ -326,14 +353,20 @@ def run_observer_loop(
                 f"  [dim]Ventana sin actividad ({triage_result}) — "
                 f"registrada como 'none'[/dim]"
             )
-            results.append(placeholder)
+            with lock:
+                results.append(placeholder)
 
+    # Loop principal: procesa ventanas contiguas mientras no se señale parada.
+    # `wait()` retorna True si el event fue seteado durante la espera, asi que
+    # salimos inmediatamente en lugar de completar el ciclo.
     while not stop_event.is_set():
         now = datetime.now(timezone.utc)
         next_end = last_end + interval_delta
 
         if next_end > now:
-            stop_event.wait((next_end - now).total_seconds())
+            remaining = (next_end - now).total_seconds()
+            if stop_event.wait(remaining):
+                break
             continue
 
         try:
@@ -343,10 +376,16 @@ def run_observer_loop(
 
         last_end = next_end
 
-    now = datetime.now(timezone.utc)
+    # Flush: procesar ventanas pendientes hasta "now". Limite maximo de iteraciones
+    # para evitar loops infinitos si process_window genera excepciones recurrentes
+    # o si `now` se corrompe.
+    flush_deadline = datetime.now(timezone.utc)
+    max_flush_iters = max(5, int((flush_deadline - last_end).total_seconds() / interval) + 3)
     pending = 0
-    while last_end < now:
-        next_end = min(last_end + interval_delta, now)
+    iters = 0
+    while last_end < flush_deadline and iters < max_flush_iters:
+        iters += 1
+        next_end = min(last_end + interval_delta, flush_deadline)
         try:
             process_window(last_end, next_end)
             pending += 1
@@ -361,32 +400,53 @@ def run_observer_loop(
     console.print("[bold blue]AGENTE OBSERVADOR FINALIZADO[/bold blue]\n")
 
 
+_ABBREV = {
+    "reconnaissance": "recon",
+    "initial_access": "init_access",
+    "execution": "execution",
+    "discovery": "discovery",
+    "credential_access": "cred_access",
+    "privilege_escalation": "priv_esc",
+    "persistence": "persist",
+    "lateral_movement": "lateral",
+    "defense_evasion": "def_evasion",
+    "command_and_control": "c2",
+    "exfiltration": "exfil",
+    "impact": "impact",
+}
+
+
+def _abbrev_list(tactics: list[str]) -> str:
+    return ", ".join(
+        _ABBREV.get(t.lower().replace(" ", "_"), t) for t in tactics
+    )
+
+
+def _normalize_tactic(name: str) -> str:
+    """Normaliza nombres de táctica: lowercase + underscores unificados."""
+    if not name:
+        return ""
+    return name.lower().strip().replace(" ", "_")
+
+
 def compare_results(attacker_state: dict, observer_classifications: list):
     """
     Compara el ground truth del atacante con las clasificaciones del observador.
 
-    Accuracy calculada solo sobre ventanas que caen dentro del rango del ataque
-    real (desde la primera accion hasta la ultima). Las ventanas fuera de ese
-    rango se muestran pero marcadas como N/A.
+    Metricas reportadas (apropiadas para clasificacion multi-clase, ref.
+    Sokolova & Lapalme 2009, "A systematic analysis of performance measures
+    for classification tasks"):
+      - Accuracy estricta: current_tactic observada coincide con la ultima
+        tactica real en la ventana
+      - Accuracy ventana: todas las tacticas reales estan presentes en
+        tactics_in_window del observador
+      - Precision/Recall/F1 por tactica (micro + macro): estandar en
+        clasificacion multi-clase, ref. Cybench/Hans et al. 2025
+      - Matriz de confusion: current_tactic real vs observada
+
+    Solo ventanas DENTRO del rango del ataque (primera accion → ultima)
+    cuentan para las metricas. Ventanas pre/post-ataque se marcan N/A/FP.
     """
-    _ABBREV = {
-        "reconnaissance": "recon",
-        "initial_access": "init_access",
-        "execution": "execution",
-        "discovery": "discovery",
-        "credential_access": "cred_access",
-        "privilege_escalation": "priv_esc",
-        "persistence": "persist",
-        "lateral_movement": "lateral",
-        "defense_evasion": "def_evasion",
-        "command_and_control": "c2",
-        "exfiltration": "exfil",
-        "impact": "impact",
-    }
-
-    def _abbrev_list(tactics: list[str]) -> str:
-        return ", ".join(_ABBREV.get(t.lower().replace(" ", "_"), t) for t in tactics)
-
     table = Table(title="Resultados: Ground Truth vs Clasificacion", expand=True)
     table.add_column("Ventana", style="dim", no_wrap=True)
     table.add_column("Real (actual)", style="red", no_wrap=True)
@@ -402,44 +462,64 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         for a in action_history
     ]
 
-    attack_start = min((a["timestamp"] for a in attacker_timeline), default="")
-    attack_end = max((a["timestamp"] for a in attacker_timeline), default="")
+    # Rango real del ataque usando objetos datetime (robusto vs strings)
+    attack_end_dt: datetime | None = None
+    for a in attacker_timeline:
+        dt = _parse_ts(a.get("timestamp", ""))
+        if dt is not None and (attack_end_dt is None or dt > attack_end_dt):
+            attack_end_dt = dt
 
-    # Ordenar clasificaciones cronologicamente por window_end
+    # Ordenar clasificaciones cronologicamente por window_end parseado
     sorted_cls = sorted(
         observer_classifications,
-        key=lambda c: c.get("window_end", c.get("timestamp", "")),
+        key=lambda c: _parse_ts(c.get("window_end", "")) or _parse_ts(c.get("timestamp", "")) or datetime.min.replace(tzinfo=timezone.utc),
     )
 
     strict_correct = 0
     window_correct = 0
     evaluable = 0
 
+    # Acumuladores para precision/recall/F1 por tactica
+    # tp[t] = # de ventanas donde t fue predicha y esta en real_in_window
+    # fp[t] = # de ventanas donde t fue predicha pero NO esta en real_in_window
+    # fn[t] = # de ventanas donde t esta en real_in_window pero NO fue predicha
+    from collections import defaultdict
+    tp: dict[str, int] = defaultdict(int)
+    fp: dict[str, int] = defaultdict(int)
+    fn: dict[str, int] = defaultdict(int)
+
+    # Matriz de confusion: real_actual -> observed_actual -> count
+    confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    all_tactics: set[str] = set()
+
     for cls in sorted_cls:
-        ws = cls.get("window_start", "")
-        we = cls.get("window_end", "")
-        real_in_window = _real_tactics_in_window(ws, we, attacker_timeline)
+        ws_str = cls.get("window_start", "")
+        we_str = cls.get("window_end", "")
+        real_in_window = _real_tactics_in_window(ws_str, we_str, attacker_timeline)
 
         observed_current = cls.get("tactic", "?")
-        observed_in_window = [
+        observed_in_window_raw = [
             t.get("tactic", "") for t in cls.get("tactics_in_window", [])
+            if isinstance(t, dict)
         ]
+        observed_in_window = [t for t in observed_in_window_raw if t and t.strip()]
         if not observed_in_window and observed_current and observed_current != "none":
             observed_in_window = [observed_current]
 
         last_real = real_in_window[-1] if real_in_window else "unknown"
         is_pre_attack = last_real in ("unknown", "")
-        is_post_attack = bool(attack_end) and ws > attack_end
+        ws_dt = _parse_ts(ws_str)
+        is_post_attack = bool(attack_end_dt) and (ws_dt is not None) and ws_dt > attack_end_dt
         is_none_obs = observed_current == "none"
 
         real_current_abbrev = (
-            "-" if is_pre_attack else _ABBREV.get(last_real.lower().replace(" ", "_"), last_real)
+            "-" if is_pre_attack else _ABBREV.get(_normalize_tactic(last_real), last_real)
         )
         real_window_abbrev = (
             _abbrev_list(real_in_window[:-1]) if len(real_in_window) > 1 else ""
         )
         obs_abbrev = (
-            "-" if is_none_obs else _ABBREV.get(observed_current.lower().replace(" ", "_"), observed_current)
+            "-" if is_none_obs else _ABBREV.get(_normalize_tactic(observed_current), observed_current)
         )
         obs_window_list = [
             t for t in observed_in_window if not _tactics_match(t, observed_current)
@@ -452,15 +532,40 @@ def compare_results(attacker_state: dict, observer_classifications: list):
             match_style = "dim" if is_none_obs else "yellow"
         else:
             evaluable += 1
+
+            # Match estricto: current_tactic == ultima tactica real
             strict_ok = _tactics_match(last_real, observed_current)
             if strict_ok:
                 strict_correct += 1
+
+            # Match ventana: todas las tacticas reales deben ser detectadas
             window_ok = all(
                 any(_tactics_match(rt, ot) for ot in observed_in_window)
                 for rt in real_in_window
             )
             if window_ok:
                 window_correct += 1
+
+            # Actualizar confusion matrix (current_tactic real vs observada)
+            real_norm = _normalize_tactic(last_real)
+            obs_norm = _normalize_tactic(observed_current) if not is_none_obs else "none"
+            confusion[real_norm][obs_norm] += 1
+            all_tactics.add(real_norm)
+            if obs_norm != "none":
+                all_tactics.add(obs_norm)
+
+            # TP/FP/FN por tactica sobre tactics_in_window (multi-label)
+            real_set = {_normalize_tactic(t) for t in real_in_window if t}
+            obs_set = {_normalize_tactic(t) for t in observed_in_window if t}
+            for t in real_set:
+                if t in obs_set:
+                    tp[t] += 1
+                else:
+                    fn[t] += 1
+            for t in obs_set:
+                if t not in real_set:
+                    fp[t] += 1
+
             match_style = "green" if strict_ok else "red"
             match_label = "OK" if strict_ok else "MISS"
 
@@ -477,38 +582,168 @@ def compare_results(attacker_state: dict, observer_classifications: list):
     console.print(table)
     console.print("[dim]Match estricto: Obs(actual) == ultima tactica real en ventana[/dim]")
     console.print("[dim]Match ventana: todas las tacticas reales presentes en Obs(ventana)[/dim]")
-    console.print("[dim]N/A = ventana pre-ataque sin ground truth | FP = falso positivo[/dim]")
+    console.print("[dim]N/A = ventana pre/post-ataque sin ground truth | FP = falso positivo[/dim]")
 
-    if observer_classifications:
-        total = len(observer_classifications)
-        console.print(
-            f"\nVentanas totales registradas: {total} "
-            f"(evaluables con ground truth: {evaluable})"
+    if not observer_classifications:
+        return
+
+    total = len(observer_classifications)
+    console.print(
+        f"\n[bold]Ventanas totales registradas:[/bold] {total} "
+        f"(evaluables: {evaluable})"
+    )
+    if evaluable == 0:
+        console.print("[yellow]No hay ventanas evaluables.[/yellow]")
+        return
+
+    console.print(
+        f"  Accuracy estricta: {strict_correct}/{evaluable} "
+        f"= {strict_correct/evaluable:.1%}"
+    )
+    console.print(
+        f"  Accuracy ventana: {window_correct}/{evaluable} "
+        f"= {window_correct/evaluable:.1%}"
+    )
+
+    # Precision/Recall/F1 por tactica
+    pr_table = Table(
+        title="Metricas por tactica (multi-label, tactics_in_window)",
+        expand=False,
+    )
+    pr_table.add_column("Tactica", style="bold")
+    pr_table.add_column("TP", justify="right")
+    pr_table.add_column("FP", justify="right")
+    pr_table.add_column("FN", justify="right")
+    pr_table.add_column("Precision", justify="right")
+    pr_table.add_column("Recall", justify="right")
+    pr_table.add_column("F1", justify="right")
+    pr_table.add_column("Support", justify="right")
+
+    tactics_sorted = sorted(all_tactics)
+    total_tp = total_fp = total_fn = 0
+    macro_precision = macro_recall = macro_f1 = 0.0
+    macro_n = 0
+
+    for t in tactics_sorted:
+        tp_t, fp_t, fn_t = tp[t], fp[t], fn[t]
+        support = tp_t + fn_t
+        prec = tp_t / (tp_t + fp_t) if (tp_t + fp_t) else 0.0
+        rec = tp_t / (tp_t + fn_t) if (tp_t + fn_t) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        pr_table.add_row(
+            _ABBREV.get(t, t),
+            str(tp_t), str(fp_t), str(fn_t),
+            f"{prec:.2f}", f"{rec:.2f}", f"{f1:.2f}",
+            str(support),
         )
-        if evaluable > 0:
-            console.print(
-                f"Accuracy actual (estricta): {strict_correct}/{evaluable} "
-                f"({strict_correct/evaluable:.0%})"
-            )
-            console.print(
-                f"Accuracy ventana (tacticas completas): {window_correct}/{evaluable} "
-                f"({window_correct/evaluable:.0%})"
-            )
+        total_tp += tp_t
+        total_fp += fp_t
+        total_fn += fn_t
+        if support > 0:
+            macro_precision += prec
+            macro_recall += rec
+            macro_f1 += f1
+            macro_n += 1
+
+    micro_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
+    micro_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0.0
+    micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r) if (micro_p + micro_r) else 0.0
+    pr_table.add_section()
+    pr_table.add_row(
+        "[bold]micro[/bold]",
+        str(total_tp), str(total_fp), str(total_fn),
+        f"{micro_p:.2f}", f"{micro_r:.2f}", f"{micro_f1:.2f}",
+        str(total_tp + total_fn),
+    )
+    if macro_n:
+        pr_table.add_row(
+            "[bold]macro[/bold]",
+            "", "", "",
+            f"{macro_precision/macro_n:.2f}",
+            f"{macro_recall/macro_n:.2f}",
+            f"{macro_f1/macro_n:.2f}",
+            "",
+        )
+    console.print(pr_table)
+
+    # Matriz de confusion
+    if len(confusion) >= 1:
+        cm_labels = sorted(set(list(confusion.keys()) +
+                               [k for v in confusion.values() for k in v.keys()]))
+        cm_table = Table(
+            title="Matriz de confusion (filas=real, columnas=observado)",
+            expand=False,
+        )
+        cm_table.add_column("real \\ obs", style="bold")
+        for l in cm_labels:
+            cm_table.add_column(_ABBREV.get(l, l), justify="right")
+        for r in cm_labels:
+            row_cells = [_ABBREV.get(r, r)]
+            for c in cm_labels:
+                v = confusion.get(r, {}).get(c, 0)
+                style_wrap = "[green]{}[/green]" if r == c and v > 0 else "{}"
+                row_cells.append(style_wrap.format(v) if v else "·")
+            cm_table.add_row(*row_cells)
+        console.print(cm_table)
+
+
+_WARNED_NAIVE_TIMESTAMP = False
+
+
+def _parse_ts(ts: str) -> datetime | None:
+    """Parsea un timestamp ISO 8601 aceptando sufijo Z y offsets explicitos.
+
+    Retorna None si el timestamp es invalido o vacio, en lugar de raise.
+    Normaliza a UTC para comparaciones consistentes. Emite warning UNA VEZ
+    si encuentra timestamps sin timezone (bug silente reportado en el audit).
+    """
+    global _WARNED_NAIVE_TIMESTAMP
+    if not ts:
+        return None
+    try:
+        # Python 3.11+ acepta Z nativamente; replace garantiza compatibilidad <3.11
+        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            if not _WARNED_NAIVE_TIMESTAMP:
+                logging.getLogger(__name__).warning(
+                    f"Timestamp sin timezone detectado: {ts!r}. Asumiendo UTC. "
+                    "Si el sistema corre en timezone distinta, las ventanas del "
+                    "observer pueden desalinearse con el ground truth del atacante."
+                )
+                _WARNED_NAIVE_TIMESTAMP = True
+            dt = dt.replace(tzinfo=timezone.utc)
         else:
-            console.print("No hay ventanas evaluables.")
+            dt = dt.astimezone(timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
 
 
 def _real_tactics_in_window(window_start: str, window_end: str, timeline: list[dict]) -> list[str]:
-    """Todas las tacticas del atacante activas durante una ventana de observacion."""
+    """Todas las tacticas del atacante activas durante una ventana de observacion.
+
+    Usa comparacion de objetos datetime (no string) para evitar bugs por
+    diferencias de formato ISO (Z vs +00:00, microsegundos, etc).
+    """
     if not timeline:
         return ["unknown"]
+
+    ws = _parse_ts(window_start)
+    we = _parse_ts(window_end)
+    if ws is None or we is None:
+        return ["unknown"]
+
     tactics = []
     tactic_at_start = _find_closest_tactic(window_start, timeline)
     if tactic_at_start != "unknown":
         tactics.append(tactic_at_start)
+
     for entry in timeline:
-        ts = entry.get("timestamp", "")
-        if window_start < ts <= window_end:
+        ts = _parse_ts(entry.get("timestamp", ""))
+        if ts is None:
+            continue
+        if ws < ts <= we:
             t = entry.get("tactic", "")
             if t and t not in tactics:
                 tactics.append(t)
@@ -517,40 +752,171 @@ def _real_tactics_in_window(window_start: str, window_end: str, timeline: list[d
 
 def _window_midpoint(cls: dict) -> str:
     """Punto medio de la ventana de observacion para comparar con el ground truth."""
-    ws, we = cls.get("window_start", ""), cls.get("window_end", "")
-    if ws and we:
-        try:
-            t_start = datetime.fromisoformat(ws)
-            t_end = datetime.fromisoformat(we)
-            return (t_start + (t_end - t_start) / 2).isoformat()
-        except Exception:
-            pass
+    t_start = _parse_ts(cls.get("window_start", ""))
+    t_end = _parse_ts(cls.get("window_end", ""))
+    if t_start and t_end:
+        return (t_start + (t_end - t_start) / 2).isoformat()
     return cls.get("timestamp", "")
 
 
 def _find_closest_tactic(timestamp: str, timeline: list[dict]) -> str:
-    """
-    Encuentra la tactica del atacante activa antes de un timestamp dado.
+    """Encuentra la tactica del atacante activa antes de un timestamp dado.
 
     Retorna "unknown" si el timestamp es anterior a cualquier accion del
-    atacante (ventana pre-ataque).
+    atacante (ventana pre-ataque) o si hay error en parsing.
     """
-    if not timeline or not timestamp:
+    target = _parse_ts(timestamp)
+    if target is None or not timeline:
         return "unknown"
+
     closest = "unknown"
     for entry in timeline:
-        if entry["timestamp"] <= timestamp:
-            closest = entry["tactic"]
+        ts = _parse_ts(entry.get("timestamp", ""))
+        if ts is None:
+            continue
+        if ts <= target:
+            closest = entry.get("tactic", "unknown") or "unknown"
         else:
             break
     return closest
 
 
 def _tactics_match(real: str, observed: str) -> bool:
-    """Compara tacticas normalizando nombres."""
+    """Compara tacticas normalizando nombres (case + underscore/space)."""
     if not real or not observed:
         return False
-    return real.lower().replace("_", " ") == observed.lower().replace("_", " ")
+    return real.lower().replace("_", " ").strip() == observed.lower().replace("_", " ").strip()
+
+
+def print_timing_summary(
+    attacker_state: dict,
+    observer_classifications: list,
+    session_elapsed_seconds: float,
+) -> None:
+    """
+    Reporta todas las metricas medibles de la corrida:
+    - Wall-clock y timings por agente.
+    - Tokens / llamadas / latencias LLM por rol (atacante vs observer).
+    - Tiempo por tactica del atacante.
+    - Triage short-circuit rate (windows que evitaron LLM).
+    - Refinamiento rate (windows que necesitaron Investigate).
+    - Docker tool execution stats (n execs, latencia total, timeouts).
+    """
+    from src.llm.provider import USAGE_STATS
+    from src.infrastructure.docker_client import DOCKER_STATS
+    from src.agents.observer.nodes import OBSERVER_NODE_STATS
+
+    attacker_s = float(attacker_state.get("attacker_elapsed_seconds", 0.0) or 0.0)
+    latencies_ms = [
+        int(c["llm_latency_ms"])
+        for c in observer_classifications
+        if isinstance(c, dict) and c.get("llm_latency_ms") is not None
+    ]
+
+    def _fmt_hms(secs: float) -> str:
+        m, s = divmod(int(secs), 60)
+        h, m = divmod(m, 60)
+        return f"{h:d}h {m:02d}m {s:02d}s" if h else f"{m:d}m {s:02d}s"
+
+    # 1) Tiempos globales
+    t_time = Table(title="Tiempos de ejecucion", expand=False)
+    t_time.add_column("Metrica", style="bold")
+    t_time.add_column("Valor", justify="right")
+    t_time.add_row("Wall-clock total de la sesion", _fmt_hms(session_elapsed_seconds))
+    t_time.add_row("Atacante (run_attacker)", _fmt_hms(attacker_s))
+    console.print(t_time)
+
+    # 2) Tiempo por tactica del atacante
+    tactic_durations = attacker_state.get("tactic_duration_seconds", {}) or {}
+    tactic_objective_met = attacker_state.get("tactic_objective_met", {}) or {}
+    if tactic_durations:
+        t_tactic = Table(title="Tiempo por tactica (atacante)", expand=False)
+        t_tactic.add_column("Tactica", style="bold")
+        t_tactic.add_column("Duracion", justify="right")
+        t_tactic.add_column("Estado", justify="center")
+        for t, secs in tactic_durations.items():
+            status = "OK" if tactic_objective_met.get(t) is True else "FAIL" if tactic_objective_met.get(t) is False else "-"
+            t_tactic.add_row(t, _fmt_hms(float(secs)), status)
+        console.print(t_tactic)
+
+    # 3) Uso del LLM por rol
+    t_llm = Table(title="Uso del LLM por agente", expand=False)
+    t_llm.add_column("Metrica", style="bold")
+    t_llm.add_column("Atacante", justify="right")
+    t_llm.add_column("Observer", justify="right")
+    a = USAGE_STATS.get("attacker", {})
+    o = USAGE_STATS.get("observer", {})
+    t_llm.add_row("Proveedor", str(a.get("provider") or "-"), str(o.get("provider") or "-"))
+    t_llm.add_row("Modelo", str(a.get("model") or "-"), str(o.get("model") or "-"))
+    t_llm.add_row("Llamadas LLM", str(a.get("call_count", 0)), str(o.get("call_count", 0)))
+    t_llm.add_row("Tokens input", f"{a.get('input_tokens', 0):,}", f"{o.get('input_tokens', 0):,}")
+    t_llm.add_row("Tokens output", f"{a.get('output_tokens', 0):,}", f"{o.get('output_tokens', 0):,}")
+    t_llm.add_row("Tokens total", f"{a.get('total_tokens', 0):,}", f"{o.get('total_tokens', 0):,}")
+    t_llm.add_row("Tiempo sumado LLM", _fmt_hms(float(a.get("elapsed_seconds", 0.0) or 0.0)),
+                  _fmt_hms(float(o.get("elapsed_seconds", 0.0) or 0.0)))
+    if a.get("call_count", 0):
+        t_llm.add_row("Tokens/llamada (avg)",
+                      f"{a.get('total_tokens', 0)/max(a.get('call_count', 1), 1):.0f}",
+                      f"{o.get('total_tokens', 0)/max(o.get('call_count', 1), 1):.0f}")
+    if latencies_ms:
+        latencies_sorted = sorted(latencies_ms)
+        p50 = latencies_sorted[len(latencies_sorted) // 2]
+        p95 = latencies_sorted[min(len(latencies_sorted) - 1, int(len(latencies_sorted) * 0.95))]
+        avg_ms = sum(latencies_ms) / len(latencies_ms)
+        t_llm.add_row("Observer — latencia avg", "-", f"{avg_ms/1000:.2f} s")
+        t_llm.add_row("Observer — latencia p50", "-", f"{p50/1000:.2f} s")
+        t_llm.add_row("Observer — latencia p95", "-", f"{p95/1000:.2f} s")
+    console.print(t_llm)
+
+    # 4) Pipeline del observer (triage + refine + classify)
+    obs = OBSERVER_NODE_STATS
+    total_wins = obs.get("triage_signal", 0) + obs.get("triage_no_signal", 0)
+    if total_wins:
+        sc_rate = obs.get("triage_no_signal", 0) / total_wins
+        t_obs = Table(title="Pipeline del observer", expand=False)
+        t_obs.add_column("Metrica", style="bold")
+        t_obs.add_column("Valor", justify="right")
+        t_obs.add_row("Ventanas procesadas", str(total_wins))
+        t_obs.add_row("Triage signal (fueron al LLM)", str(obs.get("triage_signal", 0)))
+        t_obs.add_row("Triage no-signal (corto-circuito)", str(obs.get("triage_no_signal", 0)))
+        t_obs.add_row("Tasa de corto-circuito", f"{sc_rate:.1%}")
+        t_obs.add_row("Refinamientos invocados", str(obs.get("refine_calls", 0)))
+        t_obs.add_row("Clasificaciones totales", str(obs.get("classify_calls", 0)))
+        if obs.get("triage_signal", 0):
+            reclass_ratio = obs.get("classify_calls", 0) / obs.get("triage_signal", 1)
+            t_obs.add_row("Clasificaciones por ventana anomalica", f"{reclass_ratio:.2f}")
+        console.print(t_obs)
+
+    # 5) Tool execution (Docker exec del atacante)
+    dstats = DOCKER_STATS
+    if dstats.get("exec_count", 0):
+        t_docker = Table(title="Ejecucion de herramientas (Docker)", expand=False)
+        t_docker.add_column("Metrica", style="bold")
+        t_docker.add_column("Valor", justify="right")
+        t_docker.add_row("Execs totales", str(dstats.get("exec_count", 0)))
+        t_docker.add_row("Tiempo total de ejecucion", _fmt_hms(float(dstats.get("total_seconds", 0.0) or 0.0)))
+        if dstats.get("exec_count", 0):
+            avg = float(dstats.get("total_seconds", 0.0) or 0.0) / int(dstats.get("exec_count", 1))
+            t_docker.add_row("Tiempo promedio por exec", f"{avg:.2f} s")
+        t_docker.add_row("Execs que excedieron timeout", str(dstats.get("timed_out_count", 0)))
+        t_docker.add_row("Execs con error de API", str(dstats.get("error_count", 0)))
+        console.print(t_docker)
+
+    # 6) Acciones por tactica + intentos (resumen condensado)
+    actions = attacker_state.get("action_history", []) or []
+    attempts = attacker_state.get("attempts_per_tactic", {}) or {}
+    actions_per_tactic: dict = {}
+    for a_ in actions:
+        t = a_.get("tactic", "unknown")
+        actions_per_tactic[t] = actions_per_tactic.get(t, 0) + 1
+    if actions_per_tactic:
+        t_act = Table(title="Acciones e intentos por tactica", expand=False)
+        t_act.add_column("Tactica", style="bold")
+        t_act.add_column("Acciones", justify="right")
+        t_act.add_column("Replans", justify="right")
+        for t in actions_per_tactic:
+            t_act.add_row(t, str(actions_per_tactic[t]), str(attempts.get(t, 0)))
+        console.print(t_act)
 
 
 def main():
@@ -575,6 +941,14 @@ def main():
     parser.add_argument(
         "--tool-output", action="store_true",
         help="Mostrar output raw de las herramientas ejecutadas (nmap, nikto, hydra, etc.)"
+    )
+    parser.add_argument(
+        "--no-memory", action="store_true",
+        help="Deshabilita la memoria de playbooks (cold run, util para ablation)"
+    )
+    parser.add_argument(
+        "--no-heuristics", action="store_true",
+        help="Ablation: el observador saltea T1-T10 y clasifica solo con LLM sobre log_summary"
     )
     args = parser.parse_args()
 
@@ -617,6 +991,48 @@ def main():
             ],
             "target": "10.10.0.20",
         },
+        "dc1": {
+            "tactics": [
+                "reconnaissance",
+                "initial_access",
+                "execution",
+                "discovery",
+                "credential_access",
+                "privilege_escalation",
+            ],
+            "target": "10.10.0.30",
+        },
+        "bpent": {
+            "tactics": [
+                "reconnaissance",
+                "initial_access",
+                "execution",
+                "discovery",
+                "credential_access",
+                "privilege_escalation",
+            ],
+            "target": "10.10.0.40",
+        },
+        # Log4Shell — RCE vía JNDI injection sin autenticacion.
+        # Escenario compacto: Recon + Execution + Discovery.
+        # Initial Access y Credential Access NO aplican (RCE es pre-auth).
+        "log4shell": {
+            "tactics": [
+                "reconnaissance",
+                "execution",
+                "discovery",
+            ],
+            "target": "10.10.0.50",
+        },
+        # Confluence OGNL — RCE vía expression injection sin autenticacion.
+        "confluence": {
+            "tactics": [
+                "reconnaissance",
+                "execution",
+                "discovery",
+            ],
+            "target": "10.10.0.60",
+        },
         "full": {
             "tactics": [
                 "reconnaissance", "initial_access", "execution",
@@ -632,22 +1048,27 @@ def main():
 
     if args.attacker_only:
         # Solo atacante, sin observador
-        attacker_state = run_attacker(tactics=tactics, target=target)
+        attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
         print_attack_summary(attacker_state)
         return
 
     # Ejecucion completa: atacante + observador en paralelo
-    observer_results = []
+    observer_results: list = []
     stop_event = threading.Event()
+    observer_lock = threading.RLock()
 
     # Timestamp de inicio de esta simulacion: el observador no debe mirar logs
     # anteriores a este punto (evita contaminacion de corridas previas).
     simulation_start = datetime.now(timezone.utc)
+    _session_t0 = time.monotonic()
 
-    # Iniciar observador en thread separado
+    # Iniciar observador en thread separado. El lock protege observer_results,
+    # history y suspect_list (estado compartido con el thread principal que
+    # hace join() y luego lee results).
     observer_thread = threading.Thread(
         target=run_observer_loop,
-        args=(stop_event, observer_results, args.observer_interval, simulation_start),
+        args=(stop_event, observer_results, args.observer_interval, simulation_start, observer_lock),
+        kwargs={"use_heuristics": not args.no_heuristics},
         daemon=True,
     )
     observer_thread.start()
@@ -656,7 +1077,7 @@ def main():
     time.sleep(3)
 
     # Ejecutar atacante en el thread principal
-    attacker_state = run_attacker(tactics=tactics, target=target)
+    attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
 
     # Dar tiempo al observador para clasificar las ultimas acciones.
     # Tres ciclos completos: el que estaba en curso termina + dos mas que ven
@@ -664,13 +1085,30 @@ def main():
     # capturar tacticas que el atacante completo rapidamente.
     time.sleep(args.observer_interval * 3 + 15)
     stop_event.set()
-    observer_thread.join(timeout=10)
+    # Join con timeout suficiente para permitir que se complete la ventana
+    # actual + el flush de pendientes. Si el observer tiene N ventanas
+    # pendientes, cada una puede tardar hasta 30s (LLM + loki), así que
+    # damos un margen proporcional al intervalo.
+    observer_thread.join(timeout=args.observer_interval * 4 + 30)
+    if observer_thread.is_alive():
+        logging.getLogger(__name__).warning(
+            "Observer thread did not finish in time; proceeding with current results."
+        )
+
+    # Leer results bajo lock (consistency con el thread background)
+    with observer_lock:
+        observer_results_snapshot = list(observer_results)
+
+    _session_elapsed = round(time.monotonic() - _session_t0, 2)
 
     # Resumen del ataque: objetivos cumplidos, evidencia extraida, flags
     print_attack_summary(attacker_state)
 
     # Comparar resultados del observador
-    compare_results(attacker_state, observer_results)
+    compare_results(attacker_state, observer_results_snapshot)
+
+    # Reporte de tiempos de ejecucion
+    print_timing_summary(attacker_state, observer_results_snapshot, _session_elapsed)
 
 
 if __name__ == "__main__":

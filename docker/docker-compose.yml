@@ -76,6 +76,131 @@ services:
           memory: 256M
 
   # ---------------------------------------------------------------------------
+  # DC-1 (DCAU VulnHub) inspirado: target Drupal-style para ampliar evaluacion.
+  # Credencial default admin/random, priv esc via SUID find, flag en /root.
+  # Accesible en attack_net 10.10.0.30.
+  # ---------------------------------------------------------------------------
+  dc1:
+    build:
+      context: ./dc1
+    container_name: dc1
+    hostname: dc1
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.30
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "dc1"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Basic Pentesting 1 (Josiah Pierce VulnHub) inspirado: user marlinspike,
+  # priv esc via SUID vim.tiny, flag en /root. Distinto path post-compromiso
+  # que dc1 y mrrobot.
+  # Accesible en attack_net 10.10.0.40.
+  # ---------------------------------------------------------------------------
+  bpent:
+    build:
+      context: ./bpent
+    container_name: bpent
+    hostname: bpent
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.40
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "bpent"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
+  # Log4Shell / Apache Solr 8.11.0 (CVE-2021-44228): victima Java para
+  # validar generalizacion del sistema mas alla de stacks PHP/WordPress.
+  # Vector: JNDI injection en parametros loggeados por Log4j 2.14.1.
+  # Sin bruteforce ni webshell — RCE via una sola request GET.
+  # Imagen oficial vulhub. Puerto 8983 expuesto a la red attack_net.
+  # ---------------------------------------------------------------------------
+  log4shell:
+    image: vulhub/solr:8.11.0
+    container_name: log4shell
+    hostname: log4shell
+    # OpenJDK 8 aborta al startup en kernels modernos por default ulimit nofile
+    # muy alto. Forzamos un limite razonable.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.50
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "log4shell"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ---------------------------------------------------------------------------
+  # Atlassian Confluence 7.13.6 (CVE-2022-26134): OGNL injection RCE.
+  # Vector: payload OGNL en URI, output regresa en header X-Cmd-Response.
+  # Clase distinta de ataque — expression injection (no command injection).
+  # Requiere postgres backend. Ambos aislados en la misma red.
+  # ---------------------------------------------------------------------------
+  confluence:
+    image: vulhub/confluence:7.13.6
+    container_name: confluence
+    hostname: confluence
+    depends_on:
+      - confluence-db
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.60
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "confluence"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  confluence-db:
+    image: postgres:12.8-alpine
+    container_name: confluence-db
+    hostname: confluence-db
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: confluence
+    networks:
+      attack_net:
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
   # Loki: sistema de agregacion de logs. Modo monolitico (single binary).
   # Recibe logs via HTTP push API. El observador consulta via LogQL.
   # Usa ~200MB RAM vs ~3GB de Elasticsearch.

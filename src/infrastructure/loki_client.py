@@ -31,6 +31,22 @@ class LokiClient:
         self.base_url = (base_url or settings.loki_url).rstrip("/")
         self._http = httpx.Client(timeout=30.0)
 
+    def close(self) -> None:
+        if self._http and not self._http.is_closed:
+            self._http.close()
+
+    def __enter__(self) -> "LokiClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def query_range(
         self,
         query: str,
@@ -70,60 +86,6 @@ class LokiClient:
             return []
 
         return self._parse_response(data)
-
-    def query_logs_by_container(
-        self,
-        container: str,
-        start: datetime | None = None,
-        end: datetime | None = None,
-        filter_text: str | None = None,
-        limit: int = 500,
-    ) -> list[dict]:
-        """
-        Consulta logs de un container especifico.
-
-        Opcionalmente filtra por texto contenido en los logs.
-        Este es el metodo principal que usa el observador para recolectar
-        logs del target (ej: DVWA) sin acceso directo al container.
-        """
-        query = f'{{container="{container}"}}'
-        if filter_text:
-            query += f' |= "{filter_text}"'
-
-        return self.query_range(query, start=start, end=end, limit=limit)
-
-    def query_all_target_logs(
-        self,
-        start: datetime | None = None,
-        end: datetime | None = None,
-        limit: int = 1000,
-    ) -> list[dict]:
-        """
-        Consulta logs de todos los containers target (no el atacante ni infra).
-
-        El observador usa esto para tener una vista completa de los observables
-        sin saber de antemano que containers son targets.
-        """
-        # Excluir containers de infraestructura
-        query = '{job="docker"} !~ "loki|grafana|promtail|attacker"'
-        return self.query_range(query, start=start, end=end, limit=limit)
-
-    def is_healthy(self) -> bool:
-        """Verifica que Loki esta respondiendo."""
-        try:
-            resp = self._http.get(f"{self.base_url}/ready")
-            return resp.status_code == 200
-        except httpx.HTTPError:
-            return False
-
-    def get_labels(self) -> list[str]:
-        """Obtiene los labels disponibles en Loki."""
-        try:
-            resp = self._http.get(f"{self.base_url}/loki/api/v1/labels")
-            resp.raise_for_status()
-            return resp.json().get("data", [])
-        except httpx.HTTPError:
-            return []
 
     def _parse_response(self, data: dict) -> list[dict]:
         """Parsea la respuesta JSON de Loki a una lista plana de log entries."""

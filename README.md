@@ -12,12 +12,14 @@ Banco de pruebas para estudiar empíricamente el uso de LLMs en ciberseguridad e
 
 El sistema opera con dos agentes autónomos que corren en paralelo sin comunicación directa:
 
-| Agente | Modelo | Patrón | Rol |
-|--------|--------|--------|-----|
-| Atacante | OpenAI GPT-4.1 | ReAct con validador code-based y replan | Ejecuta la cadena de ataque contra la red objetivo |
-| Observador | Anthropic Claude Sonnet 4.5 | Grafo condicional con triaje y refinamiento | Analiza logs y clasifica tácticas en tiempo real |
+| Agente | Rol | Patrón |
+|--------|-----|--------|
+| Atacante | Ejecuta la cadena de ataque contra la red objetivo | ReAct con validador code-based, replan con feedback, memoria de playbooks |
+| Observador | Analiza logs y clasifica tácticas MITRE en tiempo real | Grafo condicional con triaje heurístico + refinamiento forense |
 
-El proveedor de cada agente es independiente (`.env`: `LLM_PROVIDER`, `OBSERVER_PROVIDER`), lo que permite alternar OpenAI y Anthropic sin tocar el código. El único canal entre agentes es indirecto: el atacante genera actividad de red, el observador la lee desde Loki.
+Modelo configurable por agente vía `.env`: soporta OpenAI (GPT-4.1), Anthropic (Claude Sonnet 4.5), Google (Gemini 2.5 Flash), Groq (Llama 3.3 70B), OpenRouter y Cerebras. Reproducibilidad académica garantizada por `LLM_SEED=42` + temperaturas separadas por rol (atacante 0.2 para exploración, observador 0.0 para clasificación determinista).
+
+El proveedor de cada agente es independiente, lo que permite combinar cualquier par sin tocar el código. El único canal entre agentes es indirecto: el atacante genera actividad de red, el observador la lee desde Loki.
 
 ## Componentes
 
@@ -33,15 +35,26 @@ docker/
   docker-compose.yml   # Red objetivo + stack de observabilidad
 ```
 
-### Agente Atacante — grafo ReAct con validador code-based
+### Agente Atacante — grafo ReAct con validador code-based y memoria
 
-Ciclo `plan_tactic → execute_tools → validate_result → check_objective → advance_tactic` sobre catorce herramientas de pentesting ejecutadas dentro de un contenedor Kali Linux aislado. Implementado con LangGraph.
+Ciclo `plan_tactic → execute_tools → validate_result → check_objective → advance_tactic` sobre **30 herramientas de pentesting** ejecutadas dentro de un contenedor Kali Linux aislado. Implementado con LangGraph. El diseño del prompt sigue la metodología **Pentest Task Tree (PTT)** propuesta en PentestGPT (Deng et al., USENIX Security 2024) y validada empíricamente en Cybench (Hans et al., ICLR 2025).
 
-Cada táctica tiene un validador determinista en `src/agents/attacker/objectives.py` que revisa el historial de acciones y decide si el objetivo real fue cumplido (credenciales verificadas, RCE live, hash encontrado, root confirmado). Si el validador rechaza el avance, el grafo replanifica con feedback explícito hasta cinco veces antes de aceptar la táctica como fallida. Esto evita declaraciones falsas de éxito por parte del LLM.
+Cada táctica tiene un **validador determinista** en `src/agents/attacker/objectives.py` que revisa el historial de acciones y decide si el objetivo real fue cumplido (credenciales verificadas vía POST live, RCE con evidencia `uid=`, hash crackeado en texto plano, root confirmado por `uid=0` o lectura de `/etc/shadow` o de archivo en `/root/`). Si el validador rechaza el avance, el grafo replanifica con feedback explícito hasta 15 veces antes de aceptar la táctica como fallida.
 
-Herramientas disponibles (en `src/agents/attacker/tools.py`): `run_nmap`, `run_nikto`, `run_gobuster`, `run_gobuster_recursive`, `run_spider`, `run_wpscan`, `run_hydra`, `run_hydra_http_form`, `run_sqlmap`, `run_http_session` (login + petición autenticada con manejo automático de CSRF), `run_curl`, `run_command`, `run_web_shell`, `run_john`.
+**Memoria de playbooks** (`data/attack_playbooks.json`): tras Recon el sistema computa un fingerprint SHA-256 del target (puertos + tech + paths) y consulta memoria. Si hay match, inyecta el playbook previo en los prompts de las tácticas siguientes como hipótesis a verificar. Tras cada táctica exitosa se registra el `tool` + `payload_template` (con secretos sanitizados). Reducción empírica observada: -63% de acciones en warm runs vs cold runs.
 
-Tácticas implementadas end-to-end con validador: Reconnaissance, Initial Access, Execution, Discovery, Credential Access, Privilege Escalation.
+Catálogo de herramientas disponibles:
+
+| Categoría | Tools |
+|-----------|-------|
+| Reconnaissance / Enum | `run_nmap`, `run_nikto`, `run_whatweb`, `run_gobuster`, `run_gobuster_recursive`, `run_dirsearch`, `run_spider`, `run_wpscan`, `run_dns_enum`, `run_enum4linux`, `run_smbclient`, `run_ftp`, `run_searchsploit` |
+| Initial Access | `run_hydra_http_form`, `run_hydra`, `run_john` |
+| Execution / Exploit | `run_http_session` (login + petición autenticada con auto-CSRF), `run_sqlmap`, `run_curl`, `run_command`, `run_web_shell`, `run_ssh_exec`, `run_file_upload` |
+| Payloads / Delivery | `run_msfvenom`, `write_exploit_file`, `start_reverse_listener`, `serve_http` |
+| Privilege Escalation | `run_priv_esc_enum`, `run_linpeas` |
+| Utility | `decode_string` (base64/hex/url/rot13) |
+
+Tácticas implementadas end-to-end con validador: Reconnaissance, Initial Access, Execution, Discovery, Credential Access, Privilege Escalation. Prompts extendidos (sin validador code-based) para Persistence y Lateral Movement.
 
 ### Agente Observador — grafo condicional con triaje y refinamiento
 

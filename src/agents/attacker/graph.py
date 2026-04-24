@@ -56,14 +56,34 @@ def build_attacker_graph() -> StateGraph:
 def create_initial_state(
     target: str | None = None,
     tactics: list[str] | None = None,
+    use_memory: bool = True,
 ) -> AttackerState:
     """Crea el estado inicial para una ejecucion del agente atacante."""
     if tactics is None:
         tactics = [t.name.lower().replace(" ", "_") for t in get_implemented_tactics()]
 
-    target = target or settings.target_ip
+    # Normaliza nombres de tacticas para evitar bugs por typos (espacios, upper).
+    # La comparacion en validators y routing depende de strings lowercase
+    # unificados. Filtra entradas vacias/None.
+    tactics = [
+        t.strip().lower().replace(" ", "_")
+        for t in (tactics or [])
+        if t and isinstance(t, str) and t.strip()
+    ]
 
-    logger.info(f"Estado inicial: target={target}, tacticas={tactics}")
+    if not tactics:
+        raise ValueError(
+            "tactics no puede estar vacio. Define al menos una tactica MITRE "
+            "(ej: ['reconnaissance', 'initial_access', 'execution'])."
+        )
+
+    target = target or settings.target_ip
+    if not target:
+        raise ValueError(
+            "target no definido. Pasa --target <IP> o configura TARGET_IP en .env."
+        )
+
+    logger.info(f"Estado inicial: target={target}, tacticas={tactics}, memoria={use_memory}")
 
     return AttackerState(
         target=target,
@@ -82,5 +102,8 @@ def create_initial_state(
         tactic_complete=False,
         attack_finished=False,
         error=None,
+        target_fingerprint="",
+        matched_playbook=None,
+        use_memory=use_memory,
         messages=[],
     )

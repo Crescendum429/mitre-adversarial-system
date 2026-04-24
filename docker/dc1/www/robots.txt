@@ -1,0 +1,3 @@
+User-agent: *
+Disallow: /fsocity.dic
+Disallow: /flag1.txt

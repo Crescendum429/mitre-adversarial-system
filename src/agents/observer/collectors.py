@@ -13,7 +13,7 @@ No tiene acceso a:
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from src.infrastructure.loki_client import LokiClient
 
@@ -53,8 +53,14 @@ class LogCollector:
             end=end,
         )
 
-        # Filtrar: solo logs de containers target (excluir infra y atacante)
-        infra_containers = {"loki", "grafana", "promtail", "attacker"}
+        # Filtrar: solo logs de containers target. Excluir infraestructura
+        # (no genera logs de ataque), el atacante (principio de separacion:
+        # el observador no ve acciones del atacante directamente), y
+        # confluence-db (backing MySQL de Confluence, genera queries SQL
+        # internas que no son parte del ataque observable).
+        infra_containers = {
+            "loki", "grafana", "promtail", "attacker", "confluence-db",
+        }
         filtered = []
         for log in logs:
             container = log.get("labels", {}).get("container", "")

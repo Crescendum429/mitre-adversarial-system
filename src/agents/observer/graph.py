@@ -127,6 +127,7 @@ def create_observer_state(
     simulation_start: datetime | None = None,
     window_start: datetime | None = None,
     window_end: datetime | None = None,
+    use_heuristics: bool = True,
 ) -> ObserverState:
     """
     Crea el estado inicial para una ejecucion del observador.
@@ -159,4 +160,5 @@ def create_observer_state(
         refinement_count=0,
         has_new_logs=False,
         error=None,
+        use_heuristics=use_heuristics,
     )

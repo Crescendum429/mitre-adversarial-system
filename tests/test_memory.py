@@ -1,0 +1,170 @@
+"""Tests del sistema de memoria persistente del atacante."""
+
+import json
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from src.agents.attacker import memory
+
+
+@pytest.fixture
+def tmp_memory(monkeypatch):
+    """Usa un archivo temporal de memoria por test para aislamiento."""
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "playbooks.json"
+        monkeypatch.setattr(memory, "MEMORY_FILE", path)
+        yield path
+
+
+class TestComputeTargetFingerprint:
+    def test_same_observables_produce_same_fp(self):
+        ev = {
+            "port_80_open": True,
+            "web_technologies": ["Apache", "DVWA"],
+            "discovered_paths": ["admin", "login.php"],
+        }
+        fp1 = memory.compute_target_fingerprint(ev)
+        fp2 = memory.compute_target_fingerprint(ev)
+        assert fp1 == fp2
+        assert len(fp1) == 16
+
+    def test_tech_order_invariant(self):
+        """El orden de web_technologies no debe cambiar el fingerprint."""
+        ev1 = {
+            "port_80_open": True,
+            "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": ["admin"],
+        }
+        ev2 = {
+            "port_80_open": True,
+            "web_technologies": ["PHP", "DVWA", "Apache"],
+            "discovered_paths": ["admin"],
+        }
+        assert memory.compute_target_fingerprint(ev1) == memory.compute_target_fingerprint(ev2)
+
+    def test_different_tech_produces_different_fp(self):
+        ev1 = {"port_80_open": True, "web_technologies": ["Apache"], "discovered_paths": ["x"]}
+        ev2 = {"port_80_open": True, "web_technologies": ["nginx"], "discovered_paths": ["x"]}
+        assert memory.compute_target_fingerprint(ev1) != memory.compute_target_fingerprint(ev2)
+
+    def test_ignores_dotfiles(self):
+        """Paths que empiezan con . se filtran (son ruido de gobuster)."""
+        ev1 = {"port_80_open": True, "web_technologies": ["Apache"],
+               "discovered_paths": [".htaccess", ".hta", "admin"]}
+        ev2 = {"port_80_open": True, "web_technologies": ["Apache"],
+               "discovered_paths": ["admin"]}
+        assert memory.compute_target_fingerprint(ev1) == memory.compute_target_fingerprint(ev2)
+
+    def test_empty_evidence_returns_empty(self):
+        assert memory.compute_target_fingerprint({}) == ""
+
+
+class TestPlaybookPersistence:
+    def test_lookup_returns_none_for_missing(self, tmp_memory):
+        assert memory.lookup_playbook("abc123") is None
+
+    def test_upsert_recon_creates_entry(self, tmp_memory):
+        fp = "abc123"
+        ev = {"port_80_open": True, "web_technologies": ["Apache"],
+              "discovered_paths": ["admin"]}
+        memory.upsert_playbook_recon(fp, "10.10.0.10", ev, actions_used=5)
+
+        pb = memory.lookup_playbook(fp)
+        assert pb is not None
+        assert pb["last_target_ip"] == "10.10.0.10"
+        assert pb["tactics"]["reconnaissance"]["best_run_actions"] == 5
+
+    def test_upsert_keeps_best_actions(self, tmp_memory):
+        fp = "xyz"
+        ev = {"port_80_open": True, "web_technologies": ["X"], "discovered_paths": ["y"]}
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=10)
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=5)  # mejor
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=7)  # peor
+        pb = memory.lookup_playbook(fp)
+        assert pb["tactics"]["reconnaissance"]["best_run_actions"] == 5
+
+    def test_record_tactic_success_sanitizes_secrets(self, tmp_memory):
+        fp = "abc"
+        ev = {"port_80_open": True, "web_technologies": ["Apache"], "discovered_paths": ["x"]}
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=3)
+        memory.record_tactic_success(
+            fingerprint=fp,
+            tactic="initial_access",
+            tool="run_http_session",
+            args={
+                "login_url": "http://target/login.php",
+                "login_data": "username=admin&password=supersecret123&Login=Login",
+                "password": "hunter2",
+            },
+            evidence={"login_verified": True},
+            actions_used=5,
+        )
+        pb = memory.lookup_playbook(fp)
+        entry = pb["tactics"]["initial_access"]
+        assert entry["tool"] == "run_http_session"
+        # El password NO debe aparecer en plaintext
+        assert "supersecret123" not in json.dumps(entry)
+        assert "hunter2" not in json.dumps(entry)
+        # Los placeholders <discovered> SI deben aparecer
+        assert "<discovered>" in json.dumps(entry)
+
+    def test_record_run_completion_increments(self, tmp_memory):
+        fp = "abc"
+        ev = {"port_80_open": True, "web_technologies": ["X"], "discovered_paths": ["y"]}
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=3)
+        memory.record_run_completion(fp, all_successful=True)
+        memory.record_run_completion(fp, all_successful=False)
+        pb = memory.lookup_playbook(fp)
+        assert pb["run_count"] == 2
+        assert pb["successful_runs"] == 1
+
+
+class TestPlaybookSanitization:
+    def test_scrub_hex_hashes(self, tmp_memory):
+        fp = "a"
+        ev = {"port_80_open": True, "web_technologies": ["X"], "discovered_paths": ["y"]}
+        memory.upsert_playbook_recon(fp, "1.1.1.1", ev, actions_used=3)
+        memory.record_tactic_success(
+            fingerprint=fp,
+            tactic="discovery",
+            tool="run_command",
+            args={
+                "command": "cat /home/robot/password.raw-md5",
+                "output": "robot:5f4dcc3b5aa765d61d8327deb882cf99",
+            },
+            evidence={"discovered_hash": "5f4dcc3b5aa765d61d8327deb882cf99"},
+            actions_used=2,
+        )
+        pb = memory.lookup_playbook(fp)
+        entry_json = json.dumps(pb["tactics"]["discovery"])
+        # El hash no debe aparecer literal en el playbook
+        assert "5f4dcc3b5aa765d61d8327deb882cf99" not in entry_json
+        assert "<hash>" in entry_json
+
+
+class TestRenderForPrompt:
+    def test_renders_basic_playbook(self):
+        pb = {
+            "target_summary": "Apache+DVWA+PHP",
+            "run_count": 3,
+            "successful_runs": 2,
+            "tactics": {
+                "reconnaissance": {
+                    "best_run_actions": 4,
+                    "key_findings": ["port_80_open"],
+                },
+                "initial_access": {
+                    "tool": "run_http_session",
+                    "payload_template": {"login_url": "http://x/login.php"},
+                    "best_run_actions": 6,
+                },
+            },
+        }
+        rendered = memory.render_playbook_for_prompt(pb, "initial_access")
+        assert "Apache+DVWA+PHP" in rendered
+        assert "run_http_session" in rendered
+        assert "3" in rendered
+        assert "2 exitosas" in rendered

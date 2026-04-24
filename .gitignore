@@ -36,5 +36,13 @@ results/
 docs/
 *_run_output*.txt
 
+# Clones externos (vulhub, SecLists, etc.). No commit — el usuario los clona localmente.
+external/
+
+# Memoria persistente de playbooks: contiene datos de corridas reales.
+# Se ignora por el pattern *.json pero se hace explicito aqui.
+data/attack_playbooks.json
+data/benchmark_*.json
+
 .DS_Store
 Thumbs.db
