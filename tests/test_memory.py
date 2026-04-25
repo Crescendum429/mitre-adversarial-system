@@ -61,6 +61,60 @@ class TestComputeTargetFingerprint:
     def test_empty_evidence_returns_empty(self):
         assert memory.compute_target_fingerprint({}) == ""
 
+    def test_fingerprint_robust_to_path_variance(self):
+        """Critico para reutilizacion de memoria: fingerprint IGNORA paths
+        descubiertos (son variables entre runs por no-determinismo de
+        gobuster). Solo port + tech importan.
+        """
+        ev_run_a = {
+            "port_80_open": True, "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": ["robots.txt", "random_file.txt", "admin"],
+        }
+        ev_run_b = {
+            "port_80_open": True, "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": ["login.php", "foo.html"],  # completamente distintos
+        }
+        ev_run_c = {
+            "port_80_open": True, "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": [],  # ningun path (caso degenerate)
+        }
+        fp_a = memory.compute_target_fingerprint(ev_run_a)
+        fp_b = memory.compute_target_fingerprint(ev_run_b)
+        fp_c = memory.compute_target_fingerprint(ev_run_c)
+        assert fp_a == fp_b == fp_c
+
+    def test_fingerprint_same_across_target_instances(self):
+        """Dos despliegues distintos del mismo tipo de target (ej: DVWA en
+        10.10.0.10 y DVWA en otra IP) producen el MISMO fingerprint. Esto
+        es DESEADO: el playbook aprendido generaliza a cualquier DVWA.
+        """
+        dvwa_instance_a = {
+            "port_80_open": True,
+            "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": ["login.php"],
+        }
+        dvwa_instance_b = {
+            "port_80_open": True,
+            "web_technologies": ["Apache", "DVWA", "PHP"],
+            "discovered_paths": ["admin", "wp-login.php"],  # paths distintos
+        }
+        assert (
+            memory.compute_target_fingerprint(dvwa_instance_a)
+            == memory.compute_target_fingerprint(dvwa_instance_b)
+        )
+
+    def test_fingerprint_different_for_different_tech(self):
+        """Tech stack distinta -> fingerprint distinto. No contaminamos
+        playbooks entre tipos de target.
+        """
+        dvwa = {"port_80_open": True, "web_technologies": ["Apache", "DVWA", "PHP"]}
+        wp = {"port_80_open": True, "web_technologies": ["Apache", "WordPress", "PHP"]}
+        solr = {"http_port_open": 8983, "web_technologies": ["Apache Solr"]}
+        fp_d = memory.compute_target_fingerprint(dvwa)
+        fp_w = memory.compute_target_fingerprint(wp)
+        fp_s = memory.compute_target_fingerprint(solr)
+        assert fp_d != fp_w != fp_s != fp_d  # todos distintos entre si
+
 
 class TestPlaybookPersistence:
     def test_lookup_returns_none_for_missing(self, tmp_memory):

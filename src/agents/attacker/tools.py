@@ -78,40 +78,61 @@ def run_hydra_http_form(
     failure_indicator: str,
     extra_form_fields: str = "",
     threads: int = 4,
+    max_seconds: int = 180,
 ) -> str:
     """Brute force HTTP POST form login usando hydra.
 
     Construye automaticamente el modulo http-post-form de hydra con el formato
     correcto. Ideal para atacar formularios de login web (wp-login.php, etc).
 
+    IMPORTANTE: usa wordlists pequenos primero (dirb/common.txt ~4600 entradas).
+    rockyou.txt (14M passwords) NO es razonable en CTF tipico — toma horas.
+
     Args:
-        target: IP o host del target (ej: "10.10.0.20")
-        login_path: Ruta del endpoint de login (ej: "/wp-login.php")
-        user_field: Nombre del campo de usuario en el form (ej: "log")
-        pass_field: Nombre del campo de password en el form (ej: "pwd")
-        username: Usuario a probar (ej: "admin", "elliot")
-        password_list: Ruta absoluta al wordlist en el container atacante
-        failure_indicator: Substring que aparece en la respuesta cuando el
-            login FALLA (ej: "incorrect", "Invalid", "ERROR"). Hydra marca
-            una password como correcta cuando esta substring NO aparece.
-        extra_form_fields: Campos adicionales del form separados por &
-            (ej: "wp-submit=Log+In&testcookie=1"). Opcional.
-        threads: Numero de threads paralelos (default 4).
+        target: IP o host del target.
+        login_path: Ruta del endpoint de login (ej: "/wp-login.php").
+        user_field: Nombre del campo de usuario en el form (ej: "log").
+        pass_field: Nombre del campo de password en el form (ej: "pwd").
+        username: Usuario a probar (ej: "admin", "elliot").
+        password_list: Ruta absoluta al wordlist. Recomendado en orden de
+            preferencia: 1) wordlist descubierto en el target (ej:
+            /tmp/fsocity.dic), 2) /usr/share/wordlists/dirb/common.txt,
+            3) /usr/share/wordlists/SecLists/Passwords/Common-Credentials/
+               10-million-password-list-top-10000.txt
+        failure_indicator: Substring EXACTO en la respuesta de login fallido.
+            Si es incorrecto, hydra reporta TODAS las passwords como validas.
+            Verifica manualmente: `curl -d "log=x&pwd=x" /login` y busca
+            string que aparezca SOLO en error (no en response normal).
+        extra_form_fields: Campos extra del form separados por & (opcional).
+        threads: Threads paralelos (default 4).
+        max_seconds: Timeout duro al binario hydra. Default 180s (3 min).
+            Si el wordlist es enorme (>50k), aumenta o usa wordlist mas chico.
 
     Returns:
-        Output de hydra. Si encuentra credenciales, la linea incluye
-        "login: <user>   password: <pass>".
+        Output de hydra. Si encuentra credenciales, contiene
+        "login: <user>   password: <pass>". Si timeouta sin encontrar,
+        retorna mensaje explicito (NO ", login confirmado" implicito).
     """
     form_body = f"{user_field}=^USER^&{pass_field}=^PASS^"
     if extra_form_fields:
         form_body += f"&{extra_form_fields}"
     form_module = f"{login_path}:{form_body}:F={failure_indicator}"
+    # Cap el tiempo del binario hydra (no del docker exec) para que el output
+    # parcial salga aunque corte el wordlist a medias.
+    safe_max = max(30, min(int(max_seconds), 600))
     command = (
-        f"hydra -l {username} -P {password_list} -t {threads} -f "
+        f"timeout {safe_max} hydra -l {username} -P {password_list} -t {threads} -f "
         f"{target} http-post-form '{form_module}' 2>&1 | tail -30"
     )
-    result = _docker().exec_in_attacker(command, timeout=180)
-    return result.stdout or result.stderr
+    result = _docker().exec_in_attacker(command, timeout=safe_max + 30)
+    output = result.stdout or result.stderr
+    if result.exit_code == 124 or "timeout" in output.lower():
+        return (
+            f"[TIMEOUT] hydra excedio {safe_max}s sin completar el wordlist. "
+            f"Output parcial:\n{output[-2000:]}\n\n"
+            f"Sugerencia: usa wordlist mas pequeno (dirb/common.txt o head -1000 rockyou)."
+        )
+    return output
 
 
 @tool
@@ -121,28 +142,42 @@ def run_hydra(
     username: str,
     password_list: str,
     extra_flags: str = "-t 4 -f",
+    max_seconds: int = 180,
 ) -> str:
     """Ejecuta hydra contra servicios no-HTTP (ssh, ftp, smb, etc).
 
-    Para HTTP POST form login usa `run_hydra_http_form` que arma el formato
-    automaticamente.
+    Para HTTP POST form login usa `run_hydra_http_form` (formato auto).
+
+    Recomendaciones de wordlist (orden de preferencia):
+      1. Wordlist descubierto en el target (ej: /tmp/users.txt, fsocity.dic)
+      2. /usr/share/wordlists/dirb/common.txt (~4600 entradas)
+      3. /usr/share/wordlists/SecLists/Passwords/Common-Credentials/
+         10-million-password-list-top-10000.txt
 
     Args:
-        target: IP o host del target
-        service: Servicio a atacar ("ssh", "ftp", "smb", etc)
-        username: Usuario a probar
-        password_list: Ruta absoluta al wordlist en el container atacante
-        extra_flags: Flags adicionales para hydra (default: -t 4 -f)
+        target: IP o host del target.
+        service: Servicio ("ssh", "ftp", "smb", "vnc", "rdp").
+        username: Usuario a probar (o usa -L para wordlist de usuarios).
+        password_list: Ruta absoluta al wordlist.
+        extra_flags: Flags adicionales (default: -t 4 -f para 4 threads y stop on first).
+        max_seconds: Timeout duro del binario hydra. Default 180s.
 
     Returns:
-        Output de hydra.
+        Output de hydra. Mensaje explicito si timeouta.
     """
+    safe_max = max(30, min(int(max_seconds), 600))
     command = (
-        f"hydra -l {username} -P {password_list} {extra_flags} "
+        f"timeout {safe_max} hydra -l {username} -P {password_list} {extra_flags} "
         f"{target} {service} 2>&1 | tail -30"
     )
-    result = _docker().exec_in_attacker(command, timeout=180)
-    return result.stdout or result.stderr
+    result = _docker().exec_in_attacker(command, timeout=safe_max + 30)
+    output = result.stdout or result.stderr
+    if result.exit_code == 124:
+        return (
+            f"[TIMEOUT] hydra excedio {safe_max}s. Wordlist demasiado grande. "
+            f"Output parcial:\n{output[-2000:]}"
+        )
+    return output
 
 
 @tool
@@ -233,7 +268,10 @@ def run_http_session(
     script_lines[-1] = script_lines[-1].replace(f'"{login_body_expr}"', login_body_expr if auto_csrf else f'"{login_body_expr}"')
 
     if target_method.upper() == "POST":
-        # URL-encode cada value manualmente para evitar interpretacion shell del ';'
+        # URL-encode cada value manualmente para evitar interpretacion shell del ';'.
+        # Detecta si el value YA viene URL-encoded (contiene %XX) y en ese caso lo
+        # pasa tal cual — evita doble-encoding (`;` → `%3B` → `%253B`) que algunos
+        # LLMs (gpt-oss, llama small) hacen por su cuenta.
         from urllib.parse import quote as _urlq
         encoded_fields = []
         for field in target_data.split("&"):
@@ -241,7 +279,11 @@ def run_http_session(
                 continue
             if "=" in field:
                 k, v = field.split("=", 1)
-                encoded_fields.append(f"{k}={_urlq(v, safe='')}")
+                already_encoded = bool(re.search(r"%[0-9A-Fa-f]{2}", v))
+                if already_encoded:
+                    encoded_fields.append(f"{k}={v}")
+                else:
+                    encoded_fields.append(f"{k}={_urlq(v, safe='')}")
             else:
                 encoded_fields.append(field)
         encoded_body = "&".join(encoded_fields)

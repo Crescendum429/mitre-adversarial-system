@@ -217,7 +217,9 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
         )
 
     if provider == LLMProvider.OPENROUTER:
-        # OpenRouter expone seed via model_kwargs (cuando el modelo lo soporta).
+        # OpenRouter es un gateway hacia muchos modelos open-weight. Algunos
+        # corren en JAX/vLLM y no soportan `seed` per-request (devuelven error
+        # 502). No pasamos seed; reproducibilidad depende de temp=0.
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(
             model=model_name,
@@ -225,7 +227,6 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
             base_url="https://openrouter.ai/api/v1",
             temperature=temp,
             max_tokens=settings.llm_max_tokens,
-            seed=seed,
         )
 
     if provider == LLMProvider.CEREBRAS:

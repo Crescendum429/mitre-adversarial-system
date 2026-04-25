@@ -222,6 +222,17 @@ A) BRUTE FORCE a servicio autenticado (form login, ssh, ftp, smb):
      login: curl -d "log=x&pwd=y" /login y lee el HTML de respuesta.
    run_hydra para ssh/ftp/smb.
 
+   ESTRATEGIA DE WORDLISTS (critico, evita corridas de horas):
+     - Empieza con wordlist PEQUENA: /usr/share/wordlists/dirb/common.txt
+       (~4600 entradas, 30-60s con hydra -t 4) o las primeras 100-1000
+       lineas de rockyou con `head -1000 /usr/share/wordlists/rockyou.txt`.
+     - Si no funciona, escala a /usr/share/wordlists/SecLists/Passwords/
+       Common-Credentials/10-million-password-list-top-10000.txt (10k entradas).
+     - rockyou.txt completo (14M) NO es razonable salvo que tengas 8+ horas.
+     - Si descubriste un wordlist en el target (fsocity.dic), usalo PRIMERO:
+       las CTFs lo plantan ahi a proposito. Bajalo con run_command + curl
+       y pasalo a hydra con -P /tmp/wordlist_descubierto.txt.
+
 B) EXPLOIT DE CVE publica en software desactualizado:
    run_searchsploit con el nombre y version del software detectado en recon.
    Si hay exploit disponible, revisalo con run_command('cat <path>') antes de
@@ -545,13 +556,24 @@ def build_tactic_prompt(
         parts.append("\n[MEMORIA — PLAYBOOK PREVIO PARA ESTE TARGET]")
         parts.append(render_playbook_for_prompt(playbook, tactic_name))
         parts.append(
-            "Este playbook proviene de ataques previos contra un target con la misma "
-            "huella de recon (mismos puertos, tech stack y paths). Úsalo como hipótesis "
-            "a verificar, no como script: si los observables actuales coinciden con lo "
-            "registrado, replica la cadena. Si no coinciden, adapta. Los valores "
-            "marcados como <discovered> indican datos que descubriste antes y que "
-            "debes volver a descubrir empíricamente (no asumas que el valor previo "
-            "sigue siendo válido)."
+            "ESTE PLAYBOOK ES UNA SUGERENCIA DE ESTRATEGIA, NO LA RESPUESTA.\n"
+            "\n"
+            "Como usarlo:\n"
+            "1. La estructura general (que tool usar, que URL, que metodo) es\n"
+            "   probable que aplique si los observables coinciden con runs previos.\n"
+            "2. Los strings literales como '<discovered>', '<hash>', '<credenciales>'\n"
+            "   son PLACEHOLDERS que indican que ahi VA un valor que debes redescubrir\n"
+            "   empiricamente en este run. NO los pases tal cual a las herramientas\n"
+            "   (esto causara que el login falle o el comando se rompa).\n"
+            "3. Para credenciales especificamente: el playbook NO almacena passwords\n"
+            "   por seguridad — debes hacer tu propio brute force / discovery en\n"
+            "   ESTE run. El playbook solo te dice QUE TIPO de ataque funciono.\n"
+            "4. Si los observables actuales NO coinciden con el playbook (ej: el\n"
+            "   target tiene tech stack distinta, paths diferentes), IGNORA el\n"
+            "   playbook y procede empiricamente desde cero.\n"
+            "\n"
+            "Resumen: el playbook ahorra tiempo de exploracion de vectores; no\n"
+            "ahorra el trabajo de descubrir secretos del target actual."
         )
 
     parts.append("\nDATOS RECOPILADOS:")

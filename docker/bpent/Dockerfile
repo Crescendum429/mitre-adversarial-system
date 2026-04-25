@@ -15,6 +15,10 @@ RUN set -eux; \
     pass=$(head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 12); \
     sed -i "s/__USERNAME__/marlinspike/g" /var/www/html/wp-login.php /var/www/html/wp-admin/theme-editor.php; \
     sed -i "s/__PASSWORD_PLACEHOLDER__/${pass}/g" /var/www/html/wp-login.php; \
+    # fsocity.dic: incluye el username (descubrible) y el password (random per-build).
+    # Alineado con la estructura del CTF real Mr. Robot 1 (VulnHub) donde fsocity.dic
+    # contiene tanto candidatos de usuario como de password.
+    echo "marlinspike" >> /var/www/html/fsocity.dic; \
     echo "$pass" >> /var/www/html/fsocity.dic; \
     marl_pass=$(head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10); \
     marl_md5=$(echo -n "$marl_pass" | md5sum | cut -d' ' -f1); \

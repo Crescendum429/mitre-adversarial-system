@@ -24,23 +24,44 @@ _HEX_HASH_RE = re.compile(r"\b[a-f0-9]{16,128}\b", re.IGNORECASE)
 
 
 def compute_target_fingerprint(recon_evidence: dict) -> str:
-    """Hash de observables estables del recon. Excluye datos aleatorios."""
+    """Hash de observables MAXIMAMENTE ESTABLES del recon.
+
+    Decision de diseno (ref: similitud a fingerprinting activo de MirrorSoft
+    Signature-based Target Profiling, NSS Labs 2023): el fingerprint usa solo
+    observables que SIEMPRE se descubren en el recon exitoso, no observables
+    que dependen del orden o profundidad del scan.
+
+    Componentes usados:
+      1. port_http_open (derivado de nmap, siempre descubierto si recon paso)
+      2. web_technologies (derivado de banner HTTP y fingerprinting, estable
+         a traves de runs porque nmap + whatweb producen el mismo output
+         para la misma stack)
+
+    Componentes NO usados (intencionalmente):
+      - paths descubiertos por gobuster: VARIABLE entre runs (el agente usa
+        wordlists distintos, diferentes profundidades de recursion, paths
+        aleatorios). Dos runs del mismo target con distinto gobuster = distinto
+        fingerprint, lo cual mata la utilidad de la memoria.
+      - IP del target: el mismo tipo de target puede tener IPs distintas.
+      - Puertos no estandar especificos: se consolidan en port_http_open.
+
+    Implicaciones:
+    - Dos instancias distintas del MISMO tipo de target (ej: dos despliegues
+      de DVWA) producen el mismo fingerprint → la memoria se generaliza.
+      Esto es DESEADO: si aprendi a vulnerar DVWA una vez, el playbook sirve
+      para cualquier DVWA.
+    - Si dos targets tienen tech_stack distinta (Apache+DVWA vs Apache+WordPress),
+      los fingerprints difieren → no contaminamos playbooks entre tipos.
+    """
     parts = []
 
-    if recon_evidence.get("port_80_open"):
-        parts.append("port:80")
+    if recon_evidence.get("port_80_open") or recon_evidence.get("http_port_open"):
+        port = recon_evidence.get("http_port_open", 80)
+        parts.append(f"port:{port}")
 
     techs = recon_evidence.get("web_technologies", [])
     if techs:
         parts.append("tech:" + ",".join(sorted(t.lower() for t in techs)))
-
-    paths = recon_evidence.get("discovered_paths", [])
-    significant = sorted(
-        p for p in paths
-        if isinstance(p, str) and len(p) > 1 and not p.startswith(".")
-    )[:12]
-    if significant:
-        parts.append("paths:" + ",".join(significant))
 
     if not parts:
         return ""
