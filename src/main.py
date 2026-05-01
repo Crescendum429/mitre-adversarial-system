@@ -126,7 +126,7 @@ def run_attacker(
     accumulated_flags = []
     accumulated_met = {}
     accumulated_attempts = {}
-    for event in graph.stream(initial_state, {"recursion_limit": 800}):
+    for event in graph.stream(initial_state, {"recursion_limit": settings.attacker_recursion_limit}):
         for node_name, node_state in event.items():
             if node_name == "advance_tactic":
                 tactic = node_state.get("current_tactic", "")
@@ -825,9 +825,12 @@ def print_timing_summary(
     - Triage short-circuit rate (windows que evitaron LLM).
     - Refinamiento rate (windows que necesitaron Investigate).
     - Docker tool execution stats (n execs, latencia total, timeouts).
+    - Loki HTTP query stats (n queries, latencia total, errores).
+    - Tiempo por componente y throughput estimado del observer.
     """
     from src.llm.provider import USAGE_STATS
     from src.infrastructure.docker_client import DOCKER_STATS
+    from src.infrastructure.loki_client import LOKI_STATS
     from src.agents.observer.nodes import OBSERVER_NODE_STATS
 
     attacker_s = float(attacker_state.get("attacker_elapsed_seconds", 0.0) or 0.0)
@@ -926,6 +929,58 @@ def print_timing_summary(
         t_docker.add_row("Execs con error de API", str(dstats.get("error_count", 0)))
         console.print(t_docker)
 
+    # 5b) Loki HTTP query stats (observer)
+    lstats = LOKI_STATS
+    if lstats.get("query_count", 0):
+        t_loki = Table(title="Consultas a Loki (observer)", expand=False)
+        t_loki.add_column("Metrica", style="bold")
+        t_loki.add_column("Valor", justify="right")
+        t_loki.add_row("Queries totales", str(lstats.get("query_count", 0)))
+        t_loki.add_row("Tiempo total HTTP", _fmt_hms(float(lstats.get("total_seconds", 0.0) or 0.0)))
+        if lstats.get("query_count", 0):
+            avg = float(lstats.get("total_seconds", 0.0) or 0.0) / int(lstats.get("query_count", 1))
+            t_loki.add_row("Tiempo promedio por query", f"{avg*1000:.0f} ms")
+        t_loki.add_row("Queries con error", str(lstats.get("error_count", 0)))
+        console.print(t_loki)
+
+    # 5c) Tiempo por componente (atacante LLM, observer LLM, docker, loki)
+    t_components = Table(title="Tiempo por componente (corrida completa)", expand=False)
+    t_components.add_column("Componente", style="bold")
+    t_components.add_column("Segundos", justify="right")
+    t_components.add_column("% wall-clock", justify="right")
+    a_llm = float(a.get("elapsed_seconds", 0.0) or 0.0)
+    o_llm = float(o.get("elapsed_seconds", 0.0) or 0.0)
+    docker_s = float(dstats.get("total_seconds", 0.0) or 0.0)
+    loki_s = float(lstats.get("total_seconds", 0.0) or 0.0)
+    wall = max(session_elapsed_seconds, 1e-6)
+    for label, secs in [
+        ("LLM atacante", a_llm),
+        ("LLM observer", o_llm),
+        ("Docker exec", docker_s),
+        ("Loki HTTP", loki_s),
+    ]:
+        t_components.add_row(label, f"{secs:.1f}", f"{100*secs/wall:.1f}%")
+    t_components.add_row("Wall-clock total", f"{wall:.1f}", "100.0%")
+    console.print(t_components)
+
+    # 5d) Throughput observer y backlog (latencia LLM vs intervalo de polling).
+    # Backlog ~= ceil(latencia_promedio_obs / poll_interval) - 1; si > 0 indica
+    # que las ventanas se acumulan mas rapido de lo que el observer las procesa.
+    poll_interval = settings.observer_poll_interval
+    if latencies_ms and poll_interval > 0:
+        avg_obs_latency_s = sum(latencies_ms) / len(latencies_ms) / 1000.0
+        backlog_ratio = avg_obs_latency_s / poll_interval - 1.0
+        t_thr = Table(title="Throughput del observer", expand=False)
+        t_thr.add_column("Metrica", style="bold")
+        t_thr.add_column("Valor", justify="right")
+        t_thr.add_row("Intervalo de polling", f"{poll_interval} s")
+        t_thr.add_row("Latencia promedio LLM observer", f"{avg_obs_latency_s:.2f} s")
+        t_thr.add_row(
+            "Backlog acumulado (ratio)",
+            f"{backlog_ratio:+.2f}" + (" (acumula)" if backlog_ratio > 0 else " (drena)")
+        )
+        console.print(t_thr)
+
     # 6) Acciones por tactica + intentos (resumen condensado)
     actions = attacker_state.get("action_history", []) or []
     attempts = attacker_state.get("attempts_per_tactic", {}) or {}
@@ -986,6 +1041,11 @@ def main():
         "--no-report", action="store_true",
         help="Salta la generacion del reporte HTML al final"
     )
+    parser.add_argument(
+        "--dashboard", action="store_true",
+        help="Activa dashboard Live (Rich split-screen) que muestra atacante + "
+             "observador en tiempo real. Convive con los logs estandar."
+    )
     args = parser.parse_args()
 
     if args.tool_output:
@@ -998,17 +1058,18 @@ def main():
     # Inicia el session recorder para capturar todos los eventos del run.
     session = get_session()
     session.reset()
+    attacker_model_name = (
+        settings.openai_model if settings.llm_provider.value == "openai"
+        else settings.anthropic_model if settings.llm_provider.value == "anthropic"
+        else settings.google_model if settings.llm_provider.value == "google"
+        else settings.groq_model if settings.llm_provider.value == "groq"
+        else settings.openrouter_model if settings.llm_provider.value == "openrouter"
+        else settings.cerebras_model
+    )
     session.set_metadata(
         scenario=args.scenario,
         attacker_provider=settings.llm_provider.value,
-        attacker_model=(
-            settings.openai_model if settings.llm_provider.value == "openai"
-            else settings.anthropic_model if settings.llm_provider.value == "anthropic"
-            else settings.google_model if settings.llm_provider.value == "google"
-            else settings.groq_model if settings.llm_provider.value == "groq"
-            else settings.openrouter_model if settings.llm_provider.value == "openrouter"
-            else settings.cerebras_model
-        ),
+        attacker_model=attacker_model_name,
         observer_provider=(settings.observer_provider.value if settings.observer_provider
                             else settings.llm_provider.value),
         observer_model=settings.observer_model,
@@ -1018,6 +1079,18 @@ def main():
         started_at=datetime.now(timezone.utc).isoformat(),
     )
     session.system_event("session_start", scenario=args.scenario)
+
+    dashboard = None
+    if args.dashboard:
+        from src.ui.dashboard import LiveDashboard
+        dashboard = LiveDashboard(
+            scenario=args.scenario,
+            target=args.target or "",
+            attacker_model=attacker_model_name,
+            observer_model=settings.observer_model,
+        )
+        session.subscribe(dashboard.push_event)
+        dashboard.start()
 
     # Definir tacticas y target por escenario
     scenarios = {
@@ -1105,15 +1178,32 @@ def main():
     scenario_config = scenarios.get(args.scenario, scenarios["basic"])
     tactics = scenario_config["tactics"]
     target = args.target or scenario_config["target"]
+    if dashboard is not None:
+        dashboard.attacker_total_tactics = len(tactics)
+        dashboard.target = target or ""
 
     if args.attacker_only:
         # Solo atacante, sin observador
-        attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
-        print_attack_summary(attacker_state)
-        _emit_report(args, scenario_config, attacker_state, [])
+        try:
+            attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
+            print_attack_summary(attacker_state)
+            _emit_report(args, scenario_config, attacker_state, [])
+        finally:
+            if dashboard is not None:
+                dashboard.stop()
         return
 
     # Ejecucion completa: atacante + observador en paralelo
+    try:
+        _run_full_session(args, scenario_config, tactics, target)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
+
+
+def _run_full_session(args, scenario_config: dict, tactics: list, target: str | None) -> None:
+    """Cuerpo de la corrida completa atacante + observer (extraido para que main()
+    pueda envolverlo en try/finally para shutdown del dashboard)."""
     observer_results: list = []
     stop_event = threading.Event()
     observer_lock = threading.RLock()
@@ -1144,7 +1234,7 @@ def main():
     # Tres ciclos completos: el que estaba en curso termina + dos mas que ven
     # el estado final del ataque, dando al observador tiempo suficiente para
     # capturar tacticas que el atacante completo rapidamente.
-    time.sleep(args.observer_interval * 3 + 15)
+    time.sleep(args.observer_interval * 3 + settings.observer_shutdown_grace_seconds)
     stop_event.set()
     # Join con timeout suficiente para permitir que se complete la ventana
     # actual + el flush de pendientes. Si el observer tiene N ventanas
@@ -1211,7 +1301,37 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
     """Genera reporte HTML + JSON post-run con todos los eventos capturados."""
     if args.no_report:
         return
+    from src.llm.provider import USAGE_STATS
+    from src.infrastructure.docker_client import DOCKER_STATS
+    from src.infrastructure.loki_client import LOKI_STATS
+
     session = get_session()
+    fp = attacker_state.get("target_fingerprint", "") or ""
+    matched = attacker_state.get("matched_playbook")
+    memory_runs_previas = 0
+    if isinstance(matched, dict):
+        memory_runs_previas = int(matched.get("run_count", 0) or 0)
+    memory_hit = bool(matched)
+
+    obs_latencies_ms = [
+        int(c["llm_latency_ms"])
+        for c in observer_results
+        if isinstance(c, dict) and c.get("llm_latency_ms") is not None
+    ]
+    avg_obs_latency_s = (
+        sum(obs_latencies_ms) / len(obs_latencies_ms) / 1000.0
+        if obs_latencies_ms else 0.0
+    )
+    poll_interval = settings.observer_poll_interval
+    backlog_ratio = (
+        avg_obs_latency_s / poll_interval - 1.0
+        if obs_latencies_ms and poll_interval > 0
+        else 0.0
+    )
+
+    a_stats = USAGE_STATS.get("attacker", {})
+    o_stats = USAGE_STATS.get("observer", {})
+
     session.set_metadata(
         finished_at=datetime.now(timezone.utc).isoformat(),
         elapsed_seconds=attacker_state.get("attacker_elapsed_seconds", 0),
@@ -1222,6 +1342,26 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
             if attacker_state.get("tactic_objective_met", {}).get(t) is True
         ),
         observer_classifications=len(observer_results),
+        # Memoria del atacante
+        memory_hit=memory_hit,
+        memory_fingerprint=fp,
+        memory_runs_previas=memory_runs_previas,
+        # Tiempo por componente
+        time_attacker_llm_s=float(a_stats.get("elapsed_seconds", 0.0) or 0.0),
+        time_observer_llm_s=float(o_stats.get("elapsed_seconds", 0.0) or 0.0),
+        time_docker_exec_s=float(DOCKER_STATS.get("total_seconds", 0.0) or 0.0),
+        time_loki_http_s=float(LOKI_STATS.get("total_seconds", 0.0) or 0.0),
+        # Throughput observer
+        observer_avg_latency_s=avg_obs_latency_s,
+        observer_poll_interval_s=poll_interval,
+        observer_backlog_ratio=backlog_ratio,
+        # Tactic durations (ya calculadas por el grafo del atacante)
+        tactic_duration_seconds=attacker_state.get("tactic_duration_seconds", {}),
+        # Conteos brutos para tabla
+        tool_calls=len(attacker_state.get("action_history", []) or []),
+        replans=sum(
+            int(v) for v in (attacker_state.get("attempts_per_tactic", {}) or {}).values()
+        ),
     )
     session.system_event("session_end")
 

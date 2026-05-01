@@ -47,12 +47,13 @@ Catálogo de herramientas disponibles:
 
 | Categoría | Tools |
 |-----------|-------|
-| Reconnaissance / Enum | `run_nmap`, `run_nikto`, `run_whatweb`, `run_gobuster`, `run_gobuster_recursive`, `run_dirsearch`, `run_spider`, `run_wpscan`, `run_dns_enum`, `run_enum4linux`, `run_smbclient`, `run_ftp`, `run_searchsploit` |
-| Initial Access | `run_hydra_http_form`, `run_hydra`, `run_john` |
-| Execution / Exploit | `run_http_session` (login + petición autenticada con auto-CSRF), `run_sqlmap`, `run_curl`, `run_command`, `run_web_shell`, `run_ssh_exec`, `run_file_upload` |
-| Payloads / Delivery | `run_msfvenom`, `write_exploit_file`, `start_reverse_listener`, `serve_http` |
-| Privilege Escalation | `run_priv_esc_enum`, `run_linpeas` |
-| Utility | `decode_string` (base64/hex/url/rot13) |
+| Reconocimiento | `run_nmap`, `run_whatweb`, `run_nikto`, `run_gobuster`, `run_gobuster_recursive`, `run_dirsearch`, `run_spider`, `run_wpscan`, `run_dns_enum`, `run_enum4linux`, `run_smbclient`, `run_ftp`, `run_searchsploit` |
+| Explotación | `run_hydra_http_form`, `run_hydra`, `run_john`, `run_http_session`, `run_sqlmap`, `run_curl`, `run_command`, `run_web_shell`, `run_ssh_exec`, `run_file_upload` |
+| Payloads y listeners | `write_exploit_file`, `run_msfvenom`, `start_reverse_listener`, `serve_http` |
+| Escalada de privilegios | `run_priv_esc_enum`, `run_linpeas` |
+| Utilitarios | `decode_string` (base64/hex/url/rot13) |
+
+La fuente única de verdad para el catálogo de herramientas y su categorización es `src.agents.attacker.tools.TOOL_CATEGORIES`; el system prompt y este README se sincronizan desde ahí.
 
 Tácticas implementadas end-to-end con validador: Reconnaissance, Initial Access, Execution, Discovery, Credential Access, Privilege Escalation. Prompts extendidos (sin validador code-based) para Persistence y Lateral Movement.
 

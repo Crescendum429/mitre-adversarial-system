@@ -1264,41 +1264,121 @@ def run_whatweb(url: str, flags: str = "-a 1") -> str:
     return output
 
 
+# Taxonomia oficial de las 30 herramientas. Es la unica fuente de verdad
+# para el catalogo: prompts.py la lee para construir el bloque del system
+# prompt y README/doc deben sincronizarse desde aqui.
+TOOL_CATEGORIES: dict[str, list[tuple[str, str]]] = {
+    "reconocimiento": [
+        ("run_nmap", "Port scan, version detection, service banners"),
+        ("run_whatweb", "Fingerprint de CMS, framework, servers, libraries web"),
+        ("run_nikto", "Scan de vulns web conocidas"),
+        ("run_gobuster", "Enum de directorios web por wordlist"),
+        ("run_gobuster_recursive", "Gobuster en cascada siguiendo subdirectorios"),
+        ("run_dirsearch", "Alternativa a gobuster (mejor filtrado de falsos positivos)"),
+        ("run_spider", "Crawler que sigue enlaces HTML (con cookies)"),
+        ("run_wpscan", "Enum especifica de WordPress (usuarios, plugins, temas)"),
+        ("run_dns_enum", "Registros DNS + intento de AXFR"),
+        ("run_enum4linux", "Enum SMB/NetBIOS (usuarios, shares, policy)"),
+        ("run_smbclient", "Interactua con shares SMB descubiertos"),
+        ("run_ftp", "Sesion FTP (anonymous o con credenciales)"),
+        ("run_searchsploit", "Busqueda en ExploitDB local por software+version"),
+    ],
+    "explotacion": [
+        ("run_hydra_http_form", "Brute force HTTP forms (con failure_indicator correcto)"),
+        ("run_hydra", "Brute force ssh/ftp/smb/etc"),
+        ("run_john", "Cracking de hashes con wordlist"),
+        ("run_http_session", "Login + request autenticado con auto-CSRF (flagship)"),
+        ("run_sqlmap", "SQLi detection + exploitation"),
+        ("run_curl", "Peticiones HTTP flexibles para payload custom"),
+        ("run_command", "Shell arbitrario en el atacante (escape hatch)"),
+        ("run_web_shell", "Invoca webshell desplegada via ?cmd="),
+        ("run_ssh_exec", "Ejecuta comando via SSH post-credenciales"),
+        ("run_file_upload", "Multipart upload de archivo local al target"),
+    ],
+    "payloads": [
+        ("write_exploit_file", "Crea archivo local (shell.php, exploit.py, payload)"),
+        ("run_msfvenom", "Genera reverse shells, webshells, payloads"),
+        ("start_reverse_listener", "nc listener en background para callbacks"),
+        ("serve_http", "http.server en atacante para que target baje files"),
+    ],
+    "escalada_privilegios": [
+        ("run_priv_esc_enum", "Suite curada de checks (SUID, sudo, cron, caps)"),
+        ("run_linpeas", "Enumeracion exhaustiva automatizada (LinPEAS)"),
+    ],
+    "utilitarios": [
+        ("decode_string", "base64/hex/url/rot13 decode para secretos descubiertos"),
+    ],
+}
+
+CATEGORY_HEADERS: dict[str, str] = {
+    "reconocimiento": "RECONOCIMIENTO",
+    "explotacion": "EXPLOTACION",
+    "payloads": "PAYLOADS Y LISTENERS",
+    "escalada_privilegios": "ESCALADA DE PRIVILEGIOS",
+    "utilitarios": "UTILITARIOS",
+}
+
+
+def render_tool_catalog() -> str:
+    """Renderiza el catalogo de herramientas formateado para system prompts.
+
+    Recorre TOOL_CATEGORIES en orden y produce bloques con nombre alineado y
+    descripcion separada por guion largo. Mantener una sola fuente de verdad
+    evita drift entre prompt, README y documento de tesis.
+    """
+    blocks = []
+    for cat_key, tools_list in TOOL_CATEGORIES.items():
+        header = CATEGORY_HEADERS[cat_key]
+        max_name_len = max(len(name) for name, _ in tools_list)
+        lines = [f"{header}:"]
+        for name, desc in tools_list:
+            lines.append(f"  {name:<{max_name_len}} — {desc}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+# Resolucion del nombre simbolico a la tool callable. Permite construir
+# ATTACKER_TOOLS desde TOOL_CATEGORIES sin duplicar la lista.
+_NAME_TO_TOOL = {
+    "run_nmap": run_nmap,
+    "run_nikto": run_nikto,
+    "run_whatweb": run_whatweb,
+    "run_gobuster": run_gobuster,
+    "run_gobuster_recursive": run_gobuster_recursive,
+    "run_dirsearch": run_dirsearch,
+    "run_spider": run_spider,
+    "run_wpscan": run_wpscan,
+    "run_dns_enum": run_dns_enum,
+    "run_enum4linux": run_enum4linux,
+    "run_smbclient": run_smbclient,
+    "run_ftp": run_ftp,
+    "run_searchsploit": run_searchsploit,
+    "run_hydra_http_form": run_hydra_http_form,
+    "run_hydra": run_hydra,
+    "run_john": run_john,
+    "run_http_session": run_http_session,
+    "run_sqlmap": run_sqlmap,
+    "run_curl": run_curl,
+    "run_command": run_command,
+    "run_web_shell": run_web_shell,
+    "run_ssh_exec": run_ssh_exec,
+    "run_file_upload": run_file_upload,
+    "run_msfvenom": run_msfvenom,
+    "write_exploit_file": write_exploit_file,
+    "start_reverse_listener": start_reverse_listener,
+    "serve_http": serve_http,
+    "run_priv_esc_enum": run_priv_esc_enum,
+    "run_linpeas": run_linpeas,
+    "decode_string": decode_string,
+}
+
 ATTACKER_TOOLS = [
-    # Reconnaissance
-    run_nmap,
-    run_nikto,
-    run_whatweb,
-    run_gobuster,
-    run_gobuster_recursive,
-    run_dirsearch,
-    run_spider,
-    run_wpscan,
-    run_dns_enum,
-    run_enum4linux,
-    run_smbclient,
-    run_ftp,
-    run_searchsploit,
-    # Initial Access / Credential Attack
-    run_hydra_http_form,
-    run_hydra,
-    run_john,
-    # Execution / Exploitation
-    run_http_session,
-    run_sqlmap,
-    run_curl,
-    run_command,
-    run_web_shell,
-    run_ssh_exec,
-    run_file_upload,
-    # Payload generation & delivery
-    run_msfvenom,
-    write_exploit_file,
-    start_reverse_listener,
-    serve_http,
-    # Discovery / Privilege Escalation
-    run_priv_esc_enum,
-    run_linpeas,
-    # Utility
-    decode_string,
+    _NAME_TO_TOOL[name]
+    for tools_list in TOOL_CATEGORIES.values()
+    for name, _ in tools_list
 ]
+
+assert len(ATTACKER_TOOLS) == 30, (
+    f"Esperaba 30 tools, encontre {len(ATTACKER_TOOLS)}. "
+    f"Revisa TOOL_CATEGORIES y _NAME_TO_TOOL para que sean consistentes."
+)

@@ -9,6 +9,8 @@ Referencia API: https://grafana.com/docs/loki/latest/reference/loki-http-api/
 """
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -16,6 +18,22 @@ import httpx
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+# Stats globales del cliente Loki: el observer reporta el tiempo total que
+# pasa esperando HTTP a Loki para que la tabla de tiempos por componente
+# (atacante LLM, observer LLM, docker, loki) sea completa.
+LOKI_STATS: dict[str, float | int] = {
+    "query_count": 0,
+    "total_seconds": 0.0,
+    "error_count": 0,
+}
+_LOKI_STATS_LOCK = threading.Lock()
+
+
+def reset_loki_stats() -> None:
+    with _LOKI_STATS_LOCK:
+        LOKI_STATS.update(query_count=0, total_seconds=0.0, error_count=0)
 
 
 class LokiClient:
@@ -77,13 +95,25 @@ class LokiClient:
             "direction": "backward",
         }
 
+        _t0 = time.monotonic()
         try:
             resp = self._http.get(f"{self.base_url}/loki/api/v1/query_range", params=params)
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as e:
             logger.error(f"Error consultando Loki: {e}")
+            with _LOKI_STATS_LOCK:
+                LOKI_STATS["error_count"] = int(LOKI_STATS["error_count"]) + 1
+                LOKI_STATS["total_seconds"] = (
+                    float(LOKI_STATS["total_seconds"]) + (time.monotonic() - _t0)
+                )
             return []
+
+        with _LOKI_STATS_LOCK:
+            LOKI_STATS["query_count"] = int(LOKI_STATS["query_count"]) + 1
+            LOKI_STATS["total_seconds"] = (
+                float(LOKI_STATS["total_seconds"]) + (time.monotonic() - _t0)
+            )
 
         return self._parse_response(data)
 

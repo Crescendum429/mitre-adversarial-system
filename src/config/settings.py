@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     observer_poll_interval: int = 5
     max_actions_per_tactic: int = 10
 
+    # Recursion limit del grafo del atacante (LangGraph). 800 default calibrado
+    # empiricamente: escenarios complejos (mrrobot full chain) requieren 200-300
+    # transiciones de estado; 800 da margen 2x y permite rescatar runs con
+    # replans. Valores menores (e.g., 100) cortan el ataque antes de completar.
+    attacker_recursion_limit: int = 800
+
+    # Tiempo de gracia entre detener el observer y declarar fin del experimento.
+    # poll_interval*3+grace_seconds permite que el observer flush la ultima
+    # ventana en curso antes del shutdown.
+    observer_shutdown_grace_seconds: int = 15
+
     def validate_credentials(self) -> list[str]:
         """
         Chequea que las API keys requeridas esten presentes. Devuelve la lista

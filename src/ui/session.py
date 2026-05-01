@@ -32,10 +32,12 @@ Tipos de eventos registrados (event_type):
 """
 
 import json
+import logging
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass
@@ -56,12 +58,23 @@ class SessionRecorder:
         self.metadata: dict = {}
         self._lock = threading.Lock()
         self._enabled = True
+        self._listeners: list[Callable[[SessionEvent], None]] = []
 
     def reset(self) -> None:
         """Limpia eventos. Llamar al inicio de cada corrida nueva."""
         with self._lock:
             self.events = []
             self.metadata = {}
+
+    def subscribe(self, callback: Callable[[SessionEvent], None]) -> None:
+        """Registra un callback que recibe cada evento al ser grabado.
+
+        El dispatch ocurre fuera del lock para evitar reentradas si el listener
+        a su vez llama a record(). Cualquier excepcion del listener se loguea
+        pero no interrumpe el grabado.
+        """
+        with self._lock:
+            self._listeners.append(callback)
 
     def set_metadata(self, **kwargs) -> None:
         with self._lock:
@@ -86,6 +99,12 @@ class SessionRecorder:
         )
         with self._lock:
             self.events.append(ev)
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb(ev)
+            except Exception as e:
+                logging.getLogger(__name__).debug(f"listener {cb} fallo: {e}")
 
     def attacker_event(self, event_type: str, tactic: str = "", **payload) -> None:
         self.record(event_type, agent="attacker", tactic=tactic, **payload)
