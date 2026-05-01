@@ -46,11 +46,15 @@ class LogCollector:
         Excluye logs de infraestructura (Loki, Grafana, Promtail)
         y del container atacante (el observador no debe ver sus acciones directas).
         """
-        # Query que captura logs de todos los containers target
+        # Query que captura logs de todos los containers target.
+        # Cap a 1500 entradas: con ventanas de 5s y trafico tipico de scanner
+        # (~150 req/s), 5000 entradas era redundante y diluia eventos breves
+        # (login_success, webshell_execution) bajo el volumen de gobuster/nikto.
         logs = self.loki.query_range(
             query='{job="docker"}',
             start=start,
             end=end,
+            limit=1500,
         )
 
         # Filtrar: solo logs de containers target. Excluir infraestructura

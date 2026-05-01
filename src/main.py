@@ -43,6 +43,8 @@ from src.agents.attacker.graph import build_attacker_graph, create_initial_state
 from src.agents.observer.graph import build_observer_graph, create_observer_state
 from src.config.settings import settings
 from src.infrastructure.docker_client import DockerClient
+from src.ui.report import generate_report
+from src.ui.session import get_session
 
 console = Console()
 
@@ -289,6 +291,11 @@ def run_observer_loop(
     graph = build_observer_graph()
     history: list = []
     suspect_list: dict = {}
+    # Memoria del observer: el fingerprint y prior se computan en la primera
+    # ventana con logs, luego se persisten para que las siguientes ventanas
+    # los reutilicen sin recomputar (NIST SP 800-94 baselining).
+    traffic_fingerprint: str = ""
+    baseline_prior: dict | None = None
     lock = state_lock or threading.RLock()
 
     start_time = simulation_start or datetime.now(timezone.utc)
@@ -297,10 +304,12 @@ def run_observer_loop(
     console.print("[bold blue]AGENTE OBSERVADOR INICIADO[/bold blue]")
 
     def process_window(ws: datetime, we: datetime) -> None:
-        nonlocal history, suspect_list
+        nonlocal history, suspect_list, traffic_fingerprint, baseline_prior
         with lock:
             current_history = list(history)
             current_suspect = dict(suspect_list)
+            current_fp = traffic_fingerprint
+            current_prior = baseline_prior
 
         state = create_observer_state(
             history=current_history,
@@ -309,12 +318,27 @@ def run_observer_loop(
             window_start=ws,
             window_end=we,
             use_heuristics=use_heuristics,
+            traffic_fingerprint=current_fp,
+            baseline_prior=current_prior,
         )
         result = graph.invoke(state)
         classification = result.get("current_classification")
         triage_result = result.get("triage_result", "no_signal")
 
+        # Captura fingerprint/prior si fueron computados en esta ventana
+        new_fp = result.get("traffic_fingerprint", "")
+        new_prior = result.get("baseline_prior")
+        with lock:
+            if new_fp and not traffic_fingerprint:
+                traffic_fingerprint = new_fp
+                baseline_prior = new_prior
+
         if classification:
+            # Anota el fingerprint en la clasificacion para que update_baseline
+            # lo recupere al final del run.
+            classification["traffic_fingerprint"] = (
+                new_fp or current_fp or traffic_fingerprint
+            )
             tiw = classification.get("tactics_in_window", [])
             if len(tiw) > 1:
                 names = ", ".join(t.get("tactic", "?") for t in tiw)
@@ -930,8 +954,12 @@ def main():
         help="IP del target (default: config)"
     )
     parser.add_argument(
-        "--observer-interval", type=int, default=30,
-        help="Intervalo de polling del observador en segundos"
+        "--observer-interval", type=int, default=10,
+        help="Ventana de polling del observador en segundos. Default 10s "
+             "(calibrado para capturar tacticas rapidas tipo RCE; ref: Bhuyan "
+             "et al. 2014 'On the Effectiveness of Sliding Windows for Network "
+             "Anomaly Detection'). Ventanas mas largas (20-30s) reducen costo "
+             "de LLM pero pierden recall en tacticas que duran <5s."
     )
     parser.add_argument(
         "--attacker-only", action="store_true",
@@ -950,6 +978,14 @@ def main():
         "--no-heuristics", action="store_true",
         help="Ablation: el observador saltea T1-T10 y clasifica solo con LLM sobre log_summary"
     )
+    parser.add_argument(
+        "--report-dir", default="data/reports",
+        help="Directorio de salida de reportes HTML/JSON post-run (default: data/reports)"
+    )
+    parser.add_argument(
+        "--no-report", action="store_true",
+        help="Salta la generacion del reporte HTML al final"
+    )
     args = parser.parse_args()
 
     if args.tool_output:
@@ -958,6 +994,30 @@ def main():
 
     setup_logging(args.verbose)
     verify_infrastructure(scenario=args.scenario)
+
+    # Inicia el session recorder para capturar todos los eventos del run.
+    session = get_session()
+    session.reset()
+    session.set_metadata(
+        scenario=args.scenario,
+        attacker_provider=settings.llm_provider.value,
+        attacker_model=(
+            settings.openai_model if settings.llm_provider.value == "openai"
+            else settings.anthropic_model if settings.llm_provider.value == "anthropic"
+            else settings.google_model if settings.llm_provider.value == "google"
+            else settings.groq_model if settings.llm_provider.value == "groq"
+            else settings.openrouter_model if settings.llm_provider.value == "openrouter"
+            else settings.cerebras_model
+        ),
+        observer_provider=(settings.observer_provider.value if settings.observer_provider
+                            else settings.llm_provider.value),
+        observer_model=settings.observer_model,
+        seed=settings.llm_seed,
+        attacker_temperature=settings.attacker_temperature,
+        observer_temperature=settings.observer_temperature,
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    session.system_event("session_start", scenario=args.scenario)
 
     # Definir tacticas y target por escenario
     scenarios = {
@@ -1050,6 +1110,7 @@ def main():
         # Solo atacante, sin observador
         attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
         print_attack_summary(attacker_state)
+        _emit_report(args, scenario_config, attacker_state, [])
         return
 
     # Ejecucion completa: atacante + observador en paralelo
@@ -1109,6 +1170,79 @@ def main():
 
     # Reporte de tiempos de ejecucion
     print_timing_summary(attacker_state, observer_results_snapshot, _session_elapsed)
+
+    # Actualiza baseline del observer (NIST SP 800-94 baselining): persiste el
+    # prior estadistico de tacticas observadas para que la proxima corrida sobre
+    # el mismo tipo de target tenga prior calibrado.
+    _update_observer_memory(observer_results_snapshot, attacker_state)
+
+    _emit_report(args, scenario_config, attacker_state, observer_results_snapshot)
+
+
+def _update_observer_memory(observer_results: list, attacker_state: dict) -> None:
+    """Persiste la baseline del observer si hubo clasificaciones."""
+    if not observer_results:
+        return
+    try:
+        from src.agents.observer.memory import update_baseline
+        # Recovery del fingerprint usado: lo guardamos en el primer resultado
+        # del observer si hubo. Si no, usamos heuristica basada en target.
+        target = attacker_state.get("target", "")
+        # Construimos el fingerprint a posteriori del traffic_fingerprint que
+        # quedo en alguna clasificacion (es el mismo a traves de ventanas).
+        # Si no esta, usamos el target IP como fp degraded.
+        fp = next(
+            (c.get("traffic_fingerprint", "") for c in observer_results
+             if isinstance(c, dict) and c.get("traffic_fingerprint")),
+            "",
+        )
+        if not fp:
+            # Fallback: hash del target (menos preciso pero funcional)
+            import hashlib as _h
+            fp = _h.sha256(f"target:{target}".encode()).hexdigest()[:16]
+        target_summary = f"target_ip={target}"
+        update_baseline(fp, observer_results, target_summary=target_summary)
+        console.print(f"[dim]💾 Observer baseline actualizada (fp={fp})[/dim]")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"No se pudo actualizar baseline observer: {e}")
+
+
+def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_results: list) -> None:
+    """Genera reporte HTML + JSON post-run con todos los eventos capturados."""
+    if args.no_report:
+        return
+    session = get_session()
+    session.set_metadata(
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        elapsed_seconds=attacker_state.get("attacker_elapsed_seconds", 0),
+        target=args.target or scenario_config.get("target", ""),
+        tactics_planned=scenario_config.get("tactics", []),
+        tactics_completed=sum(
+            1 for t in scenario_config.get("tactics", [])
+            if attacker_state.get("tactic_objective_met", {}).get(t) is True
+        ),
+        observer_classifications=len(observer_results),
+    )
+    session.system_event("session_end")
+
+    from pathlib import Path
+    out_dir = Path(args.report_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"{args.scenario}_{ts_tag}"
+
+    # JSON crudo (analizable por scripts)
+    json_path = out_dir / f"{base}.json"
+    session.save_json(json_path)
+
+    # HTML autosuficiente para revision visual / tesis
+    html_path = out_dir / f"{base}.html"
+    generate_report(session.to_dict(), html_path)
+
+    console.print(
+        f"\n[bold cyan]📄 Reporte HTML generado:[/bold cyan] {html_path}\n"
+        f"[dim]   JSON crudo: {json_path}[/dim]"
+    )
 
 
 if __name__ == "__main__":

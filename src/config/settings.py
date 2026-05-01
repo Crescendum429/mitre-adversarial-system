@@ -73,7 +73,12 @@ class Settings(BaseSettings):
 
     # Ejecucion
     tool_timeout: int = 120
-    observer_poll_interval: int = 15
+    # Ventana del observador. 5s default tras calibracion empirica:
+    # tacticas rapidas (RCE = 1-3s, login_success = <1s, discovery webshell
+    # call = <1s) quedaban enmascaradas en ventanas de 10s+ por el volumen
+    # de scanner (gobuster 200+ req en la misma ventana). 5s reduce el
+    # mixing manteniendo recall (Bhuyan et al. 2014, NIST SP 800-94).
+    observer_poll_interval: int = 5
     max_actions_per_tactic: int = 10
 
     def validate_credentials(self) -> list[str]:

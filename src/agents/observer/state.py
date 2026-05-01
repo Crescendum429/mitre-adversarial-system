@@ -77,3 +77,9 @@ class ObserverState(TypedDict, total=False):
     # webshell. Permite medir el aporte de las heuristicas T1-T10 vs clasificacion
     # LLM pura sobre log_summary crudo.
     use_heuristics: bool
+
+    # Memoria del observer (NIST SP 800-94 baselining): fingerprint del patron
+    # de trafico HTTP. Permite consultar prior estadistico de tacticas
+    # observadas previamente sobre targets con perfil similar.
+    traffic_fingerprint: str
+    baseline_prior: dict | None

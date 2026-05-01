@@ -22,6 +22,7 @@ from src.agents.attacker.tools import ATTACKER_TOOLS
 from src.config.mitre_mapping import get_tactic_by_name
 from src.config.settings import settings
 from src.llm.provider import get_chat_model
+from src.ui.session import get_session
 
 logger = logging.getLogger(__name__)
 _console = Console()
@@ -66,6 +67,7 @@ def plan_tactic(state: AttackerState) -> dict:
     tactic_started_at = dict(state.get("tactic_started_at", {}))
     if tactic_name not in tactic_started_at:
         tactic_started_at[tactic_name] = time.monotonic()
+        get_session().attacker_event("tactic_start", tactic=tactic_name)
     target_ip = state.get("target", settings.target_ip)
     collected_data = state.get("collected_data", {})
     objective_feedback = state.get("objective_feedback", "")
@@ -148,6 +150,12 @@ def execute_tools(state: AttackerState) -> dict:
         tool_args = tool_call["args"]
 
         logger.info(f"[Atacante] Ejecutando: {tool_name}({tool_args})")
+        get_session().attacker_event(
+            "tool_call",
+            tactic=tactic_name,
+            tool=tool_name,
+            args=tool_args,
+        )
 
         if tool_name in tool_map:
             try:
@@ -157,6 +165,15 @@ def execute_tools(state: AttackerState) -> dict:
                 logger.error(result)
         else:
             result = f"Herramienta '{tool_name}' no encontrada"
+
+        result_str = str(result)
+        get_session().attacker_event(
+            "tool_result",
+            tactic=tactic_name,
+            tool=tool_name,
+            size=len(result_str),
+            preview=result_str[:300],
+        )
 
         tool_messages.append(ToolMessage(
             content=str(result),
@@ -168,7 +185,7 @@ def execute_tools(state: AttackerState) -> dict:
             "tactic_id": tactic_info.id if tactic_info else "",
             "technique": tool_name,
             "command": json.dumps(tool_args),
-            "output_preview": str(result)[:10000],
+            "output_preview": result_str[:10000],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -250,6 +267,14 @@ def check_objective(state: AttackerState) -> dict:
             f"[bold green]✓ OBJETIVO CUMPLIDO — {tactic_name}[/bold green]: {reason}"
         )
         logger.info(f"[Atacante] Objetivo cumplido: {tactic_name} — {reason}")
+        get_session().attacker_event(
+            "objective_check",
+            tactic=tactic_name,
+            success=True,
+            reason=reason,
+            evidence=dict(evidence),
+        )
+        get_session().attacker_event("tactic_end", tactic=tactic_name, success=True)
 
         memory_update = _handle_memory_on_success(state, tactic_name, evidence)
 
@@ -276,6 +301,14 @@ def check_objective(state: AttackerState) -> dict:
             f"[Atacante] Replan exhausted para {tactic_name} tras "
             f"{current_attempts} intentos: {reason}"
         )
+        get_session().attacker_event(
+            "objective_check",
+            tactic=tactic_name,
+            success=False,
+            reason=reason,
+            attempts=current_attempts,
+        )
+        get_session().attacker_event("tactic_end", tactic=tactic_name, success=False)
         return {
             "collected_data": collected,
             "tactic_evidence": tactic_evidence,
@@ -293,6 +326,12 @@ def check_objective(state: AttackerState) -> dict:
     )
     logger.info(
         f"[Atacante] Replanificando {tactic_name} (intento {current_attempts}): {reason}"
+    )
+    get_session().attacker_event(
+        "replan",
+        tactic=tactic_name,
+        attempt=current_attempts,
+        feedback=reason,
     )
 
     return {
@@ -395,8 +434,18 @@ def _handle_memory_on_success(state: AttackerState, tactic: str, evidence: dict)
                     f"[Memory] Match para {fp}: {runs} runs previas; "
                     f"playbook con {len(existing.get('tactics', {}))} tacticas registradas"
                 )
+                get_session().attacker_event(
+                    "memory_match",
+                    tactic=tactic,
+                    fingerprint=fp,
+                    runs_previas=runs,
+                    summary=summary,
+                )
             else:
                 logger.info(f"[Memory] Target nuevo, fingerprint registrado: {fp}")
+                get_session().attacker_event(
+                    "memory_save", tactic=tactic, fingerprint=fp, new=True
+                )
         return update
 
     fp = state.get("target_fingerprint", "")
@@ -414,6 +463,13 @@ def _handle_memory_on_success(state: AttackerState, tactic: str, evidence: dict)
         tool=last_action.get("technique", ""),
         args=args,
         evidence=evidence,
+        actions_used=actions_used,
+    )
+    get_session().attacker_event(
+        "memory_save",
+        tactic=tactic,
+        fingerprint=fp,
+        tool=last_action.get("technique", ""),
         actions_used=actions_used,
     )
     return {}

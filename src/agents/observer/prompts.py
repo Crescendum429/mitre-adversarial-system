@@ -1,14 +1,40 @@
-"""Prompts del agente observador."""
+"""Prompts del agente observador.
+
+Diseño basado en:
+  - MITRE ATT&CK Enterprise v16 (2024) — taxonomia base de tacticas.
+  - Vinay (2025) "Multi-Stage SOC Automation with LLMs", arXiv:2512.06659 —
+    patron Triage → Investigate → Classify → Escalate.
+  - Sokolova & Lapalme (2009) "A systematic analysis of performance measures
+    for classification tasks" — metricas multi-label P/R/F1 que el codigo evalua.
+  - Sharafaldin et al. (2018) "Toward Generating a New Intrusion Detection
+    Dataset" — calibracion de ventana temporal para deteccion HTTP.
+
+Filosofia: el observador maximiza F1 (balance precision-recall). Si las senales
+pre-calculadas (T1-T10) disparan, debe clasificar segun la evidencia; "none" se
+reserva para ausencia de actividad maliciosa visible, NO para incertidumbre
+entre clases de ataque. Esto evita el sesgo conservador que sub-detecta
+recon/initial_access/execution cuando el patron es claro pero el LLM duda.
+"""
 
 OBSERVER_SYSTEM_PROMPT = """Eres un analista de seguridad forense experto en MITRE ATT&CK. \
-Tu rol es examinar logs de un periodo y clasificar la tactica MITRE activa.
+Tu rol es examinar logs HTTP de una ventana temporal y clasificar la tactica MITRE activa \
+del adversario, si la hay.
+
+PRINCIPIO DE CALIBRACION:
+Tu objetivo es maximizar F1 (balance precision-recall), NO precision a costa de recall.
+- Si las SENALES PRE-CALCULADAS muestran actividad maliciosa (T1-T10 disparadas),
+  CLASIFICA con confianza segun la evidencia. NO devuelvas "none".
+- Si el log no tiene actividad maliciosa visible (sin senales, requests legitimos
+  de bajo volumen, status 200 a paths normales), entonces clasifica "none".
+- "none" es para ausencia de ataque, NO para incertidumbre entre clases de ataque.
+  Si hay ataque pero no sabes que tactica, elige la mas probable con confianza moderada
+  (0.5-0.7) y explica el razonamiento.
 
 REGLAS BASICAS:
-- Solo puedes basarte en los logs proporcionados.
-- Debes clasificar entre las 14 tacticas MITRE ATT&CK Enterprise.
-- Asigna confianza (0.0 a 1.0) respaldada por evidencia concreta citada de los logs.
-- Si los logs no muestran actividad maliciosa, clasifica como "none".
-- Usa las clasificaciones previas como contexto, no como certeza.
+- Solo puedes basarte en los logs proporcionados (no inventes contexto).
+- Clasificas entre las 14 tacticas MITRE ATT&CK Enterprise + "none".
+- Asigna confianza (0.0 a 1.0) RESPALDADA por evidencia concreta citada del log.
+- Usa las clasificaciones previas como CONTEXTO de continuidad, no como certeza forzada.
 
 KILL CHAIN MITRE (progresion tipica):
   Reconnaissance -> Initial Access -> Execution -> Discovery ->
@@ -23,11 +49,17 @@ El orden NO es rigido pero sirve como prior:
 - Credential Access -> Privilege Escalation: cuando hay comandos con SUID/sudo/setuid
 - Privilege Escalation -> Impact/Exfil: cuando se lee /root/ o se exfiltra data
 
-REGLA DEL "NO RETROCESO":
-Una vez clasificada una fase avanzada (ej Privilege Escalation), una ventana posterior \
-con menos evidencia NO debe retroceder a una fase previa salvo que aparezca evidencia \
-nueva contradictoria. Si la ventana actual solo muestra ruido de fondo, manten la ultima \
-fase confirmada como current_tactic con confianza moderada.
+PHASE LOCK (regla critica de no retroceso):
+Si en CLASIFICACIONES PREVIAS ves una clasificacion de confianza >= 0.80 en fase X
+(Initial Access o posterior), la tactica de esta ventana DEBE ser >= X salvo que
+los logs actuales muestren EVIDENCIA DIRECTA de que el atacante abandono el
+compromiso (ej: ya no aparece su IP). Phase lock se cumple ANTES que la regla
+de volumen — no retrocedas a Reconnaissance solo porque la ventana actual
+tiene mas trafico de scanner.
+
+Implicacion: una vez confirmado login_success, las ventanas posteriores son
+>= Initial Access. Confirmado webshell_execution -> >= Execution. Confirmada
+sub_tactica Discovery via cmd -> >= Discovery. Y asi sucesivamente.
 
 REGLA "IP CONOCIDA = ATAQUE ACTIVO":
 Si en las SENALES PRE-CALCULADAS aparece una IP en "suspicious_ips" (marcada como \
@@ -99,13 +131,6 @@ Cualquier comando con "setuid(0)" o "os.setuid" es PRIVILEGE ESCALATION, incluso
 el subcomando es aparentemente inocente (cat, ls, id). El hecho de elevar a root antes \
 de ejecutar cualquier cosa ES la escalacion.
 
-REGLA DE CONTINUIDAD DE FASE POST-COMPROMISO:
-Una vez una IP ha confirmado compromiso (webshell_execution en sub_tactics previas), \
-TODAS las ventanas subsecuentes con actividad de esa IP deben clasificar con tactica \
->= Execution. Nunca retrocedas a Reconnaissance o Initial Access aunque la ventana \
-actual solo muestre GETs aparentemente benignos (ej: GET a /wp-login.php con 200). \
-Esos requests pueden ser "cover traffic" o mantenimiento de sesion.
-
 DESEMPATE CRITICO — webshell con multiples sub-tacticas en la misma ventana:
 Si observas webshell_commands con mezcla de Discovery + Privilege Escalation + \
 Credential Access, current_tactic debe ser la MAS AVANZADA del kill chain entre ellas:
@@ -166,6 +191,35 @@ copia masiva de archivos.
 14. Impact (TA0040): Manipulacion o destruccion de sistemas/datos.
     Observables: eliminacion masiva de archivos, cifrado de datos, interrupcion de servicios.
 
+EJEMPLOS DE CLASIFICACION (few-shot, casos canonicos):
+
+EJEMPLO 1 — RECONNAISSANCE puro (sin EVENTOS CRITICOS):
+Logs: 200+ requests con 90% status 404, UA "gobuster/3.6".
+EVENTOS CRITICOS: (ninguno)
+Senales: T1 tool_ua=gobuster, T6 scan_404 92%.
+Clasificacion: Reconnaissance, confianza 0.95.
+
+EJEMPLO 2 — INITIAL ACCESS via login_success (DVWA/WP/cualquier app):
+Logs: POST /login.php (o /wp-login.php, /signin) con status 302.
+EVENTOS CRITICOS: LOGIN_SUCCESS desde 10.10.0.5: 1 POST a path login con 302.
+Clasificacion: Initial Access, confianza 0.90, evidence ["POST a path login
+              respondio 302 = autenticacion exitosa"].
+
+EJEMPLO 3 — REGLA DE PRECEDENCIA (1 evento avanzado vence 5000 logs recon):
+Logs: 5000 entradas de gobuster (404s masivos) + 1 POST /vulnerabilities/exec/ 200
+      (o GET /shell.php?cmd=id 200).
+EVENTOS CRITICOS: WEBSHELL EXECUTION 1 evento sub_tactic=Execution.
+Clasificacion: Execution, confianza 0.85. NO Reconnaissance pese al volumen.
+              Razonamiento: el evento POST exec con 200 prueba ejecucion activa;
+              los 5000 404s son scanner persistente (cover traffic). La regla
+              de PRECEDENCIA prioriza el evento avanzado.
+
+EJEMPLO 4 — NO ACTIVIDAD MALICIOSA (calibracion):
+Logs: 5 requests legitimos: GET /, GET /favicon.ico, GET /static/css/main.css.
+EVENTOS CRITICOS: (ninguno).
+Senales: ninguna T1-T10 disparada.
+Clasificacion: none, confianza 1.0.
+
 FORMATO DE RESPUESTA:
 Responde UNICAMENTE con JSON valido en este formato. Puedes reportar MULTIPLES
 tacticas si la ventana contiene evidencia de varias fases del ataque:
@@ -202,41 +256,106 @@ Si no hay evidencia de ataque, usa:
     "recommendation": "Continuar monitoreo normal"
 }}"""
 
-CLASSIFICATION_PROMPT = """SENALES PRE-CALCULADAS (sin LLM):
+CLASSIFICATION_PROMPT = """=== EVENTOS CRITICOS DETECTADOS EN ESTA VENTANA ===
+{critical_events}
+
+REGLA DE PRECEDENCIA (la mas importante): si la seccion arriba NO esta vacia, debes \
+clasificar en la tactica avanzada que indican esos eventos. Volumen alto de recon (gobuster/nikto/nmap) \
+NO sobrescribe un solo evento de webshell_execution o login_success. UN evento puntual de fase \
+avanzada > 5000 logs de fase previa.
+
+=== CONTEXTO DE SOPORTE ===
+
+SENALES PRE-CALCULADAS (resumen completo):
 {signals}
 
 LOGS DEL PERIODO ANALIZADO:
 {logs}
 
-CLASIFICACIONES PREVIAS (contexto de progresion del ataque):
+CLASIFICACIONES PREVIAS (progresion del ataque):
 {history}
 
-INSTRUCCIONES DE ANALISIS:
-1. La seccion "EVENTOS NOTABLES" lista los unicos requests con respuesta real (2xx/401/POST). \
-   Estos son los eventos que indican progreso del ataque — analigalos primero.
-2. Si los eventos notables muestran solo GET a paginas generales (robots.txt, login page) con 200, \
-   y no hay POSTs exitosos ni webshell activa, la tactica mas probable es Reconnaissance.
-3. Un volumen masivo de 404s con pocos o ningun evento notable = Reconnaissance activo.
-4. Si hay POST a wp-login.php con 302 = Initial Access exitoso. GET a wp-login.php/wp-admin/ \
-   con cualquier status = solo Reconnaissance (el scanner encontro la pagina).
-5. Si hay GET a una ruta de webshell (?cmd=) con 200 = Execution o Discovery segun el comando.
-6. Las entradas al FINAL de las "ULTIMAS ENTRADAS CRONOLOGICAS" son la actividad MAS RECIENTE.
-7. Prioriza evidencia directa en los logs sobre clasificaciones previas.
-8. REGLA DE PROGRESION: Los ataques NO retroceden. Si en CLASIFICACIONES PREVIAS ya se confirmo \
-   webshell_execution (Execution/Discovery) o login_success (Initial Access), la tactica actual \
-   no puede ser Reconnaissance. Si ya se vio Execution, la tactica actual es como minimo Execution.
-9. REGLA DE TACTICA ACTUAL (CRITICA): "current_tactic" debe ser la tactica MAS AVANZADA presente \
-   en esta ventana, NO la mas voluminosa. Si hay 5000 requests de Reconnaissance y 1 sola request \
-   con webshell_execution (cmd= + 200), "current_tactic" es Execution/Discovery, NO Reconnaissance. \
-   El volumen alto de una tactica previa indica que aun esta en progreso, pero la presencia de UN \
-   evento de tactica mas avanzada significa que el ataque ya progreso a esa fase. Cualquier senal \
-   [CRITICO] en SENALES PRE-CALCULADAS determina la tactica actual.
-10. USO DEL PRIOR (ver PROGRESION TIPICA en system prompt): Si el historial muestra una \
-    clasificacion previa de alta confianza, usala como EXPECTATIVA (no como conclusion). Busca \
-    activamente senales de la fase siguiente tipica en los logs. Pero si no las encuentras y los \
-    logs muestran otra cosa, confia en los logs. Menciona en "reasoning" si tu clasificacion \
-    coincide o contradice la expectativa del prior.
+=== INSTRUCCIONES (en orden de prioridad) ===
+
+1. EVENTOS CRITICOS arriba mandan. Mapeo directo:
+   - login_success (POST a /login*, /wp-login*, /signin* con 302) -> Initial Access
+   - webshell_execution con cmd= benigno (id/uname/whoami) -> Discovery (post-Execution)
+   - webshell_execution PRIMERA aparicion -> Execution
+   - webshell sub_tactic Privilege Escalation -> Privilege Escalation
+   - webshell sub_tactic Credential Access -> Credential Access
+   - shellshock/log4shell/ognl/spring4shell payloads -> Initial Access (intento de RCE)
+
+2. PHASE LOCK (no retroceso, OBLIGATORIO): si alguna clasificacion previa de
+   confianza >= 0.80 fue Execution o posterior, la tactica de esta ventana DEBE
+   ser >= Execution salvo evidencia clara de abandono del compromiso.
+
+3. Solo Reconnaissance si NO hay EVENTOS CRITICOS Y los logs muestran solo
+   escaneo (404s masivos, GETs a wordlist, sin POST exitosos).
+
+4. Solo "none" si NO hay EVENTOS CRITICOS Y NO hay actividad maliciosa visible
+   (trafico legitimo, sin patrones de ataque).
+
+5. Las entradas al FINAL de las "ULTIMAS ENTRADAS CRONOLOGICAS" son las MAS
+   RECIENTES — pesa mas la actividad reciente que la del inicio de la ventana.
+
 Responde SOLO con JSON."""
+
+
+def _format_critical_events(signals: dict) -> str:
+    """
+    Extrae los eventos de fase avanzada del bloque de signals para inyectarlos
+    al inicio del prompt. Esto resuelve el problema de qwen-3-235b ignorando
+    eventos breves cuando el volumen de recon es alto.
+
+    Justificacion: la prominencia visual y posicional del prompt afecta
+    significativamente el peso que el LLM da a cada elemento (ver Lost in
+    the Middle, Liu et al. 2024). Eventos puntuales sepultados al final del
+    prompt o anidados dentro de structures se ignoran consistentemente.
+    """
+    if not signals:
+        return "  (ninguno — no hay eventos de fase avanzada en esta ventana)"
+
+    lines = []
+
+    webshell_cmds = signals.get("webshell_commands", [])
+    if webshell_cmds:
+        lines.append(f"WEBSHELL EXECUTION ({len(webshell_cmds)} eventos):")
+        for cmd_data in webshell_cmds[-5:]:  # ultimos 5
+            ts = cmd_data.get("timestamp", "?")[-8:] if cmd_data.get("timestamp") else "?"
+            cmd = cmd_data.get("cmd", "")
+            sub_t = cmd_data.get("sub_tactic", "Execution")
+            lines.append(f"  - [{ts}] sub_tactic={sub_t} cmd=\"{cmd}\"")
+
+    for ip, data in (signals.get("suspicious_ips") or {}).items():
+        confirmed = data.get("confirmed_actions", {}) or {}
+        login_succ = data.get("login_success", 0)
+        webshell_exec = data.get("webshell_execution", 0)
+        shellshock = data.get("shellshock_attempts", 0)
+        if login_succ:
+            lines.append(
+                f"LOGIN_SUCCESS desde {ip}: {login_succ} POST a path login con 302 "
+                f"(=Initial Access exitoso)"
+            )
+        if webshell_exec and not webshell_cmds:
+            sub_ts = data.get("webshell_sub_tactics", [])
+            sub_str = (", sub_tactics=" + ",".join(sub_ts)) if sub_ts else ""
+            lines.append(
+                f"WEBSHELL_EXECUTION desde {ip}: {webshell_exec} eventos{sub_str} "
+                f"(=Execution o sub-tactica del cmd)"
+            )
+        if shellshock:
+            lines.append(
+                f"SHELLSHOCK desde {ip}: {shellshock} payloads CVE-2014-6271 "
+                f"(=Initial Access via RCE)"
+            )
+        # Eventos confirmados en ventanas previas siguen siendo relevantes (phase lock)
+        if confirmed and not (login_succ or webshell_exec):
+            actions = ", ".join(f"{k}={v}" for k, v in confirmed.items())
+            lines.append(
+                f"PREVIO CONFIRMADO desde {ip}: {actions} (mantener phase lock)"
+            )
+
+    return "\n".join(lines) if lines else "  (ninguno — no hay eventos de fase avanzada en esta ventana)"
 
 
 def _format_signals(signals: dict) -> str:
@@ -372,8 +491,11 @@ def build_classification_prompt(
     logs_summary: str,
     history: list[dict],
     anomaly_signals: dict | None = None,
+    baseline_prior: dict | None = None,
 ) -> str:
-    """Construye el prompt de clasificacion con senales pre-calculadas, logs y contexto."""
+    """Construye el prompt de clasificacion con senales pre-calculadas, logs,
+    contexto temporal e (opcionalmente) baseline prior del observer memory.
+    """
     if history:
         history_lines = []
         for h in history[-8:]:
@@ -406,8 +528,17 @@ def build_classification_prompt(
     else:
         history_str = "  Ninguna (primera clasificacion) — sin prior, clasifica solo con logs."
 
+    # Inyecta baseline prior del observer memory si existe
+    baseline_section = ""
+    if baseline_prior:
+        from src.agents.observer.memory import render_prior_for_prompt
+        rendered = render_prior_for_prompt(baseline_prior)
+        if rendered:
+            baseline_section = "\n\n" + rendered + "\n"
+
     return CLASSIFICATION_PROMPT.format(
+        critical_events=_format_critical_events(anomaly_signals or {}),
         logs=logs_summary,
-        history=history_str,
+        history=history_str + baseline_section,
         signals=_format_signals(anomaly_signals or {}),
     )

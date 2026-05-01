@@ -11,9 +11,11 @@ dos caracteristicas clave de LangGraph:
    invocar al LLM. En un servidor con trafico normal esto elimina la mayoria
    de las llamadas al LLM.
 
-2. Loop de refinamiento: si la confianza del LLM es baja, el grafo activa
-   refine_analysis (sin LLM) para generar una vista forense alternativa de
-   los mismos logs, y vuelve a clasificar. Maximo 2 iteraciones.
+2. Loop de refinamiento: si la confianza del LLM es baja segun el umbral
+   adaptativo (ver calibration.py — depende de la tactica y del prior del
+   fingerprint), el grafo activa refine_analysis (sin LLM) para generar una
+   vista forense alternativa de los mismos logs, y vuelve a clasificar.
+   Maximo 2 iteraciones.
 
 Flujo:
   START -> collect_logs -> triage_anomalies
@@ -22,9 +24,9 @@ Flujo:
                                |
                     [signal]   +-> detect_anomalies -> classify_tactic
                                                            |
-                                          [confianza < 0.6] +-> refine_analysis -> classify_tactic
+                                  [confianza < umbral adaptativo] +-> refine_analysis -> classify_tactic
                                                            |
-                                          [confianza >= 0.6] +-> generate_recommendation -> END
+                                  [confianza >= umbral adaptativo] +-> generate_recommendation -> END
 """
 
 import logging
@@ -32,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 from langgraph.graph import END, START, StateGraph
 
+from src.agents.observer.calibration import DEFAULT_THRESHOLD, adaptive_threshold
 from src.agents.observer.nodes import (
     classify_tactic,
     collect_logs,
@@ -44,7 +47,9 @@ from src.agents.observer.state import ObserverState
 
 logger = logging.getLogger(__name__)
 
-CONFIDENCE_THRESHOLD = 0.65
+# Umbral por defecto cuando la calibracion adaptativa no aplica (ver
+# calibration.py para la justificacion academica).
+CONFIDENCE_THRESHOLD = DEFAULT_THRESHOLD
 MAX_REFINEMENTS = 2
 
 
@@ -62,6 +67,14 @@ def should_refine(state: ObserverState) -> str:
     Routing post-classify: si la confianza es baja y no hemos refinado
     demasiado, volver a analizar con una vista alternativa de los logs.
     Esto implementa el paso 'Investigate' del patron SOC.
+
+    El umbral es adaptativo (calibration.adaptive_threshold):
+    - Cost-sensitive por tactica: tacticas caras (Privilege Escalation,
+      Impact, Exfiltration) requieren mayor confianza antes de cerrar.
+    - Bayesiano por prior: si la tactica esta en top-3 del prior del
+      fingerprint, baja el umbral 0.10 (la prior soporta la clasificacion).
+      Si esta fuera del top-5, sube 0.10 (clasificacion sorpresiva, pedir
+      mas evidencia).
     """
     classification = state.get("current_classification")
     refinement_count = state.get("refinement_count", 0)
@@ -70,10 +83,13 @@ def should_refine(state: ObserverState) -> str:
         return "done"
 
     confidence = classification.get("confidence", 0.0)
-    if confidence < CONFIDENCE_THRESHOLD and refinement_count < MAX_REFINEMENTS:
+    tactic = classification.get("tactic", "")
+    threshold = adaptive_threshold(tactic, state.get("baseline_prior"))
+
+    if confidence < threshold and refinement_count < MAX_REFINEMENTS:
         logger.info(
-            f"[Observador] Confianza {confidence:.0%} < {CONFIDENCE_THRESHOLD:.0%}, "
-            f"refinamiento #{refinement_count + 1}"
+            f"[Observador] Confianza {confidence:.0%} < {threshold:.0%} "
+            f"(adaptado para '{tactic}'), refinamiento #{refinement_count + 1}"
         )
         return "refine"
 
@@ -128,6 +144,8 @@ def create_observer_state(
     window_start: datetime | None = None,
     window_end: datetime | None = None,
     use_heuristics: bool = True,
+    traffic_fingerprint: str = "",
+    baseline_prior: dict | None = None,
 ) -> ObserverState:
     """
     Crea el estado inicial para una ejecucion del observador.
@@ -135,6 +153,10 @@ def create_observer_state(
     Si se pasan window_start y window_end, se usan directamente (modo ventanas
     contiguas). Si no, se calcula como [now - window_minutes, now]. En ambos
     casos, si simulation_start es posterior a window_start, se aplica clamp.
+
+    `traffic_fingerprint` y `baseline_prior` se persisten entre ventanas: la
+    primera ventana del run los computa una vez (en collect_logs), las siguientes
+    los reciben pre-computados aqui para reusar el prior sin recomputar.
     """
     if window_start is not None and window_end is not None:
         start = window_start
@@ -161,4 +183,6 @@ def create_observer_state(
         has_new_logs=False,
         error=None,
         use_heuristics=use_heuristics,
+        traffic_fingerprint=traffic_fingerprint,
+        baseline_prior=baseline_prior,
     )

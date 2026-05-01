@@ -30,9 +30,15 @@ from urllib.parse import unquote
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agents.observer.collectors import LogCollector
+from src.agents.observer.memory import (
+    compute_traffic_fingerprint,
+    get_prior,
+    update_baseline,
+)
 from src.agents.observer.prompts import OBSERVER_SYSTEM_PROMPT, build_classification_prompt
 from src.agents.observer.state import Classification, ObserverState
 from src.llm.provider import get_observer_model
+from src.ui.session import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +61,14 @@ _OBS_STATS_LOCK = _threading.Lock()
 def reset_observer_stats() -> None:
     for k in list(OBSERVER_NODE_STATS.keys()):
         OBSERVER_NODE_STATS[k] = 0
+
+
+def reset_observer_singletons() -> None:
+    """Limpia los singletons del observer. Usado entre runs back-to-back con
+    distinto provider/modelo (ej: ablation runs)."""
+    global _collector, _model
+    _collector = None
+    _model = None
 
 
 def _get_collector():
@@ -95,8 +109,30 @@ _TOOL_UA_SIGNATURES = {
 # Nikto envia metodos aleatorios: PROPFIND, TRACK, TRACE, SEARCH, LVIG, XGFU, DEBUG, etc.
 _STANDARD_HTTP_METHODS = frozenset({"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "PATCH"})
 
-# Rutas sensibles para POST (autenticacion)
-_SENSITIVE_POST_PATHS = ("/wp-login", "/login", "/admin", "/xmlrpc", "/wp-admin")
+# Rutas sensibles para POST (autenticacion). Cubre WordPress (wp-login),
+# DVWA y CMSs comunes (login.php, /login), paneles admin, OWA, Confluence
+# Crowd, etc. Validado contra logs reales de mrrobot, dvwa, dc1 y bpent.
+_SENSITIVE_POST_PATHS = (
+    "/wp-login", "/wp-admin", "/login", "/admin", "/auth", "/signin",
+    "/account/login", "/user/login", "/sso", "/xmlrpc",
+)
+
+# Endpoints de RCE/webshell por path. Detectan ejecucion sin depender del
+# parametro `?cmd=` en URL (DVWA pone el payload en POST body, p.ej.
+# `ip=127.0.0.1;id` a /vulnerabilities/exec/).
+# Justificacion: OWASP Web Security Testing Guide v4 — categorias A03 (Injection)
+# y A06 (Vulnerable Components) frecuentemente exponen endpoints predecibles.
+_EXEC_ENDPOINT_PATTERNS = (
+    "/vulnerabilities/exec",  # DVWA
+    "/vulnerabilities/sqli",  # DVWA SQLi
+    "/vulnerabilities/upload",  # DVWA upload (file inclusion / RCE)
+    "/cgi-bin/",
+    "/shell.php",
+    "/webshell",
+    "/cmd.php",
+    "/exec.php",
+    "/upload.php",
+)
 
 # Shellshock signature en user-agent o URL: () { :; }; o () { _; }
 _SHELLSHOCK_RE = re.compile(r"\(\s*\)\s*\{\s*[:;_]")
@@ -433,7 +469,15 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
         if _SPRING4SHELL_RE.search(full_request):
             profile["spring4shell_attempts"] += 1
 
-        if "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower:
+        # Webshell/RCE detection. Dos modos:
+        # (a) `?cmd=` o `?exec=` en URL con 200 -> webshell GET clasica
+        # (b) POST a endpoint de ejecucion conocido con 200 -> RCE via form
+        #     (DVWA exec/, file uploads, etc). En POST el payload no esta en
+        #     URL, asi que no podemos clasificar sub_tactic; se asume Execution.
+        is_cmd_url = "cmd=" in url_lower or "cmd%3" in url_lower or "shell.php" in url_lower
+        is_exec_endpoint = any(p in url_lower for p in _EXEC_ENDPOINT_PATTERNS)
+
+        if is_cmd_url:
             if status == 200:
                 profile["webshell_execution"] += 1
                 cmd = extract_webshell_cmd(url)
@@ -449,8 +493,25 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
                     })
             else:
                 profile["webshell_scan"] += 1
+        elif is_exec_endpoint and method == "POST" and status == 200:
+            profile["webshell_execution"] += 1
+            profile["webshell_sub_tactics"].append("Execution")
+            webshell_commands.append({
+                "timestamp": log.get("timestamp", ""),
+                "ip": ip,
+                "cmd": f"POST {url[:80]} (form payload)",
+                "sub_tactic": "Execution",
+                "sub_tactic_id": "TA0002",
+            })
 
-        if "wp-login" in url_lower and method == "POST":
+        # Login success/failure. Generalizado: cualquier POST a path tipo
+        # login + 302 = success (redireccion post-auth en DVWA, WordPress,
+        # phpMyAdmin, Confluence Crowd, OWA, etc). 200 = formulario reenviado
+        # con error o token invalido.
+        is_login_path = any(p in url_lower for p in (
+            "/wp-login", "/login", "/signin", "/auth/login", "/account/login",
+        ))
+        if is_login_path and method == "POST":
             if status == 302:
                 profile["login_success"] += 1
             else:
@@ -495,6 +556,12 @@ def collect_logs(state: ObserverState) -> dict:
     start = datetime.fromisoformat(start_str) if start_str else None
     end = datetime.fromisoformat(end_str) if end_str else None
 
+    get_session().observer_event(
+        "window_start",
+        window_start=start_str or "",
+        window_end=end_str or "",
+    )
+
     collector = _get_collector()
     raw_logs = collector.collect_window(start=start, end=end)
     summary = collector.summarize_logs(raw_logs)
@@ -504,11 +571,35 @@ def collect_logs(state: ObserverState) -> dict:
         OBSERVER_NODE_STATS["collect_calls"] += 1
     logger.info(f"[Observador] Logs recolectados: {len(raw_logs)}, nuevos: {has_new}")
 
-    return {
+    # Memoria del observer: si la primera ventana tiene logs, computa el
+    # fingerprint del patron de trafico y consulta el prior. Solo se hace una
+    # vez por sesion (cuando traffic_fingerprint aun no esta seteado).
+    update_dict = {
         "raw_logs": raw_logs,
         "log_summary": summary,
         "has_new_logs": has_new,
     }
+    if has_new and not state.get("traffic_fingerprint"):
+        fp = compute_traffic_fingerprint(raw_logs)
+        if fp:
+            prior = get_prior(fp)
+            update_dict["traffic_fingerprint"] = fp
+            update_dict["baseline_prior"] = prior
+            if prior:
+                logger.info(
+                    f"[ObserverMemory] Match fp={fp}: "
+                    f"{prior.get('windows_observed', 0)} ventanas previas, "
+                    f"top tactica={list(prior.get('tactic_distribution', {}).items())[:1]}"
+                )
+                get_session().observer_event(
+                    "memory_match",
+                    fingerprint=fp,
+                    windows_observed=prior.get("windows_observed", 0),
+                )
+            else:
+                logger.info(f"[ObserverMemory] Target nuevo, fp={fp}")
+
+    return update_dict
 
 
 def triage_anomalies(state: ObserverState) -> dict:
@@ -713,11 +804,25 @@ def triage_anomalies(state: ObserverState) -> dict:
             f"({anomaly_count}/{len(raw_logs)} logs anomalos, ratio={ratio:.1%})"
         )
         logger.debug(f"[Observador] Senales activas: {signals_found}")
+        get_session().observer_event(
+            "triage",
+            result="signal",
+            signals_count=len(signals_found),
+            signals=signals_found[:10],
+            anomaly_count=anomaly_count,
+            total_logs=len(raw_logs),
+        )
         return {"triage_result": "signal", "anomaly_count": anomaly_count}
 
     with _OBS_STATS_LOCK:
         OBSERVER_NODE_STATS["triage_no_signal"] += 1
     logger.info(f"[Observador] Triaje: sin senal relevante ({len(raw_logs)} logs)")
+    get_session().observer_event(
+        "triage",
+        result="no_signal",
+        signals_count=0,
+        total_logs=len(raw_logs),
+    )
     return {"triage_result": "no_signal", "anomaly_count": 0}
 
 
@@ -742,6 +847,12 @@ def refine_analysis(state: ObserverState) -> dict:
     prev_classification = state.get("current_classification")
     with _OBS_STATS_LOCK:
         OBSERVER_NODE_STATS["refine_calls"] += 1
+    get_session().observer_event(
+        "refine",
+        count=refinement_count,
+        prev_tactic=prev_classification.get("tactic", "?") if prev_classification else "?",
+        prev_confidence=prev_classification.get("confidence", 0.0) if prev_classification else 0.0,
+    )
 
     if not raw_logs:
         return {"refinement_count": refinement_count}
@@ -983,12 +1094,15 @@ def classify_tactic(state: ObserverState) -> dict:
     summary = state.get("log_summary", "")
     history = state.get("classification_history", [])
     anomaly_signals = state.get("anomaly_signals", {})
+    baseline_prior = state.get("baseline_prior")
 
     if not state.get("has_new_logs", False):
         logger.info("[Observador] Sin logs nuevos, manteniendo clasificacion anterior")
         return {}
 
-    prompt = build_classification_prompt(summary, history, anomaly_signals)
+    prompt = build_classification_prompt(
+        summary, history, anomaly_signals, baseline_prior=baseline_prior,
+    )
 
     messages = [
         SystemMessage(content=OBSERVER_SYSTEM_PROMPT),
@@ -1020,8 +1134,21 @@ def classify_tactic(state: ObserverState) -> dict:
                 f"[Observador] Clasificacion: {classification['tactic']} "
                 f"(confianza: {classification['confidence']:.0%})"
             )
+        get_session().observer_event(
+            "classify",
+            tactic=classification.get("tactic", "?"),
+            confidence=classification.get("confidence", 0.0),
+            tactics_in_window=[t.get("tactic", "") for t in tiw],
+            evidence=classification.get("evidence", [])[:5],
+            reasoning=str(classification.get("reasoning", ""))[:500],
+            refinement_count=state.get("refinement_count", 0),
+            llm_latency_ms=_latency_ms,
+        )
     else:
         logger.warning("[Observador] No se pudo parsear la clasificacion del LLM")
+        get_session().observer_event(
+            "error", message="LLM no produjo JSON parseable",
+        )
 
     return {"current_classification": classification}
 
