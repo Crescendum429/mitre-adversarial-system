@@ -564,6 +564,9 @@ def compare_results(attacker_state: dict, observer_classifications: list):
     tp: dict[str, int] = defaultdict(int)
     fp: dict[str, int] = defaultdict(int)
     fn: dict[str, int] = defaultdict(int)
+    # Acumuladores para bootstrap CI 95% (sets multi-label por ventana evaluable)
+    eval_real_sets: list[set[str]] = []
+    eval_obs_sets: list[set[str]] = []
 
     # Matriz de confusion: real_actual -> observed_actual -> count
     confusion: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -642,6 +645,9 @@ def compare_results(attacker_state: dict, observer_classifications: list):
             for t in obs_set:
                 if t not in real_set:
                     fp[t] += 1
+            # Acumular para bootstrap CI 95%
+            eval_real_sets.append(real_set)
+            eval_obs_sets.append(obs_set)
 
             match_style = "green" if strict_ok else "red"
             match_label = "OK" if strict_ok else "MISS"
@@ -743,6 +749,33 @@ def compare_results(attacker_state: dict, observer_classifications: list):
         )
     console.print(pr_table)
 
+    # Bootstrap CI 95% sobre macro_f1, micro_f1, strict_accuracy.
+    # Critico para n=1 corrida con multi-label sobre 10+ clases: las medias
+    # solas no son comparables sin intervalo de confianza (Efron 1979).
+    bootstrap_ci = None
+    if eval_real_sets:
+        try:
+            from src.evaluation.metrics import bootstrap_f1_ci
+            bootstrap_ci = bootstrap_f1_ci(
+                eval_real_sets, eval_obs_sets, n_resamples=1000, seed=42,
+            )
+            t_ci = Table(title="Bootstrap 95% CI (1000 resamples)", expand=False)
+            t_ci.add_column("Metrica", style="bold")
+            t_ci.add_column("Mean", justify="right")
+            t_ci.add_column("CI low", justify="right")
+            t_ci.add_column("CI high", justify="right")
+            t_ci.add_column("Width", justify="right")
+            for k in ("macro_f1", "micro_f1", "strict_accuracy"):
+                mean, lo, hi = bootstrap_ci[k]
+                t_ci.add_row(k, f"{mean:.3f}", f"{lo:.3f}", f"{hi:.3f}", f"{hi-lo:.3f}")
+            console.print(t_ci)
+        except Exception as e:
+            logging.getLogger(__name__).warning(f"Bootstrap CI fallo: {e}")
+
+    # Persistir bootstrap CI en variable de modulo para que _emit_report lo lea.
+    global _LAST_BOOTSTRAP_CI
+    _LAST_BOOTSTRAP_CI = bootstrap_ci
+
     # Matriz de confusion
     if len(confusion) >= 1:
         cm_labels = sorted(set(list(confusion.keys()) +
@@ -765,6 +798,7 @@ def compare_results(attacker_state: dict, observer_classifications: list):
 
 
 _WARNED_NAIVE_TIMESTAMP = False
+_LAST_BOOTSTRAP_CI: dict | None = None
 
 
 def _parse_ts(ts: str) -> datetime | None:
@@ -1457,6 +1491,8 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
         replans=sum(
             int(v) for v in (attacker_state.get("attempts_per_tactic", {}) or {}).values()
         ),
+        # Bootstrap 95% CI (Fase 1 — defensa estadistica vs n=1)
+        bootstrap_ci=_LAST_BOOTSTRAP_CI,
     )
     session.system_event("session_end")
 

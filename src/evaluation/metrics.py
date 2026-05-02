@@ -16,9 +16,108 @@ en analisis post-hoc sobre resultados guardados (ej: agregar experimentos,
 reproducir tablas del paper).
 """
 
+import random
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+
+
+def bootstrap_f1_ci(
+    real_window_sets: list[set[str]],
+    obs_window_sets: list[set[str]],
+    n_resamples: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 42,
+) -> dict[str, tuple[float, float, float]]:
+    """Bootstrap confidence intervals para F1 macro/micro y accuracy estricta.
+
+    Implementa el bootstrap percentil (Efron 1979): se resamplean N ventanas
+    con reemplazo n_resamples veces, se recalcula la metrica en cada resample,
+    y se reportan los percentiles (1-confidence)/2 y 1-(1-confidence)/2 como
+    bordes del intervalo. Critico para n=1 corrida con multi-label sobre 10+
+    clases — sin CI los reports de medias son estadisticamente vacios.
+
+    Args:
+        real_window_sets: lista de sets, una por ventana, con tacticas reales.
+        obs_window_sets: lista de sets, una por ventana, con tacticas observadas.
+        n_resamples: numero de bootstrap iterations (1000 estandar).
+        confidence: nivel de confianza (0.95 estandar).
+        seed: semilla para reproducibilidad.
+
+    Returns:
+        dict con (mean, ci_low, ci_high) para macro_f1, micro_f1,
+        strict_accuracy. Tres valores por metrica.
+    """
+    if len(real_window_sets) != len(obs_window_sets):
+        raise ValueError("real and obs window lists must have same length")
+    n = len(real_window_sets)
+    if n == 0:
+        return {
+            "macro_f1": (0.0, 0.0, 0.0),
+            "micro_f1": (0.0, 0.0, 0.0),
+            "strict_accuracy": (0.0, 0.0, 0.0),
+        }
+    rng = random.Random(seed)
+    macro_f1s, micro_f1s, accs = [], [], []
+    for _ in range(n_resamples):
+        idxs = [rng.randrange(n) for _ in range(n)]
+        tp_t = defaultdict(int)
+        fp_t = defaultdict(int)
+        fn_t = defaultdict(int)
+        strict_correct = 0
+        for i in idxs:
+            real = real_window_sets[i]
+            obs = obs_window_sets[i]
+            for t in real:
+                if t in obs:
+                    tp_t[t] += 1
+                else:
+                    fn_t[t] += 1
+            for t in obs:
+                if t not in real:
+                    fp_t[t] += 1
+            # strict accuracy: la unica tactica predicha == ultima real
+            if real and obs == real:
+                strict_correct += 1
+        all_t = set(tp_t) | set(fp_t) | set(fn_t)
+        f1s = []
+        total_tp = sum(tp_t.values())
+        total_fp = sum(fp_t.values())
+        total_fn = sum(fn_t.values())
+        for t in all_t:
+            prec = tp_t[t] / (tp_t[t] + fp_t[t]) if (tp_t[t] + fp_t[t]) else 0.0
+            rec = tp_t[t] / (tp_t[t] + fn_t[t]) if (tp_t[t] + fn_t[t]) else 0.0
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+            if (tp_t[t] + fn_t[t]) > 0:
+                f1s.append(f1)
+        macro_f1 = sum(f1s) / len(f1s) if f1s else 0.0
+        mp = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
+        mr = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0.0
+        micro_f1 = 2 * mp * mr / (mp + mr) if (mp + mr) else 0.0
+        macro_f1s.append(macro_f1)
+        micro_f1s.append(micro_f1)
+        accs.append(strict_correct / n)
+
+    def _ci(values: list[float]) -> tuple[float, float, float]:
+        if not values:
+            return 0.0, 0.0, 0.0
+        sorted_v = sorted(values)
+        alpha = 1.0 - confidence
+        lo_idx = int(alpha / 2 * len(sorted_v))
+        hi_idx = int((1 - alpha / 2) * len(sorted_v)) - 1
+        lo_idx = max(0, min(lo_idx, len(sorted_v) - 1))
+        hi_idx = max(0, min(hi_idx, len(sorted_v) - 1))
+        return (
+            sum(sorted_v) / len(sorted_v),
+            sorted_v[lo_idx],
+            sorted_v[hi_idx],
+        )
+
+    return {
+        "macro_f1": _ci(macro_f1s),
+        "micro_f1": _ci(micro_f1s),
+        "strict_accuracy": _ci(accs),
+    }
 
 
 @dataclass

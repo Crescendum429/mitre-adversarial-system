@@ -234,6 +234,66 @@ def test_preflight_enabled_calls_both_models(monkeypatch):
     assert calls == ["attacker", "observer"]
 
 
+# ---------- Fase 1: Bootstrap CI ----------
+
+def test_bootstrap_ci_returns_three_metrics():
+    from src.evaluation.metrics import bootstrap_f1_ci
+    real = [{"recon"}, {"recon"}, {"init_access"}, {"execution"}]
+    obs = [{"recon"}, {"recon"}, {"init_access"}, {"execution"}]
+    out = bootstrap_f1_ci(real, obs, n_resamples=100, seed=42)
+    assert "macro_f1" in out
+    assert "micro_f1" in out
+    assert "strict_accuracy" in out
+    for k, (mean, lo, hi) in out.items():
+        assert 0.0 <= lo <= mean <= hi <= 1.0
+
+
+def test_bootstrap_perfect_match_gives_one():
+    from src.evaluation.metrics import bootstrap_f1_ci
+    real = [{"recon"}, {"recon"}, {"recon"}]
+    obs = [{"recon"}, {"recon"}, {"recon"}]
+    out = bootstrap_f1_ci(real, obs, n_resamples=200, seed=42)
+    mean, lo, hi = out["macro_f1"]
+    assert mean > 0.99
+    assert lo > 0.99
+
+
+def test_bootstrap_total_miss_gives_zero():
+    from src.evaluation.metrics import bootstrap_f1_ci
+    real = [{"recon"}, {"recon"}, {"init_access"}]
+    obs = [{"execution"}, {"execution"}, {"discovery"}]
+    out = bootstrap_f1_ci(real, obs, n_resamples=200, seed=42)
+    mean, lo, hi = out["macro_f1"]
+    assert mean < 0.01
+    assert hi < 0.01
+
+
+def test_bootstrap_partial_match_has_ci_width():
+    """Con datos parciales el CI debe tener ancho > 0."""
+    from src.evaluation.metrics import bootstrap_f1_ci
+    real = [{"recon"}, {"init_access"}, {"execution"}, {"discovery"}, {"recon"}]
+    obs = [{"recon"}, {"recon"}, {"execution"}, {"recon"}, {"init_access"}]
+    out = bootstrap_f1_ci(real, obs, n_resamples=500, seed=42)
+    mean, lo, hi = out["macro_f1"]
+    assert hi - lo > 0.05  # CI debe ser ancho con datos ruidosos
+
+
+def test_bootstrap_empty_input_returns_zeros():
+    from src.evaluation.metrics import bootstrap_f1_ci
+    out = bootstrap_f1_ci([], [], n_resamples=10)
+    for k, (mean, lo, hi) in out.items():
+        assert mean == lo == hi == 0.0
+
+
+def test_bootstrap_seed_reproducibility():
+    from src.evaluation.metrics import bootstrap_f1_ci
+    real = [{"recon"}, {"init_access"}, {"recon"}]
+    obs = [{"recon"}, {"recon"}, {"init_access"}]
+    out1 = bootstrap_f1_ci(real, obs, n_resamples=100, seed=42)
+    out2 = bootstrap_f1_ci(real, obs, n_resamples=100, seed=42)
+    assert out1 == out2
+
+
 def test_preflight_aborts_on_failure(monkeypatch):
     monkeypatch.setattr(settings, "preflight_check_enabled", True)
 
