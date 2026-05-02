@@ -63,6 +63,40 @@ def setup_logging(verbose: bool = False):
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+def preflight_llm_check() -> None:
+    """Smoke test del proveedor LLM antes de empezar la corrida.
+
+    Detecta tres clases de fallos antes de gastar tokens / tiempo de Docker:
+    (1) credenciales invalidas / cuota agotada — la API responde 401/429;
+    (2) modelo que no existe en el proveedor (typo en .env);
+    (3) context length insuficiente para el system prompt completo.
+    Aborta con mensaje claro si cualquiera falla. Ejecuta atacante y observer
+    en serie para que el usuario vea cual de los dos rompe.
+    """
+    if not settings.preflight_check_enabled:
+        return
+    from src.llm.provider import get_chat_model, get_observer_model
+    from langchain_core.messages import HumanMessage
+
+    for label, factory in (
+        ("atacante", get_chat_model),
+        ("observador", get_observer_model),
+    ):
+        try:
+            m = factory()
+            r = m.invoke([HumanMessage(content="Responde unicamente con OK")])
+            if not r or not getattr(r, "content", None):
+                raise RuntimeError("respuesta vacia del modelo")
+        except Exception as e:
+            console.print(
+                f"[red]Pre-flight check fallo para {label}: {type(e).__name__}: "
+                f"{str(e)[:300]}[/red]\n"
+                f"[dim]Verifica .env: provider, modelo, API key y cuota.[/dim]"
+            )
+            sys.exit(2)
+    console.print("[green]Pre-flight check OK (atacante + observador responden).[/green]")
+
+
 def verify_infrastructure(scenario: str = "basic"):
     """Verifica que los containers requeridos por el escenario estan corriendo."""
     missing_creds = settings.validate_credentials()
@@ -879,6 +913,28 @@ def print_timing_summary(
     t_llm.add_row("Tokens input", f"{a.get('input_tokens', 0):,}", f"{o.get('input_tokens', 0):,}")
     t_llm.add_row("Tokens output", f"{a.get('output_tokens', 0):,}", f"{o.get('output_tokens', 0):,}")
     t_llm.add_row("Tokens total", f"{a.get('total_tokens', 0):,}", f"{o.get('total_tokens', 0):,}")
+    t_llm.add_row(
+        "Cache creation tokens",
+        f"{a.get('cache_creation_input_tokens', 0):,}",
+        f"{o.get('cache_creation_input_tokens', 0):,}",
+    )
+    t_llm.add_row(
+        "Cache read tokens",
+        f"{a.get('cache_read_input_tokens', 0):,}",
+        f"{o.get('cache_read_input_tokens', 0):,}",
+    )
+    # Hit rate = cache_read / (cache_read + input_tokens) — refleja porcentaje
+    # del input que se sirvio desde cache; clave para verificar M1.
+    for role_label, stats in [("Atacante", a), ("Observer", o)]:
+        cr = int(stats.get("cache_read_input_tokens", 0) or 0)
+        it = int(stats.get("input_tokens", 0) or 0)
+        denom = cr + it
+        rate = (cr / denom * 100) if denom else 0.0
+        # solo agregar columna unica para no romper la tabla; loggea en consola aparte
+        if role_label == "Atacante":
+            t_llm.add_row("Cache hit rate", f"{rate:.1f}%",
+                          f"{((int(o.get('cache_read_input_tokens', 0) or 0) / max(int(o.get('cache_read_input_tokens', 0) or 0) + int(o.get('input_tokens', 0) or 0), 1)) * 100):.1f}%")
+            break
     t_llm.add_row("Tiempo sumado LLM", _fmt_hms(float(a.get("elapsed_seconds", 0.0) or 0.0)),
                   _fmt_hms(float(o.get("elapsed_seconds", 0.0) or 0.0)))
     if a.get("call_count", 0):
@@ -1054,6 +1110,7 @@ def main():
 
     setup_logging(args.verbose)
     verify_infrastructure(scenario=args.scenario)
+    preflight_llm_check()
 
     # Inicia el session recorder para capturar todos los eventos del run.
     session = get_session()
@@ -1351,6 +1408,11 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
         time_observer_llm_s=float(o_stats.get("elapsed_seconds", 0.0) or 0.0),
         time_docker_exec_s=float(DOCKER_STATS.get("total_seconds", 0.0) or 0.0),
         time_loki_http_s=float(LOKI_STATS.get("total_seconds", 0.0) or 0.0),
+        # Cache hits (verificacion de M1 prompt caching)
+        attacker_cache_creation_tokens=int(a_stats.get("cache_creation_input_tokens", 0) or 0),
+        attacker_cache_read_tokens=int(a_stats.get("cache_read_input_tokens", 0) or 0),
+        observer_cache_creation_tokens=int(o_stats.get("cache_creation_input_tokens", 0) or 0),
+        observer_cache_read_tokens=int(o_stats.get("cache_read_input_tokens", 0) or 0),
         # Throughput observer
         observer_avg_latency_s=avg_obs_latency_s,
         observer_poll_interval_s=poll_interval,

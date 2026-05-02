@@ -27,6 +27,8 @@ USAGE_STATS: dict[str, dict] = {
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "elapsed_seconds": 0.0,
         "model": "",
         "provider": "",
@@ -36,6 +38,8 @@ USAGE_STATS: dict[str, dict] = {
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
         "elapsed_seconds": 0.0,
         "model": "",
         "provider": "",
@@ -49,30 +53,50 @@ def reset_usage_stats() -> None:
     for role in USAGE_STATS:
         USAGE_STATS[role].update(
             call_count=0, input_tokens=0, output_tokens=0,
-            total_tokens=0, elapsed_seconds=0.0, model="", provider="",
+            total_tokens=0,
+            cache_creation_input_tokens=0, cache_read_input_tokens=0,
+            elapsed_seconds=0.0, model="", provider="",
         )
 
 
-def _extract_usage(response) -> tuple[int, int]:
+def _extract_usage(response) -> tuple[int, int, int, int]:
     """
-    Extrae tokens de entrada/salida del response de LangChain.
+    Extrae (input, output, cache_creation, cache_read) tokens del response.
     Distintos providers exponen esto de formas distintas; probamos varios paths.
+
+    Anthropic LangChain expone cache_creation_input_tokens y cache_read_input_tokens
+    en usage_metadata.input_token_details. OpenAI los expone en
+    response_metadata.token_usage.prompt_tokens_details.cached_tokens (solo cached, sin
+    creation).
     """
+    cache_creation = 0
+    cache_read = 0
     usage = getattr(response, "usage_metadata", None) or {}
     if isinstance(usage, dict):
         in_t = int(usage.get("input_tokens") or 0)
         out_t = int(usage.get("output_tokens") or 0)
-        if in_t or out_t:
-            return in_t, out_t
+        details = usage.get("input_token_details") or {}
+        if isinstance(details, dict):
+            cache_creation = int(details.get("cache_creation") or 0)
+            cache_read = int(details.get("cache_read") or 0)
+        if in_t or out_t or cache_creation or cache_read:
+            return in_t, out_t, cache_creation, cache_read
     meta = getattr(response, "response_metadata", {}) or {}
-    # OpenAI-compatible: meta["token_usage"] = {"prompt_tokens", "completion_tokens"}
     tu = meta.get("token_usage") or meta.get("usage") or {}
     if isinstance(tu, dict):
         in_t = int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0)
         out_t = int(tu.get("completion_tokens") or tu.get("output_tokens") or 0)
-        if in_t or out_t:
-            return in_t, out_t
-    return 0, 0
+        # OpenAI: cached tokens en prompt_tokens_details
+        ptd = tu.get("prompt_tokens_details") or {}
+        if isinstance(ptd, dict):
+            cache_read = int(ptd.get("cached_tokens") or 0)
+        # Anthropic raw response (sin LangChain unwrap): meta.usage tiene los keys
+        if not (cache_creation or cache_read):
+            cache_creation = int(tu.get("cache_creation_input_tokens") or 0)
+            cache_read = int(tu.get("cache_read_input_tokens") or 0)
+        if in_t or out_t or cache_creation or cache_read:
+            return in_t, out_t, cache_creation, cache_read
+    return 0, 0, 0, 0
 
 
 class _InstrumentedChatModel:
@@ -93,13 +117,15 @@ class _InstrumentedChatModel:
         t0 = time.monotonic()
         response = self._model.invoke(*args, **kwargs)
         elapsed = time.monotonic() - t0
-        in_t, out_t = _extract_usage(response)
+        in_t, out_t, cache_create, cache_read = _extract_usage(response)
         with _USAGE_LOCK:
             s = USAGE_STATS[self._role]
             s["call_count"] += 1
             s["input_tokens"] += in_t
             s["output_tokens"] += out_t
             s["total_tokens"] += in_t + out_t
+            s["cache_creation_input_tokens"] += cache_create
+            s["cache_read_input_tokens"] += cache_read
             s["elapsed_seconds"] += elapsed
         return response
 
@@ -176,23 +202,43 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
 
     if provider == LLMProvider.OPENAI:
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        # Reasoning effort: solo aplica a o-series (o3, o4-mini, GPT-5).
+        # En GPT-4.1/4o se ignora silenciosamente. La presencia de "o3", "o4",
+        # "gpt-5" en el nombre de modelo determina si pasamos el flag.
+        kwargs: dict = dict(
             model=model_name,
             api_key=settings.openai_api_key,
             temperature=temp,
             max_tokens=settings.llm_max_tokens,
             seed=seed,
         )
+        is_o_series = any(s in model_name.lower() for s in ("o3", "o4-mini", "gpt-5"))
+        if is_o_series and settings.openai_reasoning_effort:
+            kwargs["reasoning_effort"] = settings.openai_reasoning_effort
+            # o-series no acepta temperature explicito; se ignora pero por
+            # cleanliness pasamos solo lo que el modelo entiende.
+            kwargs.pop("temperature", None)
+            kwargs.pop("seed", None)
+        return ChatOpenAI(**kwargs)
 
     if provider == LLMProvider.ANTHROPIC:
         from langchain_anthropic import ChatAnthropic
         # Anthropic no soporta seed a nivel API; reproducibilidad viene de temp.
-        return ChatAnthropic(
+        # Extended thinking: opt-in por settings. Habilita razonamiento explicito
+        # para Sonnet 4.5+, Opus 4.x. El budget_tokens se reserva del max_tokens.
+        kwargs: dict = dict(
             model=model_name,
             api_key=settings.anthropic_api_key,
             temperature=temp,
             max_tokens=settings.llm_max_tokens,
         )
+        if settings.anthropic_thinking_enabled:
+            budget = max(1024, int(settings.anthropic_thinking_budget_tokens))
+            kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 1024)
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Anthropic exige temperature=1 cuando thinking esta activo.
+            kwargs["temperature"] = 1.0
+        return ChatAnthropic(**kwargs)
 
     if provider == LLMProvider.GOOGLE:
         # Gemini soporta seed via generation_config (parametro model_kwargs).
@@ -281,6 +327,36 @@ def get_chat_model() -> BaseChatModel:
     model = _build_model(provider, model_name, role="attacker")
     retried = _with_retry(model)
     return _InstrumentedChatModel(retried, "attacker", provider.value, model_name)
+
+
+def make_cacheable_system_content(text: str, role: str = "attacker") -> "str | list":
+    """Construye el `content` de un SystemMessage con caching condicional al provider.
+
+    Anthropic soporta `cache_control: ephemeral` en bloques de contenido para
+    cachear el system prompt durante 5 min y obtener ~90% descuento en input
+    tokens en llamadas subsiguientes (Anthropic prompt caching, julio 2024).
+    OpenAI cachea automaticamente prompts >=1024 tokens identicos sin necesidad
+    de marker. Google Gemini y otros providers reciben el texto plano.
+
+    Para el atacante el provider activo es settings.llm_provider; para el
+    observer puede ser settings.observer_provider distinto. El parametro `role`
+    selecciona cual considerar.
+    """
+    if not settings.prompt_caching_enabled:
+        return text
+    if role == "observer":
+        provider = settings.observer_provider or settings.llm_provider
+    else:
+        provider = settings.llm_provider
+    if provider == LLMProvider.ANTHROPIC:
+        return [
+            {
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    return text
 
 
 def get_observer_model() -> BaseChatModel:

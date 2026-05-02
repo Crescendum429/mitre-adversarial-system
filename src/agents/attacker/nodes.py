@@ -17,6 +17,7 @@ from src.agents.attacker.memory import (
 )
 from src.agents.attacker.objectives import check_tactic_objective, scan_for_flags
 from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT, build_tactic_prompt
+from src.llm.provider import make_cacheable_system_content
 from src.agents.attacker.state import AttackerState
 from src.agents.attacker.tools import ATTACKER_TOOLS
 from src.config.mitre_mapping import get_tactic_by_name
@@ -29,6 +30,12 @@ _console = Console()
 
 _SOFT_WARN_ACTIONS = 15
 _HARD_WARN_ACTIONS = 30
+# Auto-advance: si el validator code-based dice OK tras >= N acciones, parar.
+# Tres garantiza que el LLM tuvo oportunidad real de explorar; mas alto retrasa
+# innecesariamente; mas bajo puede aceptar evidence prematura. Tres calibrado
+# empiricamente sobre Sonnet 4.5 (cumple recon en accion 2-3) y Haiku 4.5
+# (cumple recon en accion 5-7 tipicamente).
+_MIN_ACTIONS_BEFORE_AUTOADVANCE = 3
 _MAX_REPLAN_ATTEMPTS = 15
 
 _model_with_tools = None
@@ -91,7 +98,10 @@ def plan_tactic(state: AttackerState) -> dict:
     new_messages = list(purge_ops)
     if not has_system:
         new_messages.append(SystemMessage(
-            content=ATTACKER_SYSTEM_PROMPT.format(target_ip=target_ip)
+            content=make_cacheable_system_content(
+                ATTACKER_SYSTEM_PROMPT.format(target_ip=target_ip),
+                role="attacker",
+            )
         ))
 
     matched_playbook = state.get("matched_playbook") if state.get("use_memory", True) else None
@@ -118,7 +128,10 @@ def plan_tactic(state: AttackerState) -> dict:
     llm_context = [m for m in existing_messages if isinstance(m, SystemMessage)]
     if not llm_context:
         llm_context.append(new_messages[-2] if len(new_messages) > 1 else SystemMessage(
-            content=ATTACKER_SYSTEM_PROMPT.format(target_ip=target_ip)
+            content=make_cacheable_system_content(
+                ATTACKER_SYSTEM_PROMPT.format(target_ip=target_ip),
+                role="attacker",
+            )
         ))
     llm_context.append(new_messages[-1])
 
@@ -129,6 +142,38 @@ def plan_tactic(state: AttackerState) -> dict:
         "objective_feedback": "",
         "tactic_started_at": tactic_started_at,
     }
+
+
+def _action_signature(name: str, args: dict) -> str:
+    """Firma canonica de una accion para detectar loops."""
+    return name + "::" + json.dumps(args, sort_keys=True, default=str)
+
+
+def _is_loop(history: list[dict], next_signature: str) -> bool:
+    """Detecta si la accion siguiente repite N o mas veces la misma firma
+    en una ventana reciente del historial.
+
+    Usa los settings loop_detection_window y loop_detection_threshold; el
+    threshold cuenta la accion candidata + las repeticiones previas. Solo
+    chequea la tactica activa para no atrapar reuso legitimo entre tacticas.
+    """
+    from src.config.settings import settings as _s
+    if not _s.loop_detection_enabled:
+        return False
+    window = max(1, int(_s.loop_detection_window))
+    threshold = max(2, int(_s.loop_detection_threshold))
+    recent = history[-window:]
+    if len(recent) < threshold - 1:
+        return False
+    matches = 1  # cuenta la accion candidata
+    for h in recent:
+        sig = _action_signature(
+            h.get("technique", ""),
+            json.loads(h.get("command", "{}")) if isinstance(h.get("command"), str) else (h.get("command") or {}),
+        )
+        if sig == next_signature:
+            matches += 1
+    return matches >= threshold
 
 
 def execute_tools(state: AttackerState) -> dict:
@@ -144,6 +189,8 @@ def execute_tools(state: AttackerState) -> dict:
     new_history = list(state.get("action_history", []))
     tactic_name = state.get("current_tactic", "unknown")
     tactic_info = get_tactic_by_name(tactic_name)
+    # Solo el historial de la tactica actual cuenta para loop detection
+    tactic_history = [h for h in new_history if h.get("tactic") == tactic_name]
 
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
@@ -157,7 +204,23 @@ def execute_tools(state: AttackerState) -> dict:
             args=tool_args,
         )
 
-        if tool_name in tool_map:
+        next_sig = _action_signature(tool_name, tool_args)
+        if _is_loop(tactic_history, next_sig):
+            result = (
+                f"[LOOP_DETECTED] La invocacion {tool_name}({tool_args}) "
+                f"se ha repetido en las ultimas acciones de la tactica "
+                f"{tactic_name} sin progreso. NO se ejecuto. Cambia de approach: "
+                f"prueba un wordlist distinto, otra herramienta, otro target_path, "
+                f"o declara la tactica inalcanzable con justificacion."
+            )
+            logger.warning(f"[Atacante] LOOP detectado en {tool_name}, no ejecutado")
+            get_session().attacker_event(
+                "loop_detected",
+                tactic=tactic_name,
+                tool=tool_name,
+                args=tool_args,
+            )
+        elif tool_name in tool_map:
             try:
                 result = tool_map[tool_name].invoke(tool_args)
             except Exception as e:
@@ -199,10 +262,40 @@ def execute_tools(state: AttackerState) -> dict:
 
 
 def validate_result(state: AttackerState) -> dict:
-    """Reflexiona sobre el ultimo resultado y decide si ejecuta mas tools o termina."""
+    """Reflexiona sobre el ultimo resultado y decide si ejecuta mas tools o termina.
+
+    Auto-advance: si el validator code-based ya considera la tactica cumplida
+    y se ejecutaron al menos `_MIN_ACTIONS_BEFORE_AUTOADVANCE` acciones,
+    cortocircuitamos al LLM con un AIMessage vacio sin tool_calls. Eso route
+    a check_objective que detectara success y avanzara, evitando que el LLM
+    sobre-explore tras haber cumplido el objetivo. Critico para modelos como
+    Haiku 4.5 que tienden a continuar curl-eando rutas tras el OK.
+    """
     messages = list(state.get("messages", []))
     tactic_name = state.get("current_tactic", "")
     actions_count = state.get("actions_in_current_tactic", 0)
+
+    # Pre-check: validator code-based ya OK?
+    if actions_count >= _MIN_ACTIONS_BEFORE_AUTOADVANCE:
+        try:
+            success, reason, _evidence = check_tactic_objective(state)
+        except Exception:
+            success, reason = False, ""
+        if success:
+            logger.info(
+                f"[Atacante] Auto-advance {tactic_name}: validator OK tras "
+                f"{actions_count} acciones ({reason})"
+            )
+            get_session().attacker_event(
+                "auto_advance",
+                tactic=tactic_name,
+                actions=actions_count,
+                reason=reason,
+            )
+            # AIMessage sin tool_calls -> should_continue -> check_objective
+            return {"messages": [AIMessage(
+                content=f"[AUTO-ADVANCE] Objetivo de {tactic_name} verificado: {reason}"
+            )]}
 
     if actions_count == _SOFT_WARN_ACTIONS:
         messages.append(HumanMessage(

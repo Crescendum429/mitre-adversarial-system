@@ -1104,8 +1104,11 @@ def classify_tactic(state: ObserverState) -> dict:
         summary, history, anomaly_signals, baseline_prior=baseline_prior,
     )
 
+    from src.llm.provider import make_cacheable_system_content
     messages = [
-        SystemMessage(content=OBSERVER_SYSTEM_PROMPT),
+        SystemMessage(content=make_cacheable_system_content(
+            OBSERVER_SYSTEM_PROMPT, role="observer"
+        )),
         HumanMessage(content=prompt),
     ]
 

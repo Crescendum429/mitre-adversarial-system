@@ -92,6 +92,36 @@ class Settings(BaseSettings):
     # ventana en curso antes del shutdown.
     observer_shutdown_grace_seconds: int = 15
 
+    # Prompt caching (Anthropic ephemeral cache). Reduce input cost ~90% y
+    # latencia en corridas repetidas. El system prompt del atacante (19k
+    # tokens) se cachea con cache_control. OpenAI cachea automatico para
+    # prompts >=1024 tokens identicos. Google no expone caching control.
+    prompt_caching_enabled: bool = True
+
+    # Extended thinking de Anthropic (Sonnet 4.5+, Opus 4.x). Mejora multi-step
+    # reasoning a costa de output tokens adicionales. Default off para
+    # reproducibilidad y costo controlado. Activar via env para ablation.
+    anthropic_thinking_enabled: bool = False
+    anthropic_thinking_budget_tokens: int = 5000
+
+    # Reasoning effort para OpenAI o-series (o3, o4-mini, GPT-5). Valores:
+    # 'minimal', 'low', 'medium', 'high'. None = default del modelo.
+    openai_reasoning_effort: str = ""
+
+    # Loop detection en el atacante: si la misma accion (mismo tool + args
+    # firma) se repite N+ veces en las ultimas window acciones, forzar replan
+    # con feedback explicito. Evita timeouts artificiales por bucles triviales
+    # del LLM (caso D1 mrrobot OpenRouter: gobuster rockyou.txt 10+ veces).
+    loop_detection_enabled: bool = True
+    loop_detection_window: int = 6
+    loop_detection_threshold: int = 3
+
+    # Pre-flight check del modelo antes de empezar la corrida: smoke test
+    # con un prompt minimo para detectar fallos de cuota / context size /
+    # auth ANTES de gastar tokens. Aborta la corrida con mensaje claro si
+    # falla. Default on; desactivar solo en tests.
+    preflight_check_enabled: bool = True
+
     def validate_credentials(self) -> list[str]:
         """
         Chequea que las API keys requeridas esten presentes. Devuelve la lista
