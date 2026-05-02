@@ -66,35 +66,54 @@ def setup_logging(verbose: bool = False):
 def preflight_llm_check() -> None:
     """Smoke test del proveedor LLM antes de empezar la corrida.
 
-    Detecta tres clases de fallos antes de gastar tokens / tiempo de Docker:
+    Detecta cuatro clases de fallos antes de gastar tokens / tiempo de Docker:
     (1) credenciales invalidas / cuota agotada — la API responde 401/429;
     (2) modelo que no existe en el proveedor (typo en .env);
-    (3) context length insuficiente para el system prompt completo.
+    (3) context length insuficiente para el system prompt formateado real;
+    (4) modelo no soporta tool calling (el atacante lo necesita).
     Aborta con mensaje claro si cualquiera falla. Ejecuta atacante y observer
-    en serie para que el usuario vea cual de los dos rompe.
+    en serie para que el usuario vea cual de los dos rompe. El check del
+    atacante envia el ATTACKER_SYSTEM_PROMPT real para validar context size.
     """
     if not settings.preflight_check_enabled:
         return
     from src.llm.provider import get_chat_model, get_observer_model
-    from langchain_core.messages import HumanMessage
+    from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT
+    from src.agents.observer.prompts import OBSERVER_SYSTEM_PROMPT
+    from langchain_core.messages import HumanMessage, SystemMessage
 
-    for label, factory in (
-        ("atacante", get_chat_model),
-        ("observador", get_observer_model),
-    ):
+    targets = [
+        ("atacante", get_chat_model, ATTACKER_SYSTEM_PROMPT.format(target_ip="10.10.0.10")),
+        ("observador", get_observer_model, OBSERVER_SYSTEM_PROMPT),
+    ]
+    for label, factory, sys_prompt in targets:
         try:
             m = factory()
-            r = m.invoke([HumanMessage(content="Responde unicamente con OK")])
+            # Smoke con el prompt REAL — atrapa context_length_exceeded ANTES
+            # de gastar tokens en tools / docker.
+            msgs = [
+                SystemMessage(content=sys_prompt),
+                HumanMessage(content="Responde unicamente con OK"),
+            ]
+            r = m.invoke(msgs)
             if not r or not getattr(r, "content", None):
                 raise RuntimeError("respuesta vacia del modelo")
         except Exception as e:
+            err_str = str(e)
+            hint = ""
+            if "context" in err_str.lower() or "too long" in err_str.lower() or "413" in err_str:
+                hint = "El modelo no soporta el tamano del system prompt. "
+            elif "401" in err_str or "auth" in err_str.lower():
+                hint = "API key invalida. "
+            elif "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+                hint = "Cuota agotada o rate limit. "
             console.print(
                 f"[red]Pre-flight check fallo para {label}: {type(e).__name__}: "
-                f"{str(e)[:300]}[/red]\n"
-                f"[dim]Verifica .env: provider, modelo, API key y cuota.[/dim]"
+                f"{err_str[:300]}[/red]\n"
+                f"[dim]{hint}Verifica .env: provider, modelo, API key y cuota.[/dim]"
             )
             sys.exit(2)
-    console.print("[green]Pre-flight check OK (atacante + observador responden).[/green]")
+    console.print("[green]Pre-flight check OK (atacante + observador responden, prompt cabe en context).[/green]")
 
 
 def verify_infrastructure(scenario: str = "basic"):
@@ -937,6 +956,12 @@ def print_timing_summary(
             break
     t_llm.add_row("Tiempo sumado LLM", _fmt_hms(float(a.get("elapsed_seconds", 0.0) or 0.0)),
                   _fmt_hms(float(o.get("elapsed_seconds", 0.0) or 0.0)))
+    # Costo estimado USD (M9): incluye precio diferencial por cache_read/creation.
+    from src.llm.provider import estimate_cost_usd
+    a_cost = estimate_cost_usd("attacker")
+    o_cost = estimate_cost_usd("observer")
+    t_llm.add_row("Costo estimado (USD)", f"${a_cost:.4f}", f"${o_cost:.4f}")
+    t_llm.add_row("Costo total (USD)", f"${a_cost + o_cost:.4f}", "")
     if a.get("call_count", 0):
         t_llm.add_row("Tokens/llamada (avg)",
                       f"{a.get('total_tokens', 0)/max(a.get('call_count', 1), 1):.0f}",
@@ -1354,6 +1379,11 @@ def _update_observer_memory(observer_results: list, attacker_state: dict) -> Non
         logging.getLogger(__name__).warning(f"No se pudo actualizar baseline observer: {e}")
 
 
+def _estimate_cost(role: str) -> float:
+    from src.llm.provider import estimate_cost_usd
+    return estimate_cost_usd(role)
+
+
 def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_results: list) -> None:
     """Genera reporte HTML + JSON post-run con todos los eventos capturados."""
     if args.no_report:
@@ -1413,6 +1443,9 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
         attacker_cache_read_tokens=int(a_stats.get("cache_read_input_tokens", 0) or 0),
         observer_cache_creation_tokens=int(o_stats.get("cache_creation_input_tokens", 0) or 0),
         observer_cache_read_tokens=int(o_stats.get("cache_read_input_tokens", 0) or 0),
+        # Costo USD estimado (M9): usa pricing 2026-01. Si modelo no listado, 0.
+        attacker_cost_usd=_estimate_cost("attacker"),
+        observer_cost_usd=_estimate_cost("observer"),
         # Throughput observer
         observer_avg_latency_s=avg_obs_latency_s,
         observer_poll_interval_s=poll_interval,

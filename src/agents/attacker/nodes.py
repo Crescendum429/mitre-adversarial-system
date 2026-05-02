@@ -12,6 +12,7 @@ from src.agents.attacker.memory import (
     compute_target_fingerprint,
     lookup_playbook,
     record_run_completion,
+    record_tactic_failure,
     record_tactic_success,
     upsert_playbook_recon,
 )
@@ -144,9 +145,70 @@ def plan_tactic(state: AttackerState) -> dict:
     }
 
 
+_PRIMARY_ARGS = {
+    # tool_name -> tupla de keys que definen "el intento" (ignora flags)
+    "run_nmap": ("target",),
+    "run_nikto": ("target",),
+    "run_whatweb": ("url",),
+    "run_gobuster": ("url",),
+    "run_gobuster_recursive": ("url",),
+    "run_dirsearch": ("url",),
+    "run_spider": ("url",),
+    "run_wpscan": ("url",),
+    "run_dns_enum": ("target",),
+    "run_enum4linux": ("target",),
+    "run_smbclient": ("target", "share"),
+    "run_ftp": ("target",),
+    "run_searchsploit": ("query",),
+    "run_hydra_http_form": ("target", "login_path", "username"),
+    "run_hydra": ("target", "service", "username"),
+    "run_john": ("hash_format",),
+    "run_http_session": ("login_url", "target_url", "target_method"),
+    "run_sqlmap": ("url",),
+    "run_curl": ("url", "method"),
+    "run_command": ("command",),
+    "run_web_shell": ("url", "cmd"),
+    "run_ssh_exec": ("target", "username", "remote_command"),
+    "run_file_upload": ("target_url", "file_path_on_attacker"),
+    "run_msfvenom": ("payload",),
+    "write_exploit_file": ("path",),
+    "start_reverse_listener": ("port",),
+    "serve_http": ("port",),
+    "run_priv_esc_enum": ("webshell_url", "mode"),
+    "run_linpeas": ("webshell_url", "mode"),
+    "decode_string": ("data", "encoding"),
+}
+
+
+def _canonicalize_args(name: str, args: dict) -> dict:
+    """Reduce args a las claves primarias que definen el intento.
+
+    Ignora flags secundarios (e.g., timeout, threads, headers) y normaliza
+    strings (lowercase host, strip whitespace). Detecta loops semánticos:
+    `run_curl(url='http://X', method='GET', headers='User-Agent: a')` y
+    `run_curl(url='http://X/', method='GET')` colapsan a la misma firma.
+    """
+    if not isinstance(args, dict):
+        return {"_raw": str(args)}
+    primary = _PRIMARY_ARGS.get(name)
+    if primary is None:
+        # tool desconocida: usar todos los args
+        return {k: str(v).strip() for k, v in args.items()}
+    out = {}
+    for k in primary:
+        v = args.get(k, "")
+        s = str(v).strip()
+        # Normalizar URLs: trim trailing /, lowercase host
+        if k.endswith("url") or k == "target_url" or k == "login_url":
+            s = s.rstrip("/").lower()
+        out[k] = s
+    return out
+
+
 def _action_signature(name: str, args: dict) -> str:
-    """Firma canonica de una accion para detectar loops."""
-    return name + "::" + json.dumps(args, sort_keys=True, default=str)
+    """Firma canonica de una accion para detectar loops semanticos."""
+    canon = _canonicalize_args(name, args)
+    return name + "::" + json.dumps(canon, sort_keys=True, default=str)
 
 
 def _is_loop(history: list[dict], next_signature: str) -> bool:
@@ -402,6 +464,14 @@ def check_objective(state: AttackerState) -> dict:
             attempts=current_attempts,
         )
         get_session().attacker_event("tactic_end", tactic=tactic_name, success=False)
+        # M9: persistir el fallo en memoria para que la proxima corrida lo evite
+        if state.get("use_memory", True):
+            fp = state.get("target_fingerprint", "")
+            if fp:
+                try:
+                    record_tactic_failure(fp, tactic_name, reason, current_attempts)
+                except Exception as e:
+                    logger.warning(f"[Memory] No se pudo persistir fallo: {e}")
         return {
             "collected_data": collected,
             "tactic_evidence": tactic_evidence,

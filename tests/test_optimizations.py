@@ -142,18 +142,47 @@ def test_loop_detection_triggers_on_3_repetitions(monkeypatch):
     assert _is_loop(history, sig) is True
 
 
-def test_loop_detection_distinguishes_args(monkeypatch):
+def test_loop_detection_distinguishes_targets(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 6)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
     from src.agents.attacker.nodes import _is_loop, _action_signature
-    sig = _action_signature("run_gobuster", {"url": "x", "wordlist": "small"})
+    # Diferentes URLs primarias = NO es loop
+    sig = _action_signature("run_gobuster", {"url": "http://A", "wordlist": "rockyou"})
     history = [
-        {"technique": "run_gobuster", "command": '{"url": "x", "wordlist": "rockyou"}'},
-        {"technique": "run_gobuster", "command": '{"url": "x", "wordlist": "rockyou"}'},
+        {"technique": "run_gobuster", "command": '{"url": "http://B", "wordlist": "rockyou"}'},
+        {"technique": "run_gobuster", "command": '{"url": "http://B", "wordlist": "rockyou"}'},
     ]
-    # Args distintos = no es loop
     assert _is_loop(history, sig) is False
+
+
+def test_loop_detection_collapses_secondary_args(monkeypatch):
+    """M8.b: el cambio de wordlist u otros flags NO es nuevo intento."""
+    monkeypatch.setattr(settings, "loop_detection_enabled", True)
+    monkeypatch.setattr(settings, "loop_detection_window", 6)
+    monkeypatch.setattr(settings, "loop_detection_threshold", 3)
+    from src.agents.attacker.nodes import _is_loop, _action_signature
+    sig = _action_signature("run_gobuster", {"url": "http://X", "wordlist": "small"})
+    history = [
+        {"technique": "run_gobuster", "command": '{"url": "http://X", "wordlist": "rockyou"}'},
+        {"technique": "run_gobuster", "command": '{"url": "http://X", "wordlist": "common.txt"}'},
+    ]
+    # Mismo URL primario pero wordlist distinto: SI es loop semantico
+    assert _is_loop(history, sig) is True
+
+
+def test_loop_detection_url_canonicalization(monkeypatch):
+    """M8.b: trailing slash y mayusculas en host son irrelevantes."""
+    monkeypatch.setattr(settings, "loop_detection_enabled", True)
+    monkeypatch.setattr(settings, "loop_detection_window", 6)
+    monkeypatch.setattr(settings, "loop_detection_threshold", 3)
+    from src.agents.attacker.nodes import _is_loop, _action_signature
+    sig = _action_signature("run_curl", {"url": "http://10.10.0.10/", "method": "GET"})
+    history = [
+        {"technique": "run_curl", "command": '{"url": "HTTP://10.10.0.10", "method": "GET"}'},
+        {"technique": "run_curl", "command": '{"url": "http://10.10.0.10/", "method": "GET"}'},
+    ]
+    assert _is_loop(history, sig) is True
 
 
 def test_loop_detection_only_within_window(monkeypatch):

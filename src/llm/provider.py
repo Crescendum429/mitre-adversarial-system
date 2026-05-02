@@ -21,6 +21,70 @@ from langchain_core.language_models import BaseChatModel
 from src.config.settings import LLMProvider, settings
 
 
+# Pricing por 1M tokens (USD), valores 2026-01 publicados por los providers.
+# Tupla: (input, output, cache_read_discount, cache_write_premium).
+# cache_read_discount es factor de input (Anthropic: 0.1, OpenAI: 0.5);
+# cache_write_premium es factor de input (Anthropic: 1.25 para 5min ephemeral).
+_PRICE_PER_M_TOKENS: dict[str, tuple[float, float, float, float]] = {
+    # Anthropic
+    "claude-opus-4-7": (5.0, 25.0, 0.1, 1.25),
+    "claude-opus-4-5": (15.0, 75.0, 0.1, 1.25),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.1, 1.25),
+    "claude-sonnet-4-5": (3.0, 15.0, 0.1, 1.25),
+    "claude-sonnet-4-5-20250929": (3.0, 15.0, 0.1, 1.25),
+    "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
+    "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1, 1.25),
+    # OpenAI
+    "gpt-4.1": (2.0, 8.0, 0.5, 1.0),
+    "gpt-4.1-mini": (0.4, 1.6, 0.5, 1.0),
+    "gpt-4.1-nano": (0.1, 0.4, 0.5, 1.0),
+    "gpt-4o": (2.5, 10.0, 0.5, 1.0),
+    "gpt-4o-mini": (0.15, 0.6, 0.5, 1.0),
+    "o3": (2.0, 8.0, 0.5, 1.0),
+    "o4-mini": (1.1, 4.4, 0.5, 1.0),
+    # Google
+    "gemini-2.5-pro": (1.25, 10.0, 0.0, 1.0),
+    "gemini-2.5-flash": (0.075, 0.3, 0.0, 1.0),
+    # Free-tier (cost = 0)
+    "qwen-3-235b-a22b-instruct-2507": (0.0, 0.0, 0.0, 1.0),
+    "openai/gpt-oss-120b:free": (0.0, 0.0, 0.0, 1.0),
+    "llama-3.3-70b-versatile": (0.0, 0.0, 0.0, 1.0),
+}
+
+
+def estimate_cost_usd(role: str = "attacker") -> float:
+    """Estima el costo USD acumulado para un role usando los contadores de USAGE_STATS.
+
+    Usa el dict _PRICE_PER_M_TOKENS por nombre de modelo. Si el modelo no esta
+    en el dict, retorna 0 (mejor under-report que sobre-estimar).
+    """
+    s = USAGE_STATS.get(role, {})
+    model = (s.get("model") or "").lower()
+    # Match exacto, despues prefix match (para que claude-sonnet-4-5-XXXXXX caiga
+    # en claude-sonnet-4-5 si no se registra la fecha)
+    prices = _PRICE_PER_M_TOKENS.get(model)
+    if prices is None:
+        for key, val in _PRICE_PER_M_TOKENS.items():
+            if model.startswith(key) or key.startswith(model):
+                prices = val
+                break
+    if prices is None:
+        return 0.0
+    inp, out, cache_disc, cache_prem = prices
+    cache_read = int(s.get("cache_read_input_tokens", 0) or 0)
+    cache_creation = int(s.get("cache_creation_input_tokens", 0) or 0)
+    raw_input = int(s.get("input_tokens", 0) or 0)
+    output_t = int(s.get("output_tokens", 0) or 0)
+    # cache_read se cobra al cache_disc del precio; cache_creation al cache_prem
+    cost = (
+        raw_input * inp / 1_000_000
+        + cache_read * inp * cache_disc / 1_000_000
+        + cache_creation * inp * cache_prem / 1_000_000
+        + output_t * out / 1_000_000
+    )
+    return round(cost, 4)
+
+
 USAGE_STATS: dict[str, dict] = {
     "attacker": {
         "call_count": 0,
@@ -67,7 +131,8 @@ def _extract_usage(response) -> tuple[int, int, int, int]:
     Anthropic LangChain expone cache_creation_input_tokens y cache_read_input_tokens
     en usage_metadata.input_token_details. OpenAI los expone en
     response_metadata.token_usage.prompt_tokens_details.cached_tokens (solo cached, sin
-    creation).
+    creation). Google Gemini retorna prompt_token_count / candidates_token_count en
+    response_metadata.usage_metadata.
     """
     cache_creation = 0
     cache_read = 0
@@ -96,6 +161,19 @@ def _extract_usage(response) -> tuple[int, int, int, int]:
             cache_read = int(tu.get("cache_read_input_tokens") or 0)
         if in_t or out_t or cache_creation or cache_read:
             return in_t, out_t, cache_creation, cache_read
+    # Google Gemini: usage_metadata en response_metadata con keys distintos
+    gum = meta.get("usage_metadata") or {}
+    if isinstance(gum, dict):
+        in_t = int(gum.get("prompt_token_count") or 0)
+        out_t = int(gum.get("candidates_token_count") or 0)
+        if in_t or out_t:
+            return in_t, out_t, 0, 0
+    # Last resort: log debug para que sea visible si todos los paths fallaron
+    import logging as _logging
+    _logging.getLogger(__name__).debug(
+        f"No usage extraido de {type(response).__name__}; "
+        f"meta keys={list(meta.keys()) if isinstance(meta, dict) else 'N/A'}"
+    )
     return 0, 0, 0, 0
 
 

@@ -66,15 +66,38 @@ def _parse_tool_args(command_json: str) -> dict:
 
 
 def _is_echo_command(cmd: str) -> bool:
+    """Detecta comandos que solo imprimen literales sin tocar el sistema.
+
+    Anti-cheating: si el LLM pasa `printf 'uid=0(root) gid=0'` como evidencia
+    de RCE, el output del docker exec contiene literalmente "uid=0(root)" y
+    matchearia los regex de _has_real_system_output. Bloqueamos las formas
+    comunes: echo, printf, cat <<EOF, python -c "print(...)", perl/ruby -e.
+    """
     cmd_l = cmd.strip().lower()
-    return (
+    if (
         cmd_l.startswith("echo ")
         or cmd_l.startswith("echo\t")
         or cmd_l.startswith("printf ")
+        or cmd_l.startswith("printf\t")
         or cmd_l.startswith("/bin/echo ")
+        or cmd_l.startswith("/usr/bin/printf ")
         or " | echo " in cmd_l
         or cmd_l == "echo"
-    )
+    ):
+        return True
+    # cat <<EOF / cat <<-EOF (heredoc con literal)
+    if "cat <<" in cmd_l or "cat<<" in cmd_l:
+        return True
+    # python -c "print(...)" / python3 -c "print(...)" sin tocar sistema
+    if any(
+        re.search(rf"\b{lang}\s*[23]?\b.*-c\s+['\"]?\s*print", cmd_l)
+        for lang in ("python", "perl", "ruby", "node")
+    ):
+        return True
+    # printf via sh -c
+    if "sh -c" in cmd_l and ("echo " in cmd_l or "printf " in cmd_l):
+        return True
+    return False
 
 
 def _verify_webshell_live(webshell_url: str) -> tuple[bool, str]:

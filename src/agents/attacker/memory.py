@@ -152,6 +152,37 @@ def record_run_completion(fingerprint: str, all_successful: bool) -> None:
     save_playbooks(data)
 
 
+def record_tactic_failure(
+    fingerprint: str,
+    tactic: str,
+    reason: str,
+    attempts: int,
+) -> None:
+    """Persiste fallos de una tactica para que la proxima corrida los evite.
+
+    El playbook acumula 'failed_tactics': {tactic: {reasons: [...], attempts: N,
+    last_failed: iso_timestamp}}. El prompt de la siguiente corrida lo lee en
+    `render_playbook_for_prompt` y advierte al LLM "esta tactica fracaso N
+    veces; no repitas el approach que fallo: <razon>".
+    """
+    if not fingerprint:
+        return
+    data = load_playbooks()
+    pb = data["playbooks"].get(fingerprint)
+    if pb is None:
+        return
+    failed = pb.setdefault("failed_tactics", {})
+    entry = failed.setdefault(tactic, {"reasons": [], "attempts": 0})
+    entry["attempts"] = max(int(entry.get("attempts", 0)), int(attempts))
+    reason_short = (reason or "")[:240]
+    if reason_short and reason_short not in entry["reasons"]:
+        entry["reasons"].append(reason_short)
+        # capar a 5 razones para no inflar
+        entry["reasons"] = entry["reasons"][-5:]
+    entry["last_failed"] = _now()
+    save_playbooks(data)
+
+
 def render_playbook_for_prompt(pb: dict, current_tactic: str) -> str:
     """Formatea el playbook para inyectar en el prompt de planificación."""
     lines = [
@@ -159,6 +190,17 @@ def render_playbook_for_prompt(pb: dict, current_tactic: str) -> str:
         f"Ejecuciones previas: {pb.get('run_count', 0)} "
         f"({pb.get('successful_runs', 0)} exitosas)",
     ]
+    # M9: si esta tactica fallo en runs previos, advertir explicitamente.
+    failed_entry = (pb.get("failed_tactics") or {}).get(current_tactic)
+    if failed_entry:
+        lines.append("")
+        lines.append(
+            f"⚠ ADVERTENCIA: esta tactica ({current_tactic}) fallo en "
+            f"{failed_entry.get('attempts', 0)} intentos previos. Razones:"
+        )
+        for r in failed_entry.get("reasons", [])[-3:]:
+            lines.append(f"  - {r}")
+        lines.append("Cambia de approach respecto a esos intentos.")
     tactic_entry = pb.get("tactics", {}).get(current_tactic)
     if tactic_entry:
         tool = tactic_entry.get("tool", "?")
