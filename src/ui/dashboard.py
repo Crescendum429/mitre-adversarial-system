@@ -104,10 +104,11 @@ class LiveDashboard:
                     pass
 
     def _update_from_event(self, ev: "SessionEvent") -> None:
+        # SessionEvent.tactic es top-level para attacker; observer usa payload.
         et = ev.event_type
         if ev.agent == "attacker":
             if et == "tactic_start":
-                self.attacker_tactic = ev.payload.get("tactic", "?")
+                self.attacker_tactic = ev.tactic or ev.payload.get("tactic", "?")
             elif et == "tool_call":
                 tool = ev.payload.get("tool", "?")
                 self.attacker_last_action = tool
@@ -126,7 +127,9 @@ class LiveDashboard:
                 if ev.payload.get("result") == "signal":
                     self.observer_signals = ev.payload.get("signals_count", 0)
             elif et == "classify":
-                tactic = ev.payload.get("tactic", "?")
+                # `tactic` puede venir en ev.tactic (record() lo extrae como
+                # parametro nombrado) o en el payload, segun el call site.
+                tactic = ev.tactic or ev.payload.get("tactic", "?")
                 self.observer_last_classify = tactic
                 self.observer_confidence = ev.payload.get("confidence", 0.0)
                 self.observer_classifications += 1
@@ -211,8 +214,10 @@ class LiveDashboard:
     def _format_event_desc(self, ev) -> str:
         et = ev.event_type
         p = ev.payload
+        # Attacker events: tactic vive en ev.tactic (top-level del SessionEvent).
+        tactic = ev.tactic or p.get("tactic", "?")
         if et == "tactic_start":
-            return f"→ {p.get('tactic', '?')} iniciada"
+            return f"→ {tactic} iniciada"
         if et == "tool_call":
             tool = p.get("tool", "?")
             args = p.get("args", {})
@@ -222,12 +227,12 @@ class LiveDashboard:
             return f"  result: {p.get('size', 0)} chars"
         if et == "objective_check":
             ok = "✓" if p.get("success") else "✗"
-            return f"{ok} {p.get('tactic', '?')}: {_short(p.get('reason', ''), 80)}"
+            return f"{ok} {tactic}: {_short(p.get('reason', ''), 80)}"
         if et == "replan":
             return f"replan #{p.get('attempt', 0)}: {_short(p.get('feedback', ''), 70)}"
         if et == "tactic_end":
             ok = "✓" if p.get("success") else "✗"
-            return f"{ok} {p.get('tactic', '?')} cerrada"
+            return f"{ok} {tactic} cerrada"
         if et == "memory_match":
             return f"🧠 fp={_short(p.get('fingerprint', ''), 12)} ({p.get('runs_previas', 0)} runs)"
         if et == "memory_save":
@@ -235,7 +240,7 @@ class LiveDashboard:
         if et == "triage":
             return f"triage: {p.get('result', '?')} ({p.get('signals_count', 0)} señales)"
         if et == "classify":
-            return f"→ {p.get('tactic', '?')} ({p.get('confidence', 0):.0%})"
+            return f"→ {tactic} ({p.get('confidence', 0):.0%})"
         if et == "refine":
             return f"refine #{p.get('count', 0)}"
         if et == "window_start":
