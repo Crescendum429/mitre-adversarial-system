@@ -183,6 +183,31 @@ OBJETIVO
 TECNICAS MITRE: T1078 (Valid Accounts), T1110 (Brute Force), T1190 (Exploit
 Public-Facing App), T1133 (External Remote Services).
 
+═══════════════════════════════════════════════════════════════════════════
+HERRAMIENTA PRIMARIA PARA LOGIN HTTP — run_http_session
+═══════════════════════════════════════════════════════════════════════════
+Para CUALQUIER login form de aplicacion web, usa `run_http_session` en lugar
+de `run_curl` o `run_command(curl ...)`. run_http_session maneja:
+  - Cookie jar persistente entre login y peticion autenticada.
+  - Extraccion automatica de tokens CSRF (user_token, _csrf, authenticity_token).
+  - GET previo del form, POST con credentials, GET subsiguiente con sesion.
+Probar admin/admin con run_curl toma 5+ acciones (GET form, parsear CSRF,
+POST con cookies, etc.); con run_http_session toma 1 invocacion.
+
+EJEMPLO MINIMO:
+  run_http_session(
+    login_url="http://{target_ip}/login.php",
+    login_data="username=admin&password=password&Login=Login",
+    target_url="http://{target_ip}/index.php",
+    target_method="GET",
+  )
+Si el login_url responde 302 a no-/login.php → credenciales validas.
+
+NO uses run_curl/run_command para POST manual de login. Si el target tiene
+form de login, run_http_session es la opcion correcta.
+
+═══════════════════════════════════════════════════════════════════════════
+
 VECTORES POSIBLES (elige segun lo que revelo el recon):
 
 A) BRUTE FORCE a servicio autenticado (form login, ssh, ftp, smb):
