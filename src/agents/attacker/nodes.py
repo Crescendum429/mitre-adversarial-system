@@ -107,6 +107,13 @@ def plan_tactic(state: AttackerState) -> dict:
 
     matched_playbook = state.get("matched_playbook") if state.get("use_memory", True) else None
 
+    # model_id se usa para seleccionar la estrategia per-model en el playbook
+    # (memoria hibrida: estrategia propia primero, fallback cross-model con
+    # disclaimer). Tomado del USAGE_STATS para obtener el nombre real del modelo
+    # en uso (ej: claude-sonnet-4-5-20250929).
+    from src.llm.provider import USAGE_STATS as _USAGE
+    current_model_id = (_USAGE.get("attacker", {}) or {}).get("model", "") or ""
+
     tactic_prompt = build_tactic_prompt(
         tactic_name,
         target_ip,
@@ -115,6 +122,7 @@ def plan_tactic(state: AttackerState) -> dict:
         recent_actions=recent_actions,
         replan_attempt=attempts,
         playbook=matched_playbook,
+        model_id=current_model_id,
     )
     new_messages.append(HumanMessage(content=tactic_prompt))
 
@@ -579,11 +587,15 @@ def _handle_memory_on_success(state: AttackerState, tactic: str, evidence: dict)
     target_ip = state.get("target", "")
     update: dict = {}
 
+    # model_id activo para memoria hibrida (per-model strategies).
+    from src.llm.provider import USAGE_STATS as _USAGE
+    current_model = (_USAGE.get("attacker", {}) or {}).get("model", "") or ""
+
     if tactic == "reconnaissance":
         fp = compute_target_fingerprint(evidence)
         if fp:
-            existing = lookup_playbook(fp)
-            upsert_playbook_recon(fp, target_ip, evidence, actions_used)
+            existing = lookup_playbook(fp, model_id=current_model)
+            upsert_playbook_recon(fp, target_ip, evidence, actions_used, model_id=current_model)
             update["target_fingerprint"] = fp
             if existing is not None:
                 update["matched_playbook"] = existing
@@ -627,6 +639,7 @@ def _handle_memory_on_success(state: AttackerState, tactic: str, evidence: dict)
         args=args,
         evidence=evidence,
         actions_used=actions_used,
+        model_id=current_model,
     )
     get_session().attacker_event(
         "memory_save",

@@ -222,3 +222,74 @@ class TestRenderForPrompt:
         assert "run_http_session" in rendered
         assert "3" in rendered
         assert "2 exitosas" in rendered
+
+
+class TestHybridMemoryByModel:
+    """Memoria hibrida: cross-model + per-model strategies."""
+
+    def test_record_tactic_success_persists_per_model(self, tmp_memory):
+        ev = {"port_80_open": True, "web_technologies": ["Apache"]}
+        fp = memory.compute_target_fingerprint(ev)
+        memory.upsert_playbook_recon(fp, "10.0.0.1", ev, 5, model_id="modelA")
+        memory.record_tactic_success(
+            fp, "execution", "run_http_session",
+            {"login_url": "http://x"}, {"rce_verified": True}, 3,
+            model_id="modelA",
+        )
+        pb = memory.lookup_playbook(fp)
+        # Cross-model entry actualizada
+        assert pb["tactics"]["execution"]["tool"] == "run_http_session"
+        # Per-model entry tambien
+        assert pb["tool_strategies"]["modelA"]["execution"]["tool"] == "run_http_session"
+        assert pb["tool_strategies"]["modelA"]["execution"]["best_run_actions"] == 3
+
+    def test_record_two_models_keeps_separate_strategies(self, tmp_memory):
+        ev = {"port_80_open": True, "web_technologies": ["Apache"]}
+        fp = memory.compute_target_fingerprint(ev)
+        memory.upsert_playbook_recon(fp, "10.0.0.1", ev, 5, model_id="modelA")
+        memory.record_tactic_success(
+            fp, "execution", "run_http_session",
+            {"login_url": "http://x"}, {"rce_verified": True}, 3,
+            model_id="modelA",
+        )
+        memory.record_tactic_success(
+            fp, "execution", "run_curl",
+            {"url": "http://x?cmd=id"}, {"rce_verified": True}, 8,
+            model_id="modelB",
+        )
+        pb = memory.lookup_playbook(fp)
+        # Cada modelo tiene su propia estrategia
+        assert pb["tool_strategies"]["modelA"]["execution"]["tool"] == "run_http_session"
+        assert pb["tool_strategies"]["modelB"]["execution"]["tool"] == "run_curl"
+        # Cross-model conserva el MEJOR (modelA con 3 acciones < modelB con 8)
+        assert pb["tactics"]["execution"]["tool"] == "run_http_session"
+
+    def test_render_prefers_per_model_when_match(self):
+        pb = {
+            "target_summary": "Apache",
+            "run_count": 1,
+            "successful_runs": 1,
+            "tactics": {"execution": {"tool": "run_http_session", "best_run_actions": 3}},
+            "tool_strategies": {
+                "modelA": {"execution": {"tool": "run_curl", "best_run_actions": 5}},
+            },
+        }
+        out = memory.render_playbook_for_prompt(pb, "execution", model_id="modelA")
+        assert "run_curl" in out
+        assert "tu propia ejecucion previa" in out
+        assert "run_http_session" not in out
+
+    def test_render_falls_back_to_cross_model_with_disclaimer(self):
+        pb = {
+            "target_summary": "Apache",
+            "run_count": 1,
+            "successful_runs": 1,
+            "tactics": {"execution": {"tool": "run_http_session", "best_run_actions": 3}},
+            "tool_strategies": {
+                "modelA": {"execution": {"tool": "run_curl", "best_run_actions": 5}},
+            },
+        }
+        # modelB nunca ejecuto -> fallback a cross-model con disclaimer
+        out = memory.render_playbook_for_prompt(pb, "execution", model_id="modelB")
+        assert "run_http_session" in out
+        assert "OTRO modelo" in out

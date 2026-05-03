@@ -87,7 +87,14 @@ def save_playbooks(data: dict) -> None:
     MEMORY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-def lookup_playbook(fingerprint: str) -> dict | None:
+def lookup_playbook(fingerprint: str, model_id: str = "") -> dict | None:
+    """Recupera el playbook para un fingerprint dado.
+
+    El playbook contiene seccion cross-model (target_summary, key_findings,
+    evidence_keys) y seccion per-model (tool_strategies[model_id]). Se retorna
+    el dict completo; render_playbook_for_prompt elige que partes usar segun
+    el model_id activo.
+    """
     if not fingerprint:
         return None
     data = load_playbooks()
@@ -99,18 +106,30 @@ def upsert_playbook_recon(
     target_ip: str,
     recon_evidence: dict,
     actions_used: int,
+    model_id: str = "",
 ) -> None:
+    """Persiste recon. target_summary y key_findings son cross-model;
+    actions_used se registra por modelo en tool_strategies[model_id]['reconnaissance'].
+    """
     if not fingerprint:
         return
     data = load_playbooks()
     pb = data["playbooks"].setdefault(fingerprint, _new_playbook(target_ip, recon_evidence))
     pb["last_seen"] = _now()
     pb["last_target_ip"] = target_ip
+    # Recon key_findings es cross-model (puerto, tech, paths son del target)
     pb_recon = pb["tactics"].setdefault("reconnaissance", {})
     prev_best = pb_recon.get("best_run_actions")
     if prev_best is None or actions_used < prev_best:
         pb_recon["best_run_actions"] = actions_used
     pb_recon["key_findings"] = _summarize_recon(recon_evidence)
+    # Per-model: registra acciones del modelo actual
+    if model_id:
+        strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
+        recon_strat = strategies.setdefault("reconnaissance", {})
+        prev = recon_strat.get("best_run_actions")
+        if prev is None or actions_used < prev:
+            recon_strat["best_run_actions"] = actions_used
     save_playbooks(data)
 
 
@@ -121,20 +140,48 @@ def record_tactic_success(
     args: dict,
     evidence: dict,
     actions_used: int,
+    model_id: str = "",
 ) -> None:
+    """Persiste exito de tactica con dos vistas:
+
+    - Cross-model (pb['tactics'][tactic]): tool + payload_template + evidence_keys
+      del MEJOR resultado entre todos los modelos. Esto provee fallback cuando un
+      modelo nuevo ataca el target sin haber ejecutado antes.
+    - Per-model (pb['tool_strategies'][model_id][tactic]): tool + payload_template
+      especifico del modelo. Cada modelo tiene su 'estilo' de tool selection
+      (Sonnet usa run_http_session, GPT-4.1 usa run_curl, etc.) y persistir sus
+      preferencias acelera la segunda corrida CON EL MISMO MODELO.
+    """
     if not fingerprint or tactic == "reconnaissance":
         return
     data = load_playbooks()
     pb = data["playbooks"].get(fingerprint)
     if pb is None:
         return
+    sanitized = _sanitize_args(args)
+    evidence_keys = sorted(k for k in evidence if not k.startswith("_"))
+    # Cross-model: solo sobreescribir si superamos el best
     entry = pb["tactics"].setdefault(tactic, {})
-    entry["tool"] = tool
-    entry["payload_template"] = _sanitize_args(args)
-    entry["evidence_keys"] = sorted(k for k in evidence if not k.startswith("_"))
     prev_best = entry.get("best_run_actions")
     if prev_best is None or actions_used < prev_best:
+        entry["tool"] = tool
+        entry["payload_template"] = sanitized
+        entry["evidence_keys"] = evidence_keys
         entry["best_run_actions"] = actions_used
+    else:
+        # actualizamos solo evidence_keys que sea union de las observadas
+        existing_ek = set(entry.get("evidence_keys", []))
+        entry["evidence_keys"] = sorted(existing_ek | set(evidence_keys))
+    # Per-model: siempre registrar (cada modelo tiene su mejor)
+    if model_id:
+        strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
+        m_entry = strategies.setdefault(tactic, {})
+        prev_m = m_entry.get("best_run_actions")
+        if prev_m is None or actions_used < prev_m:
+            m_entry["tool"] = tool
+            m_entry["payload_template"] = sanitized
+            m_entry["evidence_keys"] = evidence_keys
+            m_entry["best_run_actions"] = actions_used
     save_playbooks(data)
 
 
@@ -183,8 +230,14 @@ def record_tactic_failure(
     save_playbooks(data)
 
 
-def render_playbook_for_prompt(pb: dict, current_tactic: str) -> str:
-    """Formatea el playbook para inyectar en el prompt de planificación."""
+def render_playbook_for_prompt(pb: dict, current_tactic: str, model_id: str = "") -> str:
+    """Formatea el playbook para inyectar en el prompt de planificación.
+
+    Memoria hibrida: prefiere `tool_strategies[model_id][tactic]` si existe
+    (mismo modelo lo ha resuelto antes). Si no, fallback a `tactics[tactic]`
+    cross-model con disclaimer explicito de que viene de otro modelo y la
+    sintaxis puede requerir ajuste.
+    """
     lines = [
         f"Target observado previamente: {pb.get('target_summary', '?')}",
         f"Ejecuciones previas: {pb.get('run_count', 0)} "
@@ -201,13 +254,26 @@ def render_playbook_for_prompt(pb: dict, current_tactic: str) -> str:
         for r in failed_entry.get("reasons", [])[-3:]:
             lines.append(f"  - {r}")
         lines.append("Cambia de approach respecto a esos intentos.")
-    tactic_entry = pb.get("tactics", {}).get(current_tactic)
+    # Per-model strategy: prioridad alta. El modelo actual tiene su forma
+    # propia de invocar tools.
+    per_model = (
+        pb.get("tool_strategies", {}).get(model_id, {}).get(current_tactic)
+        if model_id else None
+    )
+    cross_model = pb.get("tactics", {}).get(current_tactic)
+    tactic_entry = per_model or cross_model
+    source_label = (
+        "tu propia ejecucion previa con este modelo"
+        if per_model
+        else ("estrategia que funciono con OTRO modelo (ajusta sintaxis "
+              "a tu forma de invocar tools)" if cross_model else "")
+    )
     if tactic_entry:
         tool = tactic_entry.get("tool", "?")
         payload = tactic_entry.get("payload_template", {})
         best = tactic_entry.get("best_run_actions", "?")
         lines.append(f"")
-        lines.append(f"En esta táctica ({current_tactic}) funcionó:")
+        lines.append(f"En esta táctica ({current_tactic}) funcionó ({source_label}):")
         lines.append(f"  Tool: {tool}")
         if payload:
             lines.append(f"  Argumentos sugeridos:")
