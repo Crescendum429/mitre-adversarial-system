@@ -256,11 +256,23 @@ def render_playbook_for_prompt(pb: dict, current_tactic: str, model_id: str = ""
         lines.append("Cambia de approach respecto a esos intentos.")
     # Per-model strategy: prioridad alta. El modelo actual tiene su forma
     # propia de invocar tools.
-    per_model = (
+    # Filtrar entradas con best_run_actions > _PLAYBOOK_BAD_THRESHOLD: los
+    # playbooks que tomaron muchas acciones reflejan que el LLM se atasco;
+    # sugerirlos al siguiente run propaga el mal camino. Mejor "sin sugerencia"
+    # que "sugerencia mala": el LLM intentara empiricamente desde cero.
+    _PLAYBOOK_BAD_THRESHOLD = 30
+    def _ok(entry):
+        if not entry: return None
+        best = entry.get("best_run_actions")
+        if best is not None and int(best) > _PLAYBOOK_BAD_THRESHOLD:
+            return None
+        return entry
+
+    per_model = _ok(
         pb.get("tool_strategies", {}).get(model_id, {}).get(current_tactic)
         if model_id else None
     )
-    cross_model = pb.get("tactics", {}).get(current_tactic)
+    cross_model = _ok(pb.get("tactics", {}).get(current_tactic))
     tactic_entry = per_model or cross_model
     source_label = (
         "tu propia ejecucion previa con este modelo"

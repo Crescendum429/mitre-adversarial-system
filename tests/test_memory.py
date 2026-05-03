@@ -279,6 +279,35 @@ class TestHybridMemoryByModel:
         assert "tu propia ejecucion previa" in out
         assert "run_http_session" not in out
 
+    def test_render_filters_bad_playbook_entries(self):
+        """Entradas con best_run_actions > 30 NO se sugieren — propagan mal camino."""
+        pb = {
+            "target_summary": "Apache",
+            "run_count": 1,
+            "successful_runs": 1,
+            "tactics": {
+                "discovery": {"tool": "run_curl", "best_run_actions": 134}  # mala
+            },
+            "tool_strategies": {
+                "modelA": {"discovery": {"tool": "run_curl", "best_run_actions": 134}}
+            },
+        }
+        out = memory.render_playbook_for_prompt(pb, "discovery", model_id="modelA")
+        # No debe sugerir el playbook (es "no hay registro previo" o similar)
+        assert "run_curl" not in out
+        assert "Mejor corrida previa: 134" not in out
+
+    def test_render_keeps_good_playbook_entries(self):
+        """Entradas con best_run_actions <= 30 SI se sugieren."""
+        pb = {
+            "target_summary": "Apache",
+            "run_count": 1,
+            "successful_runs": 1,
+            "tactics": {"discovery": {"tool": "run_web_shell", "best_run_actions": 5}},
+        }
+        out = memory.render_playbook_for_prompt(pb, "discovery")
+        assert "run_web_shell" in out
+
     def test_render_falls_back_to_cross_model_with_disclaimer(self):
         pb = {
             "target_summary": "Apache",
