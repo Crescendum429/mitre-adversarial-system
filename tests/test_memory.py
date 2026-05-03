@@ -103,6 +103,17 @@ class TestComputeTargetFingerprint:
             == memory.compute_target_fingerprint(dvwa_instance_b)
         )
 
+    def test_fingerprint_stable_across_secondary_tech(self):
+        """FP debe ser igual aunque recon detecte tech secundarias adicionales (MySQL, JQuery, Bootstrap)."""
+        ev1 = {"http_port_open": 80, "web_technologies": ["Apache", "DVWA", "PHP"]}
+        ev2 = {"http_port_open": 80, "web_technologies": ["Apache", "DVWA", "PHP", "MySQL"]}
+        ev3 = {"http_port_open": 80, "web_technologies": ["Apache", "DVWA", "PHP", "MySQL", "JQuery", "Bootstrap"]}
+        assert (
+            memory.compute_target_fingerprint(ev1)
+            == memory.compute_target_fingerprint(ev2)
+            == memory.compute_target_fingerprint(ev3)
+        )
+
     def test_fingerprint_different_for_different_tech(self):
         """Tech stack distinta -> fingerprint distinto. No contaminamos
         playbooks entre tipos de target.

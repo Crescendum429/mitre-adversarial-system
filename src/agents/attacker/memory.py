@@ -59,9 +59,30 @@ def compute_target_fingerprint(recon_evidence: dict) -> str:
         port = recon_evidence.get("http_port_open", 80)
         parts.append(f"port:{port}")
 
+    # Solo "anchor techs" (web server + app principal) para estabilidad.
+    # Excluye runtime (PHP, Python), DBs (MySQL, Postgres) y libs JS porque
+    # APARECEN/DESAPARECEN entre corridas dependiendo de la profundidad de
+    # whatweb/nmap. Solo retenemos web servers y apps que son determinantes
+    # del vector de ataque.
+    _ANCHOR_TECHS = {
+        # Web servers
+        "apache", "nginx", "iis", "tomcat", "jetty", "lighttpd", "caddy", "gunicorn",
+        # Applications / CMS
+        "dvwa", "wordpress", "drupal", "joomla", "confluence", "jira",
+        "phpmyadmin", "moodle", "magento", "django", "flask",
+        # Java appservers / frameworks (vector OGNL/JNDI)
+        "struts", "spring", "weblogic", "jboss", "wildfly",
+        # Solr / search
+        "solr", "elasticsearch",
+    }
     techs = recon_evidence.get("web_technologies", [])
     if techs:
-        parts.append("tech:" + ",".join(sorted(t.lower() for t in techs)))
+        anchor = sorted({
+            t.lower() for t in techs
+            if t and t.lower() in _ANCHOR_TECHS
+        })
+        if anchor:
+            parts.append("tech:" + ",".join(anchor))
 
     if not parts:
         return ""
