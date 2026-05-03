@@ -179,35 +179,55 @@ def run_attacker(
     accumulated_flags = []
     accumulated_met = {}
     accumulated_attempts = {}
-    for event in graph.stream(initial_state, {"recursion_limit": settings.attacker_recursion_limit}):
-        for node_name, node_state in event.items():
-            if node_name == "advance_tactic":
-                tactic = node_state.get("current_tactic", "")
-                if tactic:
-                    console.print(f"  [yellow]>> Avanzando a: {tactic}[/yellow]")
-            elif node_name == "execute_tools":
-                history = node_state.get("action_history", [])
-                if history:
-                    accumulated_history = history
-                    last = history[-1]
-                    console.print(f"  [cyan]Ejecutado: {last.get('technique', '?')}[/cyan]")
-            elif node_name == "check_objective":
-                ev = node_state.get("tactic_evidence", {})
-                if ev:
-                    accumulated_evidence.update(ev)
-                cd = node_state.get("collected_data", {})
-                if cd:
-                    accumulated_collected.update(cd)
-                flags = node_state.get("flags_found", [])
-                if flags:
-                    accumulated_flags = flags
-                met = node_state.get("tactic_objective_met", {})
-                if met:
-                    accumulated_met.update(met)
-                attempts = node_state.get("attempts_per_tactic", {})
-                if attempts:
-                    accumulated_attempts.update(attempts)
-            final_state.update(node_state)
+    # GraphRecursionError se captura para emitir reporte parcial: sin esto el
+    # sistema descarta toda la metadata acumulada cuando el atacante no
+    # converge en recursion_limit acciones (caso tipico: OpenRouter free
+    # atascado en init_access por sesgo de frecuencia).
+    try:
+        from langgraph.errors import GraphRecursionError
+    except ImportError:
+        GraphRecursionError = Exception
+
+    try:
+        for event in graph.stream(initial_state, {"recursion_limit": settings.attacker_recursion_limit}):
+            for node_name, node_state in event.items():
+                if node_name == "advance_tactic":
+                    tactic = node_state.get("current_tactic", "")
+                    if tactic:
+                        console.print(f"  [yellow]>> Avanzando a: {tactic}[/yellow]")
+                elif node_name == "execute_tools":
+                    history = node_state.get("action_history", [])
+                    if history:
+                        accumulated_history = history
+                        last = history[-1]
+                        console.print(f"  [cyan]Ejecutado: {last.get('technique', '?')}[/cyan]")
+                elif node_name == "check_objective":
+                    ev = node_state.get("tactic_evidence", {})
+                    if ev:
+                        accumulated_evidence.update(ev)
+                    cd = node_state.get("collected_data", {})
+                    if cd:
+                        accumulated_collected.update(cd)
+                    flags = node_state.get("flags_found", [])
+                    if flags:
+                        accumulated_flags = flags
+                    met = node_state.get("tactic_objective_met", {})
+                    if met:
+                        accumulated_met.update(met)
+                    attempts = node_state.get("attempts_per_tactic", {})
+                    if attempts:
+                        accumulated_attempts.update(attempts)
+                final_state.update(node_state)
+    except GraphRecursionError as e:
+        console.print(
+            f"[bold yellow]⚠ RECURSION LIMIT alcanzado "
+            f"({settings.attacker_recursion_limit}): {e}[/bold yellow]\n"
+            f"[dim]Emitiendo reporte parcial con la metadata acumulada hasta "
+            f"este punto. El atacante no convergio dentro del limite — "
+            f"comportamiento esperado en escenarios donde el modelo se atasca "
+            f"(p.ej. sesgo de frecuencia en user enumeration).[/dim]"
+        )
+        final_state["recursion_limit_hit"] = True
 
     final_state["action_history"] = accumulated_history
     if accumulated_evidence:
