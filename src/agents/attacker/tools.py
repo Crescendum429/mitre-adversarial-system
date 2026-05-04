@@ -1381,3 +1381,84 @@ assert len(ATTACKER_TOOLS) == 30, (
     f"Esperaba 30 tools, encontre {len(ATTACKER_TOOLS)}. "
     f"Revisa TOOL_CATEGORIES y _NAME_TO_TOOL para que sean consistentes."
 )
+
+
+# Mapeo tactica -> herramientas relevantes para selective tool exposure
+# (opt-in). Reduce el numero de schemas inyectados al LLM por llamada
+# (~2-3k tokens) a costa de cache misses entre tacticas. Util en corridas
+# largas donde el modelo solo necesita un subset por fase.
+#
+# Filosofia: cada subset incluye un nucleo "siempre disponible" (curl, command,
+# decode) que evita romper la corrida si el LLM elige una herramienta no listada
+# en la categoria. La category-to-tactic decision se basa en patrones empiricos
+# observados en HALLAZGOS_TESIS.txt §1-3 (que tools usan los modelos por fase).
+_CORE_TOOLS = ("run_curl", "run_command", "decode_string")
+
+TACTIC_TO_TOOLS: dict[str, tuple[str, ...]] = {
+    "reconnaissance": (
+        "run_nmap", "run_whatweb", "run_nikto", "run_gobuster",
+        "run_gobuster_recursive", "run_dirsearch", "run_spider",
+        "run_wpscan", "run_dns_enum", "run_enum4linux",
+        "run_smbclient", "run_ftp", "run_searchsploit",
+    ) + _CORE_TOOLS,
+    "initial_access": (
+        "run_hydra_http_form", "run_hydra", "run_http_session",
+        "run_sqlmap", "run_searchsploit", "write_exploit_file",
+        "run_msfvenom", "run_file_upload",
+    ) + _CORE_TOOLS,
+    "execution": (
+        "run_http_session", "run_web_shell", "run_ssh_exec",
+        "write_exploit_file", "run_msfvenom", "run_file_upload",
+        "start_reverse_listener", "serve_http",
+    ) + _CORE_TOOLS,
+    "persistence": (
+        "run_web_shell", "run_ssh_exec", "write_exploit_file",
+        "run_file_upload",
+    ) + _CORE_TOOLS,
+    "privilege_escalation": (
+        "run_priv_esc_enum", "run_linpeas", "run_web_shell",
+        "run_ssh_exec", "run_searchsploit",
+    ) + _CORE_TOOLS,
+    "defense_evasion": (
+        "run_web_shell", "run_ssh_exec", "write_exploit_file",
+    ) + _CORE_TOOLS,
+    "credential_access": (
+        "run_john", "run_hydra", "run_hydra_http_form",
+        "run_web_shell", "run_ssh_exec",
+    ) + _CORE_TOOLS,
+    "discovery": (
+        "run_web_shell", "run_ssh_exec", "run_priv_esc_enum",
+    ) + _CORE_TOOLS,
+    "lateral_movement": (
+        "run_ssh_exec", "run_web_shell", "run_smbclient",
+    ) + _CORE_TOOLS,
+    "collection": (
+        "run_web_shell", "run_ssh_exec", "run_smbclient", "run_ftp",
+    ) + _CORE_TOOLS,
+    "exfiltration": (
+        "run_web_shell", "run_ssh_exec",
+    ) + _CORE_TOOLS,
+    "impact": (
+        "run_web_shell", "run_ssh_exec",
+    ) + _CORE_TOOLS,
+}
+
+
+def select_tools_for_tactic(tactic: str) -> list:
+    """Devuelve la lista filtrada de tools relevantes para una tactica.
+
+    Si la tactica no esta mapeada, retorna ATTACKER_TOOLS completo (failsafe
+    para tacticas no documentadas). Las tools del subset son objetos callable
+    listos para bind_tools().
+    """
+    names = TACTIC_TO_TOOLS.get(tactic.lower())
+    if not names:
+        return list(ATTACKER_TOOLS)
+    seen: set[str] = set()
+    result = []
+    for n in names:
+        if n in seen or n not in _NAME_TO_TOOL:
+            continue
+        seen.add(n)
+        result.append(_NAME_TO_TOOL[n])
+    return result

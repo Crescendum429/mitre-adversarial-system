@@ -25,7 +25,7 @@ from src.agents.attacker.memory import (
 from src.agents.attacker.objectives import check_tactic_objective, scan_for_flags
 from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT, build_tactic_prompt
 from src.agents.attacker.state import AttackerState
-from src.agents.attacker.tools import ATTACKER_TOOLS
+from src.agents.attacker.tools import ATTACKER_TOOLS, select_tools_for_tactic
 from src.config.mitre_mapping import get_tactic_by_name
 from src.config.settings import settings
 from src.llm.provider import get_chat_model, make_cacheable_system_content
@@ -44,17 +44,64 @@ _HARD_WARN_ACTIONS = 30
 _MIN_ACTIONS_BEFORE_AUTOADVANCE = 3
 _MAX_REPLAN_ATTEMPTS = 15
 
+# Tope de chars del ToolMessage que va al historial de mensajes consumido por
+# validate_result. action_history.output_preview ya esta capado a 10000;
+# para la conversacion al LLM cortamos mas agresivo (head + tail) porque cada
+# tool result se suma al contexto en cada invocacion subsiguiente. Ej:
+# gobuster con 10k lineas 404 desperdicia ~3k tokens repetidos. Head+tail
+# preserva los primeros 1.5k chars (URL inicial, banner, primeras matches)
+# y los ultimos 1.5k (resumen final, summary line).
+_TOOL_MSG_MAX_CHARS = 3500
+
+
+def _truncate_tool_output_for_llm(text: str, max_chars: int = _TOOL_MSG_MAX_CHARS) -> str:
+    """Recorta tool output preservando inicio y fin.
+
+    Si el texto excede max_chars, mantiene los primeros y ultimos
+    max_chars//2 caracteres con un marker explicito en el medio. Razon de
+    no usar solo head: las herramientas suelen acumular detalles al final
+    (summary, count, exit code) que importan tanto como el inicio.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    omitted = len(text) - max_chars
+    return (
+        text[:half]
+        + f"\n... [truncado {omitted} chars del medio para reducir contexto LLM] ...\n"
+        + text[-half:]
+    )
+
 _model_with_tools = None
+_models_by_tactic: dict[str, object] = {}
 _model_lock = __import__("threading").Lock()
 
 
-def _get_model():
+def _get_model(tactic: str | None = None):
     """Singleton thread-safe del modelo con tools bound.
 
     El lock previene doble inicializacion cuando plan_tactic y validate_result
     corren concurrentemente (raro pero posible con LangGraph streams).
+
+    Selective tool exposure (opt-in): si settings.attacker_selective_tools_enabled
+    es True y se pasa `tactic`, devuelve un modelo con tools filtradas a las
+    relevantes para esa tactica (ahorra tokens en system prompt; cache miss
+    al cambiar de tactica). Default: modelo con TODAS las tools (1 singleton).
     """
     global _model_with_tools
+    selective = bool(getattr(settings, "attacker_selective_tools_enabled", False))
+    if selective and tactic:
+        key = tactic.lower()
+        if key in _models_by_tactic:
+            return _models_by_tactic[key]
+        with _model_lock:
+            if key not in _models_by_tactic:
+                tools_subset = select_tools_for_tactic(key)
+                _models_by_tactic[key] = get_chat_model().bind_tools(tools_subset)
+        return _models_by_tactic[key]
+
     if _model_with_tools is not None:
         return _model_with_tools
     with _model_lock:
@@ -70,6 +117,7 @@ def reset_model_singleton():
     global _model_with_tools
     with _model_lock:
         _model_with_tools = None
+        _models_by_tactic.clear()
 
 
 def plan_tactic(state: AttackerState) -> dict:
@@ -149,7 +197,7 @@ def plan_tactic(state: AttackerState) -> dict:
         ))
     llm_context.append(new_messages[-1])
 
-    response = _get_model().invoke(llm_context)
+    response = _get_model(tactic_name).invoke(llm_context)
 
     return {
         "messages": new_messages + [response],
@@ -313,8 +361,12 @@ def execute_tools(state: AttackerState) -> dict:
             preview=result_str[:300],
         )
 
+        # ToolMessage content va al messages que el LLM consume en
+        # validate_result; aplicamos truncacion head+tail mas agresiva que
+        # action_history (10000 -> 3500) para no inflar el context window
+        # con outputs largos repetidos en cada invoke subsiguiente.
         tool_messages.append(ToolMessage(
-            content=str(result),
+            content=_truncate_tool_output_for_llm(result_str),
             tool_call_id=tool_call["id"],
         ))
 
@@ -389,7 +441,7 @@ def validate_result(state: AttackerState) -> dict:
             )
         ))
 
-    response = _get_model().invoke(messages)
+    response = _get_model(tactic_name).invoke(messages)
     return {"messages": [response]}
 
 

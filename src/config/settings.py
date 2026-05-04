@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     reflector_enabled: bool = True
     reflector_trigger_attempts: int = 3
 
+    # Selective tool exposure por tactica (opt-in). Reduce los schemas de
+    # tools inyectados al LLM por llamada (~2-3k tokens menos) a costa de
+    # cache misses entre tacticas (Anthropic). Util en corridas largas con
+    # tacticas distintas — pero default OFF porque en runs cortos el cache
+    # miss anula el ahorro neto. Ablation experimental en N6/N7.
+    attacker_selective_tools_enabled: bool = False
+
     # Extended thinking de Anthropic (Sonnet 4.5+, Opus 4.x). Mejora multi-step
     # reasoning a costa de output tokens adicionales. Default off para
     # reproducibilidad y costo controlado. Activar via env para ablation.

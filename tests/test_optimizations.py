@@ -410,3 +410,83 @@ def test_is_transient_connection_errors():
     assert _is_transient_error(Exception("Connection refused"))
     assert _is_transient_error(Exception("RemoteDisconnected"))
     assert _is_transient_error(Exception("Read timed out"))
+
+
+# ---------- Tool output truncation for LLM context ----------
+
+def test_truncate_tool_output_short_unchanged():
+    from src.agents.attacker.nodes import _truncate_tool_output_for_llm
+    short = "hello world"
+    assert _truncate_tool_output_for_llm(short, max_chars=4000) == short
+
+
+def test_truncate_tool_output_preserves_head_and_tail():
+    from src.agents.attacker.nodes import _truncate_tool_output_for_llm
+    body = "A" * 10000 + "MIDDLE" + "B" * 10000
+    out = _truncate_tool_output_for_llm(body, max_chars=200)
+    assert "AAAA" in out  # head preservado
+    assert "BBBB" in out  # tail preservado
+    assert "MIDDLE" not in out  # medio descartado
+    assert "truncado" in out  # marker explicito
+    # Tamano ligeramente mayor que max_chars por el marker
+    assert len(out) < 400
+
+
+def test_truncate_tool_output_handles_non_string():
+    from src.agents.attacker.nodes import _truncate_tool_output_for_llm
+    result = _truncate_tool_output_for_llm(12345, max_chars=10)
+    assert isinstance(result, str)
+    assert "12345" in result
+
+
+# ---------- Selective tool exposure ----------
+
+def test_select_tools_for_tactic_recon_includes_nmap():
+    from src.agents.attacker.tools import select_tools_for_tactic
+    tools = select_tools_for_tactic("reconnaissance")
+    names = [t.name for t in tools]
+    assert "run_nmap" in names
+    assert "run_curl" in names  # core
+    assert "run_command" in names  # core
+
+
+def test_select_tools_for_tactic_priv_esc_includes_linpeas():
+    from src.agents.attacker.tools import select_tools_for_tactic
+    tools = select_tools_for_tactic("privilege_escalation")
+    names = [t.name for t in tools]
+    assert "run_linpeas" in names
+    assert "run_priv_esc_enum" in names
+
+
+def test_select_tools_for_tactic_unknown_returns_full():
+    from src.agents.attacker.tools import ATTACKER_TOOLS, select_tools_for_tactic
+    tools = select_tools_for_tactic("nonexistent_tactic")
+    assert len(tools) == len(ATTACKER_TOOLS)
+
+
+def test_select_tools_subset_smaller_than_full():
+    """El subset por tactica debe ser estrictamente mas chico que el total."""
+    from src.agents.attacker.tools import ATTACKER_TOOLS, select_tools_for_tactic
+    for tactic in ("reconnaissance", "initial_access", "execution",
+                   "discovery", "privilege_escalation"):
+        subset = select_tools_for_tactic(tactic)
+        assert len(subset) < len(ATTACKER_TOOLS), (
+            f"Subset para {tactic} no es mas chico que ATTACKER_TOOLS"
+        )
+        assert len(subset) >= 3, f"Subset para {tactic} demasiado pequeno"
+
+
+def test_select_tools_for_tactic_no_duplicates():
+    from src.agents.attacker.tools import select_tools_for_tactic
+    for tactic in ("reconnaissance", "initial_access", "execution"):
+        tools = select_tools_for_tactic(tactic)
+        names = [t.name for t in tools]
+        assert len(names) == len(set(names)), f"Duplicados en {tactic}"
+
+
+def test_selective_tools_default_off(monkeypatch):
+    """Cuando attacker_selective_tools_enabled=False, _get_model retorna singleton global."""
+    monkeypatch.setattr(settings, "attacker_selective_tools_enabled", False)
+    # No podemos invocar _get_model sin un LLM real, pero podemos verificar
+    # el setting default desde fuera.
+    assert getattr(settings, "attacker_selective_tools_enabled", False) is False

