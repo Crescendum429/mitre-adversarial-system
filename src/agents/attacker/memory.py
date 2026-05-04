@@ -5,10 +5,18 @@ import json
 import logging
 import os
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Lock para serializar load+modify+save sobre el JSON. Evita lost-write
+# si dos tacticas terminan al mismo tiempo (raro en el grafo actual del
+# atacante que es secuencial, pero defensivo para refactors futuros que
+# paralelicen tacticas — ej: Recon + Initial Access concurrentes en
+# multi-target).
+_MEMORY_LOCK = threading.Lock()
 
 # Path absoluto basado en la ubicacion del modulo (sube 3 niveles: attacker/ →
 # agents/ → src/ → project_root). Evita que la memoria se escriba en lugares
@@ -104,8 +112,12 @@ def load_playbooks() -> dict:
 
 
 def save_playbooks(data: dict) -> None:
+    """Persiste el dict de playbooks. Atomico via tmp+rename para evitar
+    archivo a medio escribir si el proceso muere durante write."""
     MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MEMORY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp = MEMORY_FILE.with_suffix(MEMORY_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(MEMORY_FILE)
 
 
 def lookup_playbook(fingerprint: str, model_id: str = "") -> dict | None:
@@ -134,24 +146,25 @@ def upsert_playbook_recon(
     """
     if not fingerprint:
         return
-    data = load_playbooks()
-    pb = data["playbooks"].setdefault(fingerprint, _new_playbook(target_ip, recon_evidence))
-    pb["last_seen"] = _now()
-    pb["last_target_ip"] = target_ip
-    # Recon key_findings es cross-model (puerto, tech, paths son del target)
-    pb_recon = pb["tactics"].setdefault("reconnaissance", {})
-    prev_best = pb_recon.get("best_run_actions")
-    if prev_best is None or actions_used < prev_best:
-        pb_recon["best_run_actions"] = actions_used
-    pb_recon["key_findings"] = _summarize_recon(recon_evidence)
-    # Per-model: registra acciones del modelo actual
-    if model_id:
-        strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
-        recon_strat = strategies.setdefault("reconnaissance", {})
-        prev = recon_strat.get("best_run_actions")
-        if prev is None or actions_used < prev:
-            recon_strat["best_run_actions"] = actions_used
-    save_playbooks(data)
+    with _MEMORY_LOCK:
+        data = load_playbooks()
+        pb = data["playbooks"].setdefault(fingerprint, _new_playbook(target_ip, recon_evidence))
+        pb["last_seen"] = _now()
+        pb["last_target_ip"] = target_ip
+        # Recon key_findings es cross-model (puerto, tech, paths son del target)
+        pb_recon = pb["tactics"].setdefault("reconnaissance", {})
+        prev_best = pb_recon.get("best_run_actions")
+        if prev_best is None or actions_used < prev_best:
+            pb_recon["best_run_actions"] = actions_used
+        pb_recon["key_findings"] = _summarize_recon(recon_evidence)
+        # Per-model: registra acciones del modelo actual
+        if model_id:
+            strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
+            recon_strat = strategies.setdefault("reconnaissance", {})
+            prev = recon_strat.get("best_run_actions")
+            if prev is None or actions_used < prev:
+                recon_strat["best_run_actions"] = actions_used
+        save_playbooks(data)
 
 
 def record_tactic_success(
@@ -175,49 +188,51 @@ def record_tactic_success(
     """
     if not fingerprint or tactic == "reconnaissance":
         return
-    data = load_playbooks()
-    pb = data["playbooks"].get(fingerprint)
-    if pb is None:
-        return
-    sanitized = _sanitize_args(args)
-    evidence_keys = sorted(k for k in evidence if not k.startswith("_"))
-    # Cross-model: solo sobreescribir si superamos el best
-    entry = pb["tactics"].setdefault(tactic, {})
-    prev_best = entry.get("best_run_actions")
-    if prev_best is None or actions_used < prev_best:
-        entry["tool"] = tool
-        entry["payload_template"] = sanitized
-        entry["evidence_keys"] = evidence_keys
-        entry["best_run_actions"] = actions_used
-    else:
-        # actualizamos solo evidence_keys que sea union de las observadas
-        existing_ek = set(entry.get("evidence_keys", []))
-        entry["evidence_keys"] = sorted(existing_ek | set(evidence_keys))
-    # Per-model: siempre registrar (cada modelo tiene su mejor)
-    if model_id:
-        strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
-        m_entry = strategies.setdefault(tactic, {})
-        prev_m = m_entry.get("best_run_actions")
-        if prev_m is None or actions_used < prev_m:
-            m_entry["tool"] = tool
-            m_entry["payload_template"] = sanitized
-            m_entry["evidence_keys"] = evidence_keys
-            m_entry["best_run_actions"] = actions_used
-    save_playbooks(data)
+    with _MEMORY_LOCK:
+        data = load_playbooks()
+        pb = data["playbooks"].get(fingerprint)
+        if pb is None:
+            return
+        sanitized = _sanitize_args(args)
+        evidence_keys = sorted(k for k in evidence if not k.startswith("_"))
+        # Cross-model: solo sobreescribir si superamos el best
+        entry = pb["tactics"].setdefault(tactic, {})
+        prev_best = entry.get("best_run_actions")
+        if prev_best is None or actions_used < prev_best:
+            entry["tool"] = tool
+            entry["payload_template"] = sanitized
+            entry["evidence_keys"] = evidence_keys
+            entry["best_run_actions"] = actions_used
+        else:
+            # actualizamos solo evidence_keys que sea union de las observadas
+            existing_ek = set(entry.get("evidence_keys", []))
+            entry["evidence_keys"] = sorted(existing_ek | set(evidence_keys))
+        # Per-model: siempre registrar (cada modelo tiene su mejor)
+        if model_id:
+            strategies = pb.setdefault("tool_strategies", {}).setdefault(model_id, {})
+            m_entry = strategies.setdefault(tactic, {})
+            prev_m = m_entry.get("best_run_actions")
+            if prev_m is None or actions_used < prev_m:
+                m_entry["tool"] = tool
+                m_entry["payload_template"] = sanitized
+                m_entry["evidence_keys"] = evidence_keys
+                m_entry["best_run_actions"] = actions_used
+        save_playbooks(data)
 
 
 def record_run_completion(fingerprint: str, all_successful: bool) -> None:
     if not fingerprint:
         return
-    data = load_playbooks()
-    pb = data["playbooks"].get(fingerprint)
-    if pb is None:
-        return
-    pb["run_count"] = pb.get("run_count", 0) + 1
-    if all_successful:
-        pb["successful_runs"] = pb.get("successful_runs", 0) + 1
-        pb["last_full_success"] = _now()
-    save_playbooks(data)
+    with _MEMORY_LOCK:
+        data = load_playbooks()
+        pb = data["playbooks"].get(fingerprint)
+        if pb is None:
+            return
+        pb["run_count"] = pb.get("run_count", 0) + 1
+        if all_successful:
+            pb["successful_runs"] = pb.get("successful_runs", 0) + 1
+            pb["last_full_success"] = _now()
+        save_playbooks(data)
 
 
 def record_tactic_failure(
@@ -235,20 +250,21 @@ def record_tactic_failure(
     """
     if not fingerprint:
         return
-    data = load_playbooks()
-    pb = data["playbooks"].get(fingerprint)
-    if pb is None:
-        return
-    failed = pb.setdefault("failed_tactics", {})
-    entry = failed.setdefault(tactic, {"reasons": [], "attempts": 0})
-    entry["attempts"] = max(int(entry.get("attempts", 0)), int(attempts))
-    reason_short = (reason or "")[:240]
-    if reason_short and reason_short not in entry["reasons"]:
-        entry["reasons"].append(reason_short)
-        # capar a 5 razones para no inflar
-        entry["reasons"] = entry["reasons"][-5:]
-    entry["last_failed"] = _now()
-    save_playbooks(data)
+    with _MEMORY_LOCK:
+        data = load_playbooks()
+        pb = data["playbooks"].get(fingerprint)
+        if pb is None:
+            return
+        failed = pb.setdefault("failed_tactics", {})
+        entry = failed.setdefault(tactic, {"reasons": [], "attempts": 0})
+        entry["attempts"] = max(int(entry.get("attempts", 0)), int(attempts))
+        reason_short = (reason or "")[:240]
+        if reason_short and reason_short not in entry["reasons"]:
+            entry["reasons"].append(reason_short)
+            # capar a 5 razones para no inflar
+            entry["reasons"] = entry["reasons"][-5:]
+        entry["last_failed"] = _now()
+        save_playbooks(data)
 
 
 def render_playbook_for_prompt(pb: dict, current_tactic: str, model_id: str = "") -> str:

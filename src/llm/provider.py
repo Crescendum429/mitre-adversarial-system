@@ -233,19 +233,20 @@ class _InstrumentedChatModel:
             bound = _with_retry(bound)
         else:
             bound = inner.bind_tools(*args, **kwargs)
-        return _InstrumentedChatModel(
-            bound, self._role,
-            USAGE_STATS[self._role]["provider"],
-            USAGE_STATS[self._role]["model"],
-        )
+        # Lectura bajo lock para evitar race con invoke() de otro thread que
+        # reescribe USAGE_STATS[role] (provider/model). El proxy nuevo recibe
+        # snapshot consistente del provider y model.
+        with _USAGE_LOCK:
+            provider_snap = USAGE_STATS[self._role]["provider"]
+            model_snap = USAGE_STATS[self._role]["model"]
+        return _InstrumentedChatModel(bound, self._role, provider_snap, model_snap)
 
     def with_retry(self, *args, **kwargs):
         retried = self._model.with_retry(*args, **kwargs)
-        return _InstrumentedChatModel(
-            retried, self._role,
-            USAGE_STATS[self._role]["provider"],
-            USAGE_STATS[self._role]["model"],
-        )
+        with _USAGE_LOCK:
+            provider_snap = USAGE_STATS[self._role]["provider"]
+            model_snap = USAGE_STATS[self._role]["model"]
+        return _InstrumentedChatModel(retried, self._role, provider_snap, model_snap)
 
     def __getattr__(self, name):
         return getattr(self._model, name)

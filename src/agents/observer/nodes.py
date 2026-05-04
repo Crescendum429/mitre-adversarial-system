@@ -477,8 +477,6 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
                 method = "GET"  # Solr expone via GET en query params; aproximacion
                 body_size = "-"
                 ip = "solr-internal"
-                ip_lower_skip = False
-                # Bypass: caer al codigo principal con esta info
             else:
                 continue
 

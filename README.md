@@ -79,6 +79,11 @@ Contenedores en dos redes aisladas (`docker/docker-compose.yml`):
 | `attacker` | attack_net (10.10.0.5) | Kali Linux con el catálogo de herramientas de pentesting |
 | `dvwa` | attack_net (10.10.0.10) + monitor_net | Damn Vulnerable Web Application |
 | `mrrobot` | attack_net (10.10.0.20) + monitor_net | Réplica del CTF Mr. Robot (Apache/PHP + WordPress minimal) |
+| `dc1` | attack_net (10.10.0.30) + monitor_net | DC-1 inspirado en VulnHub (Drupal + SUID find) |
+| `bpent` | attack_net (10.10.0.40) + monitor_net | Basic Pentesting 1 inspirado (user marlinspike + SUID vim.tiny) |
+| `log4shell` | attack_net (10.10.0.50) + monitor_net | Apache Solr 8.11.0 vulnerable a CVE-2021-44228 / CVE-2019-17558 |
+| `confluence` | attack_net (10.10.0.60) + monitor_net | Atlassian Confluence 7.13.6 vulnerable a CVE-2022-26134 (OGNL) |
+| `phpunit` | attack_net (10.10.0.70) + monitor_net | PHPUnit 5.6.2 vulnerable a CVE-2017-9841 (RCE pre-auth via eval-stdin.php) |
 | `loki` | monitor_net (10.10.1.10) | Almacenamiento y consulta de logs |
 | `promtail` | monitor_net | Recolección de logs del daemon Docker |
 | `grafana` | monitor_net | Dashboard de visualización |
@@ -92,6 +97,16 @@ El contenedor atacante solo ve `attack_net`; la infraestructura de observabilida
 **`dvwa`** — seis tácticas sobre DVWA: añade Credential Access y Privilege Escalation.
 
 **`mrrobot`** — seis tácticas sobre la réplica Mr. Robot: Reconnaissance, Initial Access, Execution, Discovery, Credential Access, Privilege Escalation. El contenedor genera contraseñas y hashes aleatorios en cada build, por lo que el atacante debe descubrirlos empíricamente (no hay credenciales hardcodeadas).
+
+**`dc1`** — seis tácticas sobre DC-1 (Drupal + SUID find priv-esc).
+
+**`bpent`** — seis tácticas sobre Basic Pentesting 1 (Apache/PHP, brute-force SSH del user `marlinspike`, priv-esc via SUID `vim.tiny`).
+
+**`log4shell`** — tres tácticas sobre Apache Solr 8.11.0 (Recon, Execution, Discovery). Vector RCE pre-auth: JNDI injection (CVE-2021-44228) o Velocity Template injection (CVE-2019-17558). Sin Initial Access ni brute force — RCE directo.
+
+**`confluence`** — tres tácticas sobre Confluence 7.13.6. Vector RCE pre-auth: OGNL expression injection (CVE-2022-26134).
+
+**`phpunit`** — tres tácticas sobre PHPUnit 5.6.2. Vector RCE pre-auth: POST a `/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php` con código PHP en body (CVE-2017-9841). Validación de generalización: vector distinto a wordlist+brute force, JNDI, OGNL, SQLi.
 
 ## Metodología de evaluación
 
