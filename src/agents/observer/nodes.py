@@ -33,7 +33,6 @@ from src.agents.observer.collectors import LogCollector
 from src.agents.observer.memory import (
     compute_traffic_fingerprint,
     get_prior,
-    update_baseline,
 )
 from src.agents.observer.prompts import OBSERVER_SYSTEM_PROMPT, build_classification_prompt
 from src.agents.observer.state import Classification, ObserverState
@@ -48,6 +47,7 @@ _model = None
 
 # Contadores por nodo para reportar al final de la corrida.
 import threading as _threading
+
 OBSERVER_NODE_STATS = {
     "collect_calls": 0,
     "triage_signal": 0,
@@ -161,9 +161,13 @@ _OGNL_CONFLUENCE_RE = re.compile(
 # caracteres entre () y {.
 _SHELLSHOCK_EXTENDED_RE = re.compile(r"\(\s*\)\s*\{[^}]{0,20}\}[\s;]", re.IGNORECASE)
 
-# Apache Solr Velocity RCE (CVE-2019-17558): params.resource.loader.enabled=true
+# Apache Solr Velocity RCE (CVE-2019-17558): params.resource.loader.enabled=true.
+# Tambien capturamos el endpoint tipico /solr/<core>/select?wt=velocity (la
+# explotacion publica usa wt=velocity con un Velocity template inline).
 _SOLR_VELOCITY_RE = re.compile(
-    r"params\.resource\.loader\.enabled|VelocityResponseWriter",
+    r"params\.resource\.loader\.enabled"
+    r"|VelocityResponseWriter"
+    r"|/solr/[^/?]+/[^?]*\?[^ ]*wt=velocity",
     re.IGNORECASE,
 )
 
@@ -192,8 +196,20 @@ _TRIAGE_404_MIN = 8
 # para evitar acumulacion infinita de estado.
 _SUSPECT_TTL_WINDOWS = 5
 
-# Marcadores SQLi compartidos entre triage y detect
-_SQLI_MARKERS = ("' or", "1=1", "union select", "sleep(", "%27")
+# Marcadores SQLi compartidos entre triage y detect. Cubre payloads clasicos
+# (' or 1=1, UNION SELECT, sleep()) y variantes ofuscadas: comentarios inline
+# (UNION/**/SELECT) usados por sqlmap, comilla URL-encoded (%27), boolean
+# blind con SLEEP/BENCHMARK, y waitfor delay (MSSQL). El match se hace tras
+# urllib.parse.unquote() del URL para capturar payloads URL-encoded.
+_SQLI_MARKERS = (
+    "' or", "1=1", "union select", "union all select",
+    "union/**/select", "union%20select",
+    "sleep(", "benchmark(", "waitfor delay",
+    "' and", " and 1=", " or 1=",
+    "%27", "%20or%20", "%20union%20", "%2520",
+    "drop table", "into outfile", "load_file(",
+    "information_schema",
+)
 
 
 # Patrones de comandos webshell ordenados por especificidad. El primer match
@@ -459,14 +475,23 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
         # CVE-specific injection signatures en URL o User-Agent.
         # Ref: CVE-2021-44228 (Log4Shell), CVE-2017-5638 (Struts2),
         # CVE-2022-26134 (Confluence), CVE-2019-17558 (Solr), CVE-2022-22965 (Spring).
+        # Buscamos tanto en la version cruda (UA suele venir plaintext) como en
+        # la URL-decoded — los exploits comunmente envian payloads encoded como
+        # %24%7bjndi:ldap... que solo matchean tras unquote.
         full_request = f"{url} {user_agent}"
-        if _LOG4SHELL_RE.search(full_request):
+        try:
+            full_request_decoded = f"{unquote(url)} {user_agent}"
+        except Exception:
+            full_request_decoded = full_request
+        if _LOG4SHELL_RE.search(full_request) or _LOG4SHELL_RE.search(full_request_decoded):
             profile["log4shell_attempts"] += 1
-        if _OGNL_RE.search(full_request) or _OGNL_CONFLUENCE_RE.search(full_request):
+        if (_OGNL_RE.search(full_request) or _OGNL_CONFLUENCE_RE.search(full_request)
+                or _OGNL_RE.search(full_request_decoded)
+                or _OGNL_CONFLUENCE_RE.search(full_request_decoded)):
             profile["ognl_attempts"] += 1
-        if _SOLR_VELOCITY_RE.search(full_request):
+        if _SOLR_VELOCITY_RE.search(full_request) or _SOLR_VELOCITY_RE.search(full_request_decoded):
             profile["solr_velocity_attempts"] += 1
-        if _SPRING4SHELL_RE.search(full_request):
+        if _SPRING4SHELL_RE.search(full_request) or _SPRING4SHELL_RE.search(full_request_decoded):
             profile["spring4shell_attempts"] += 1
 
         # Webshell/RCE detection. Dos modos:
@@ -517,7 +542,15 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
             else:
                 profile["login_failed"] += 1
 
-        if any(marker in url_lower for marker in _SQLI_MARKERS):
+        # SQLi detection contra version decodificada — sqlmap envia payloads
+        # URL-encoded (' = %27, espacios = %20 o +) que serian invisibles si
+        # solo miramos url_lower crudo.
+        try:
+            url_decoded_lower = unquote(url).lower()
+        except Exception:
+            url_decoded_lower = url_lower
+        if any(marker in url_decoded_lower or marker in url_lower
+               for marker in _SQLI_MARKERS):
             profile["sqli_attempts"] += 1
 
         if method == "POST" and any(p in url_lower for p in _SENSITIVE_POST_PATHS):

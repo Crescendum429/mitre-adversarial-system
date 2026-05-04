@@ -1,7 +1,6 @@
 """Tests del sistema de memoria persistente del atacante."""
 
 import json
-import os
 import tempfile
 from pathlib import Path
 

@@ -5,7 +5,6 @@ estos tests aseguran que la baseline es estable, no contamina entre targets
 distintos, y se actualiza correctamente.
 """
 
-from pathlib import Path
 
 import pytest
 

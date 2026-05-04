@@ -5,7 +5,6 @@ demandan que tacticas caras requieran mayor confianza y que un prior alto
 relaje el umbral.
 """
 
-import pytest
 
 from src.agents.observer import calibration
 

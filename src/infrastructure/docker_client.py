@@ -17,9 +17,9 @@ import threading
 import time
 from dataclasses import dataclass
 
-import docker
 from docker.errors import APIError, ContainerError, NotFound
 
+import docker
 from src.config.settings import settings
 
 logger = logging.getLogger(__name__)

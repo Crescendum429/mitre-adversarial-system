@@ -5,7 +5,6 @@ rechazan evidencia falsa (hallucination del LLM) y aceptan solo evidencia
 observable. Cada test documenta un escenario con su resultado esperado.
 """
 
-import pytest
 
 from src.agents.attacker.objectives import (
     _extract_cracked_password,
@@ -15,11 +14,9 @@ from src.agents.attacker.objectives import (
     verify_credential_access,
     verify_discovery,
     verify_execution,
-    verify_initial_access,
     verify_privilege_escalation,
     verify_reconnaissance,
 )
-
 
 # ---------------------------------------------------------------------------
 # _is_login_success: bug critico que antes aceptaba 302→login como exito

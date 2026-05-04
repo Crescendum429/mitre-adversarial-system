@@ -77,10 +77,11 @@ def preflight_llm_check() -> None:
     """
     if not settings.preflight_check_enabled:
         return
-    from src.llm.provider import get_chat_model, get_observer_model
+    from langchain_core.messages import HumanMessage, SystemMessage
+
     from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT
     from src.agents.observer.prompts import OBSERVER_SYSTEM_PROMPT
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from src.llm.provider import get_chat_model, get_observer_model
 
     targets = [
         ("atacante", get_chat_model, ATTACKER_SYSTEM_PROMPT.format(target_ip="10.10.0.10")),
@@ -935,10 +936,10 @@ def print_timing_summary(
     - Loki HTTP query stats (n queries, latencia total, errores).
     - Tiempo por componente y throughput estimado del observer.
     """
-    from src.llm.provider import USAGE_STATS
+    from src.agents.observer.nodes import OBSERVER_NODE_STATS
     from src.infrastructure.docker_client import DOCKER_STATS
     from src.infrastructure.loki_client import LOKI_STATS
-    from src.agents.observer.nodes import OBSERVER_NODE_STATS
+    from src.llm.provider import USAGE_STATS
 
     attacker_s = float(attacker_state.get("attacker_elapsed_seconds", 0.0) or 0.0)
     latencies_ms = [
@@ -1442,9 +1443,9 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
     """Genera reporte HTML + JSON post-run con todos los eventos capturados."""
     if args.no_report:
         return
-    from src.llm.provider import USAGE_STATS
     from src.infrastructure.docker_client import DOCKER_STATS
     from src.infrastructure.loki_client import LOKI_STATS
+    from src.llm.provider import USAGE_STATS
 
     session = get_session()
     fp = attacker_state.get("target_fingerprint", "") or ""

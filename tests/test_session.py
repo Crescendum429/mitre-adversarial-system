@@ -3,8 +3,6 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from src.ui.session import SessionRecorder, get_session
 
 

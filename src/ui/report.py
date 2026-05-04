@@ -21,7 +21,6 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-
 _CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -165,13 +164,13 @@ def _format_payload_short(event_type: str, payload: dict) -> str:
     if event_type == "refine":
         return f"refinement #{payload.get('count', 0)}"
     if event_type == "window_start":
-        return f"ventana iniciada"
+        return "ventana iniciada"
     if event_type == "window_end":
-        return f"ventana cerrada"
+        return "ventana cerrada"
     if event_type == "session_start":
         return f"<b>sesion iniciada</b>: {_esc(payload.get('scenario', '?'))}"
     if event_type == "session_end":
-        return f"<b>sesion finalizada</b>"
+        return "<b>sesion finalizada</b>"
     if event_type == "error":
         return f"<span style='color:#f85149'>error: {_esc(payload.get('message', ''))}</span>"
     return _esc(event_type)

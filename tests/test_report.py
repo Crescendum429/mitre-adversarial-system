@@ -2,8 +2,6 @@
 
 from pathlib import Path
 
-import pytest
-
 from src.ui.report import generate_report
 from src.ui.session import SessionRecorder
 

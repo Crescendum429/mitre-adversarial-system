@@ -520,7 +520,6 @@ def run_spider(
     Returns:
         Lista de URLs encontradas junto con titulos y forms detectados.
     """
-    cookie_arg = f"-b '{cookies}'" if cookies else ""
     host = url.split("/")[2] if "://" in url else url.split("/")[0]
     script = f"""
 set -e
@@ -930,7 +929,7 @@ def run_priv_esc_enum(webshell_url: str, mode: str = "quick") -> str:
         marker = f"===== {cmd[:60]} ====="
         combined.append(f"echo '{marker}'; {cmd}; echo")
     script = " ; ".join(combined)
-    encoded = urllib.parse.quote(script)
+    urllib.parse.quote(script)
 
     parts = urllib.parse.urlsplit(webshell_url)
     query_params = dict(urllib.parse.parse_qsl(parts.query, keep_blank_values=True))

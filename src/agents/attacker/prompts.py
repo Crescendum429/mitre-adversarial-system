@@ -611,6 +611,21 @@ def build_tactic_prompt(
             f"Adapta tu enfoque para cubrir especificamente lo que falta."
         )
 
+    # Reflector (RefPentester-style, Chen et al. 2025): tras N+ replans en la
+    # misma tactica, inyectamos un bloque de reflexion estructurada que pide
+    # al LLM razonar sobre patrones de fallo en vez de solo retocar args. La
+    # razon de no hacerlo desde el primer replan: los primeros 1-2 intentos
+    # tipicamente se resuelven con feedback puntual; el bucle solo aparece
+    # despues — disparar la reflexion antes desperdicia tokens.
+    try:
+        from src.config.settings import settings as _s
+        reflector_on = bool(getattr(_s, "reflector_enabled", True))
+        trigger = int(getattr(_s, "reflector_trigger_attempts", 3))
+    except Exception:
+        reflector_on, trigger = True, 3
+    if reflector_on and replan_attempt >= trigger:
+        parts.append(_render_reflection_block(replan_attempt, recent_actions or []))
+
     parts.append(
         "\nRazona paso a paso sobre los datos actuales y ejecuta la siguiente accion. "
         "Cuando el criterio se cumpla con evidencia real, declara la tactica completa "
@@ -618,6 +633,39 @@ def build_tactic_prompt(
     )
 
     return "\n".join(parts)
+
+
+def _render_reflection_block(replan_attempt: int, recent_actions: list[dict]) -> str:
+    """Bloque de reflexion estructurada inyectado tras N replans fallidos.
+
+    Sigue el patron de RefPentester (arXiv:2505.07089): forzar al LLM a hacer
+    explicito el analisis de fallos previos antes de proponer una nueva accion.
+    El bloque NO ejecuta otra llamada al LLM; reusa el plan_tactic existente
+    pero con prompt aumentado.
+    """
+    head = (
+        f"\n[REFLEXION — {replan_attempt} intentos previos sin exito]\n"
+        "Antes de proponer la siguiente accion, RAZONA por escrito sobre estos puntos:\n"
+        "  1. Patrones de fallo: ¿que tienen en comun los intentos previos? "
+        "(misma tool, mismos args, mismo endpoint, mismo error)\n"
+        "  2. Supuesto cuestionable: ¿que asumiste que podria estar mal? "
+        "(target tech stack, ruta del recurso, formato del payload)\n"
+        "  3. Cambio cualitativo: ¿que probarias DISTINTO? (otra tool, otro vector, "
+        "otra hipotesis sobre el target). Evita solo retocar flags.\n"
+        "  4. Decision: si el cambio cualitativo no esta claro, declara la tactica "
+        "fallida con texto explicativo en vez de seguir replanificando ciegamente.\n"
+    )
+    if not recent_actions:
+        return head
+    # Resumen compacto de las ultimas tools invocadas para ayudar al razonamiento.
+    seen: list[str] = []
+    for a in recent_actions:
+        tool = (a.get("technique") or a.get("tool") or "?")[:40]
+        if tool and tool not in seen:
+            seen.append(tool)
+    if seen:
+        head += "\nTools usadas en intentos recientes: " + ", ".join(seen[:6]) + "\n"
+    return head
 
 
 def _format_collected_data(data: dict) -> str:

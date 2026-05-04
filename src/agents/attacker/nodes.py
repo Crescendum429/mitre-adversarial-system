@@ -5,7 +5,13 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from rich.console import Console
 
 from src.agents.attacker.memory import (
@@ -18,12 +24,11 @@ from src.agents.attacker.memory import (
 )
 from src.agents.attacker.objectives import check_tactic_objective, scan_for_flags
 from src.agents.attacker.prompts import ATTACKER_SYSTEM_PROMPT, build_tactic_prompt
-from src.llm.provider import make_cacheable_system_content
 from src.agents.attacker.state import AttackerState
 from src.agents.attacker.tools import ATTACKER_TOOLS
 from src.config.mitre_mapping import get_tactic_by_name
 from src.config.settings import settings
-from src.llm.provider import get_chat_model
+from src.llm.provider import get_chat_model, make_cacheable_system_content
 from src.ui.session import get_session
 
 logger = logging.getLogger(__name__)

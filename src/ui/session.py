@@ -34,7 +34,7 @@ Tipos de eventos registrados (event_type):
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable

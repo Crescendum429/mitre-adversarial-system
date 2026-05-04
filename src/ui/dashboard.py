@@ -21,7 +21,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -154,7 +154,7 @@ class LiveDashboard:
         elapsed_str = f"{h:d}h {m:02d}m {s:02d}s" if h else f"{m:d}m {s:02d}s"
 
         text = Text()
-        text.append(f"Scenario: ", style="dim")
+        text.append("Scenario: ", style="dim")
         text.append(f"{self.scenario}", style="bold cyan")
         text.append("  |  Target: ", style="dim")
         text.append(self.target, style="bold yellow")
@@ -236,7 +236,7 @@ class LiveDashboard:
         if et == "memory_match":
             return f"🧠 fp={_short(p.get('fingerprint', ''), 12)} ({p.get('runs_previas', 0)} runs)"
         if et == "memory_save":
-            return f"💾 playbook actualizado"
+            return "💾 playbook actualizado"
         if et == "triage":
             return f"triage: {p.get('result', '?')} ({p.get('signals_count', 0)} señales)"
         if et == "classify":

@@ -20,7 +20,6 @@ from langchain_core.language_models import BaseChatModel
 
 from src.config.settings import LLMProvider, settings
 
-
 # Pricing por 1M tokens (USD), valores 2026-01 publicados por los providers.
 # Tupla: (input, output, cache_read_discount, cache_write_premium).
 # cache_read_discount es factor de input (Anthropic: 0.1, OpenAI: 0.5);
@@ -168,11 +167,17 @@ def _extract_usage(response) -> tuple[int, int, int, int]:
         out_t = int(gum.get("candidates_token_count") or 0)
         if in_t or out_t:
             return in_t, out_t, 0, 0
-    # Last resort: log debug para que sea visible si todos los paths fallaron
+    # Si llegamos aqui ningun path produjo tokens. En vez de silenciar como
+    # 0/0/0/0 (lo que hace que el costo USD del rol salga en $0), emitimos
+    # warning visible — un escenario tipico de regresion silenciosa cuando un
+    # SDK cambia el shape del response. El caller sigue recibiendo ceros para
+    # no romper la suma, pero el log queda en el reporte.
     import logging as _logging
-    _logging.getLogger(__name__).debug(
-        f"No usage extraido de {type(response).__name__}; "
-        f"meta keys={list(meta.keys()) if isinstance(meta, dict) else 'N/A'}"
+    _logging.getLogger(__name__).warning(
+        "extract_usage: ningun path produjo tokens. "
+        f"response={type(response).__name__}; "
+        f"meta_keys={list(meta.keys()) if isinstance(meta, dict) else 'N/A'}; "
+        f"usage_keys={list(usage.keys()) if isinstance(usage, dict) else 'N/A'}"
     )
     return 0, 0, 0, 0
 
@@ -234,19 +239,76 @@ class _InstrumentedChatModel:
         return getattr(self._model, name)
 
 
+def _is_transient_error(exc: BaseException) -> bool:
+    """Heuristica para clasificar si un error es transitorio y vale reintentar.
+
+    Contrato: True si la operacion deberia reintentarse. False si el error es
+    permanente (auth, payload, schema). El caller cubre los SDK-specific
+    classes en retry_types ademas de esta funcion (aplicada a Exception base
+    como ultima red).
+
+    No se reintenta:
+      - 4xx semanticos: 400 (bad request), 401/403 (auth), 404 (not found),
+        413 (payload too large), 422 (validation).
+      - context_overflow / max_tokens / token limit (mensaje explicito).
+    Se reintenta:
+      - 5xx: 500, 502, 503, 504, 529 (Anthropic overload).
+      - 408 (timeout).
+      - 429 (rate limit) — cubierto por SDK classes pero por si llega como
+        HTTPStatusError generico.
+      - Connection errors, read timeout, DNS, etc.
+    """
+    msg = str(exc).lower()
+    permanent = (
+        " 400", "bad request", " 401", "unauthorized",
+        " 403", "forbidden", " 404", "not found",
+        " 413", "payload too large", " 422",
+        "context_length_exceeded", "context window",
+        "max_tokens", "context_overflow",
+    )
+    if any(m in msg for m in permanent):
+        return False
+    transient = (
+        " 408", "timeout", " 429", "rate limit", "rate_limit",
+        "too many requests",
+        " 500", " 502", " 503", " 504", " 529",
+        "overloaded", "server error", "service unavailable",
+        "connection", "remotedisconnected", "read timed out",
+        "tlsv1_alert", "ssl",
+    )
+    return any(m in msg for m in transient)
+
+
 def _with_retry(model: BaseChatModel) -> BaseChatModel:
-    """Envuelve un modelo con reintentos exponenciales ante errores transitorios."""
+    """Envuelve un modelo con reintentos exponenciales ante errores transitorios.
+
+    Cubre SDK-specific exception classes (OpenAI, Anthropic) y, como red mas
+    amplia, httpx.HTTPStatusError filtrado por status code transitorio. La
+    decision permanent-vs-transient se delega a `_is_transient_error` para
+    que un 413 o 422 NO consuma 8 reintentos.
+    """
     retry_types: list = []
     try:
-        from openai import APIConnectionError, APITimeoutError, RateLimitError
-        retry_types.extend([APIConnectionError, APITimeoutError, RateLimitError])
+        from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+        retry_types.extend([APIConnectionError, APITimeoutError, RateLimitError, InternalServerError])
     except Exception:
         pass
     try:
         from anthropic import APIConnectionError as AnthropicConnErr
         from anthropic import APITimeoutError as AnthropicTimeoutErr
+        from anthropic import InternalServerError as AnthropicInternalErr
         from anthropic import RateLimitError as AnthropicRateErr
-        retry_types.extend([AnthropicConnErr, AnthropicTimeoutErr, AnthropicRateErr])
+        retry_types.extend([AnthropicConnErr, AnthropicTimeoutErr, AnthropicRateErr, AnthropicInternalErr])
+    except Exception:
+        pass
+    try:
+        import httpx
+        # httpx.HTTPStatusError cubre OpenRouter/Cerebras/Groq cuando el
+        # gateway responde 5xx — los SDKs underlying los pasan tal cual.
+        retry_types.append(httpx.HTTPStatusError)
+        retry_types.append(httpx.RemoteProtocolError)
+        retry_types.append(httpx.ReadTimeout)
+        retry_types.append(httpx.ConnectError)
     except Exception:
         pass
     if not retry_types:
@@ -427,11 +489,17 @@ def make_cacheable_system_content(text: str, role: str = "attacker") -> "str | l
     else:
         provider = settings.llm_provider
     if provider == LLMProvider.ANTHROPIC:
+        cache_control: dict = {"type": "ephemeral"}
+        # Extended cache (1h) opt-in. Anthropic acepta `ttl: "1h"` en bloques
+        # ephemeral cuando el header beta `extended-cache-ttl-2025-04-11`
+        # esta habilitado. langchain_anthropic lo pasa transparentemente.
+        if getattr(settings, "anthropic_cache_ttl_extended", False):
+            cache_control["ttl"] = "1h"
         return [
             {
                 "type": "text",
                 "text": text,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": cache_control,
             }
         ]
     return text

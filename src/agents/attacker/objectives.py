@@ -697,10 +697,9 @@ def verify_privilege_escalation(state: dict) -> tuple[bool, str, dict]:
     """
     actions = _get_tactic_actions(state, "privilege_escalation")
     evidence = {}
-    missing = []
 
     real_exec_actions = _real_execution_actions(actions)
-    all_out = _all_outputs(real_exec_actions)
+    _all_outputs(real_exec_actions)
 
     # Suma el contexto historico de todas las tacticas. Incluye tanto outputs
     # como commands porque el path a /root/file.txt aparece en el command

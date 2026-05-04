@@ -1,11 +1,9 @@
 """Tests para las cuatro mejoras post-cierre: caching, thinking, loop detection, preflight."""
 
-import json
 
 import pytest
 
 from src.config.settings import LLMProvider, settings
-
 
 # ---------- M1: Anthropic prompt caching ----------
 
@@ -44,6 +42,27 @@ def test_make_cacheable_observer_role_uses_observer_provider(monkeypatch):
     out = make_cacheable_system_content("p", role="observer")
     assert isinstance(out, list)
     assert out[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_make_cacheable_extended_ttl_when_enabled(monkeypatch):
+    """1h cache opt-in: cache_control debe incluir ttl='1h'."""
+    monkeypatch.setattr(settings, "prompt_caching_enabled", True)
+    monkeypatch.setattr(settings, "llm_provider", LLMProvider.ANTHROPIC)
+    monkeypatch.setattr(settings, "anthropic_cache_ttl_extended", True)
+    from src.llm.provider import make_cacheable_system_content
+    out = make_cacheable_system_content("hello", role="attacker")
+    assert isinstance(out, list)
+    assert out[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_make_cacheable_default_ttl_5min(monkeypatch):
+    """Sin opt-in, no debe aparecer ttl en cache_control (default 5min)."""
+    monkeypatch.setattr(settings, "prompt_caching_enabled", True)
+    monkeypatch.setattr(settings, "llm_provider", LLMProvider.ANTHROPIC)
+    monkeypatch.setattr(settings, "anthropic_cache_ttl_extended", False)
+    from src.llm.provider import make_cacheable_system_content
+    out = make_cacheable_system_content("hello", role="attacker")
+    assert "ttl" not in out[0]["cache_control"]
 
 
 # ---------- M2: Extended thinking opt-in ----------
@@ -121,7 +140,7 @@ def test_build_model_openai_gpt4_ignores_reasoning_effort(monkeypatch):
 
 def test_loop_detection_disabled(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", False)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     sig = _action_signature("run_nmap", {"target": "10.10.0.10"})
     history = [{"technique": "run_nmap", "command": '{"target": "10.10.0.10"}'}] * 5
     assert _is_loop(history, sig) is False
@@ -131,7 +150,7 @@ def test_loop_detection_triggers_on_3_repetitions(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 6)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     sig = _action_signature("run_gobuster", {"url": "x", "wordlist": "rockyou"})
     history = [
         {"technique": "run_gobuster", "command": '{"url": "x", "wordlist": "rockyou"}'},
@@ -146,7 +165,7 @@ def test_loop_detection_distinguishes_targets(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 6)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     # Diferentes URLs primarias = NO es loop
     sig = _action_signature("run_gobuster", {"url": "http://A", "wordlist": "rockyou"})
     history = [
@@ -161,7 +180,7 @@ def test_loop_detection_collapses_secondary_args(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 6)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     sig = _action_signature("run_gobuster", {"url": "http://X", "wordlist": "small"})
     history = [
         {"technique": "run_gobuster", "command": '{"url": "http://X", "wordlist": "rockyou"}'},
@@ -176,7 +195,7 @@ def test_loop_detection_url_canonicalization(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 6)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     sig = _action_signature("run_curl", {"url": "http://10.10.0.10/", "method": "GET"})
     history = [
         {"technique": "run_curl", "command": '{"url": "HTTP://10.10.0.10", "method": "GET"}'},
@@ -189,7 +208,7 @@ def test_loop_detection_only_within_window(monkeypatch):
     monkeypatch.setattr(settings, "loop_detection_enabled", True)
     monkeypatch.setattr(settings, "loop_detection_window", 3)
     monkeypatch.setattr(settings, "loop_detection_threshold", 3)
-    from src.agents.attacker.nodes import _is_loop, _action_signature
+    from src.agents.attacker.nodes import _action_signature, _is_loop
     sig = _action_signature("run_nmap", {"target": "10.10.0.10"})
     # 2 matches en hace mucho, ventana=3 los descarta
     history = [
@@ -308,3 +327,86 @@ def test_preflight_aborts_on_failure(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         preflight_llm_check()
     assert exc.value.code == 2
+
+
+# ---------- Reflector node (RefPentester style) ----------
+
+def test_reflector_not_triggered_below_threshold(monkeypatch):
+    """attempts < 3 (default trigger): no aparece bloque de reflexion."""
+    monkeypatch.setattr(settings, "reflector_enabled", True)
+    monkeypatch.setattr(settings, "reflector_trigger_attempts", 3)
+    from src.agents.attacker.prompts import build_tactic_prompt
+    out = build_tactic_prompt(
+        "reconnaissance", "10.10.0.10", {},
+        objective_feedback="incompleto", replan_attempt=2,
+    )
+    assert "[REFLEXION" not in out
+
+
+def test_reflector_triggered_at_threshold(monkeypatch):
+    """attempts >= 3: bloque de reflexion presente."""
+    monkeypatch.setattr(settings, "reflector_enabled", True)
+    monkeypatch.setattr(settings, "reflector_trigger_attempts", 3)
+    from src.agents.attacker.prompts import build_tactic_prompt
+    out = build_tactic_prompt(
+        "reconnaissance", "10.10.0.10", {},
+        objective_feedback="aun no completo", replan_attempt=3,
+        recent_actions=[
+            {"technique": "run_nmap", "command": "{}"},
+            {"technique": "run_nmap", "command": "{}"},
+            {"technique": "run_nmap", "command": "{}"},
+        ],
+    )
+    assert "[REFLEXION" in out
+    assert "Patrones de fallo" in out
+    assert "Cambio cualitativo" in out
+    # Resumen de tools usadas debe incluir run_nmap
+    assert "run_nmap" in out
+
+
+def test_reflector_disabled_via_setting(monkeypatch):
+    monkeypatch.setattr(settings, "reflector_enabled", False)
+    from src.agents.attacker.prompts import build_tactic_prompt
+    out = build_tactic_prompt(
+        "execution", "10.10.0.10", {},
+        objective_feedback="x", replan_attempt=10,
+    )
+    assert "[REFLEXION" not in out
+
+
+# ---------- Retry transient classifier ----------
+
+def test_is_transient_5xx():
+    from src.llm.provider import _is_transient_error
+    assert _is_transient_error(Exception("HTTP 502 Bad Gateway"))
+    assert _is_transient_error(Exception("503 Service Unavailable"))
+    assert _is_transient_error(Exception("504 Gateway Timeout"))
+    assert _is_transient_error(Exception("HTTP 500 Internal Server Error"))
+
+
+def test_is_transient_rate_limit():
+    from src.llm.provider import _is_transient_error
+    assert _is_transient_error(Exception("HTTP 429 rate limit exceeded"))
+    assert _is_transient_error(Exception("Too many requests"))
+
+
+def test_is_not_transient_4xx_permanent():
+    from src.llm.provider import _is_transient_error
+    assert not _is_transient_error(Exception("HTTP 400 bad request"))
+    assert not _is_transient_error(Exception("HTTP 401 unauthorized"))
+    assert not _is_transient_error(Exception("HTTP 403 forbidden"))
+    assert not _is_transient_error(Exception("HTTP 404 not found"))
+    assert not _is_transient_error(Exception("HTTP 413 payload too large"))
+
+
+def test_is_not_transient_context_overflow():
+    from src.llm.provider import _is_transient_error
+    assert not _is_transient_error(Exception("context_length_exceeded"))
+    assert not _is_transient_error(Exception("max_tokens reached"))
+
+
+def test_is_transient_connection_errors():
+    from src.llm.provider import _is_transient_error
+    assert _is_transient_error(Exception("Connection refused"))
+    assert _is_transient_error(Exception("RemoteDisconnected"))
+    assert _is_transient_error(Exception("Read timed out"))

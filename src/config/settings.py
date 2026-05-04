@@ -98,6 +98,24 @@ class Settings(BaseSettings):
     # prompts >=1024 tokens identicos. Google no expone caching control.
     prompt_caching_enabled: bool = True
 
+    # Cache TTL extendido (Anthropic 1h cache, beta extended-cache-ttl-2025).
+    # Default 5min (False) cubre la mayoria de corridas dvwa (<5min). Para
+    # corridas largas (mrrobot, dc1, log4shell, bpent) que duran >5min, el
+    # cache 5min se invalida y se paga el premium (1.25x) repetidamente.
+    # 1h cache cuesta 2x premium en write pero solo se paga UNA vez por
+    # corrida; en runs >10min suele ahorrar costo neto.
+    anthropic_cache_ttl_extended: bool = False
+
+    # Reflector node (RefPentester style, Chen et al. arXiv:2505.07089).
+    # Si el atacante falla N+ replans en la misma tactica, el siguiente
+    # plan_tactic incluye un bloque de "reflexion estructurada" que invita
+    # al LLM a listar intentos previos, identificar patrones recurrentes
+    # y proponer un cambio cualitativo de enfoque (no solo retocar args).
+    # Bajo costo (~ +500 tokens al prompt cuando se dispara) — alto valor
+    # cuando el replan se atasca en bucles superficiales.
+    reflector_enabled: bool = True
+    reflector_trigger_attempts: int = 3
+
     # Extended thinking de Anthropic (Sonnet 4.5+, Opus 4.x). Mejora multi-step
     # reasoning a costa de output tokens adicionales. Default off para
     # reproducibilidad y costo controlado. Activar via env para ablation.

@@ -2,10 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from src.evaluation.metrics import (
-    EvaluationReport,
     TacticMetrics,
     _match,
     _normalize,

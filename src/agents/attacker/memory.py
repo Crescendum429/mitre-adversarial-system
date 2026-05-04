@@ -305,11 +305,11 @@ def render_playbook_for_prompt(pb: dict, current_tactic: str, model_id: str = ""
         tool = tactic_entry.get("tool", "?")
         payload = tactic_entry.get("payload_template", {})
         best = tactic_entry.get("best_run_actions", "?")
-        lines.append(f"")
+        lines.append("")
         lines.append(f"En esta táctica ({current_tactic}) funcionó ({source_label}):")
         lines.append(f"  Tool: {tool}")
         if payload:
-            lines.append(f"  Argumentos sugeridos:")
+            lines.append("  Argumentos sugeridos:")
             for k, v in payload.items():
                 v_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
                 if len(v_str) > 200:
@@ -319,7 +319,7 @@ def render_playbook_for_prompt(pb: dict, current_tactic: str, model_id: str = ""
     else:
         completed = sorted(t for t in pb.get("tactics", {}) if t != "reconnaissance")
         if completed:
-            lines.append(f"")
+            lines.append("")
             lines.append(f"Tácticas previamente exitosas en este target: {', '.join(completed)}")
             lines.append("Esta táctica ({}) no tiene playbook todavía.".format(current_tactic))
     return "\n".join(lines)
