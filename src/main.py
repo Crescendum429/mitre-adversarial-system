@@ -137,6 +137,7 @@ def verify_infrastructure(scenario: str = "basic"):
         "bpent": base + ["bpent"],
         "log4shell": base + ["log4shell"],
         "confluence": base + ["confluence", "confluence-db"],
+        "phpunit": base + ["phpunit"],
     }
     required = scenario_containers.get(scenario, base + ["dvwa"])
     missing = [name for name in required if not dc.is_container_running(name)]
@@ -1302,6 +1303,18 @@ def main():
                 "discovery",
             ],
             "target": "10.10.0.60",
+        },
+        # PHPUnit CVE-2017-9841 — RCE pre-auth via eval-stdin.php. Vector
+        # web puro (single POST request) distinto a JNDI/Velocity/SQLi/CMD
+        # injection ya cubiertos. Escenario para test de generalizacion del
+        # sistema sin overfitting a vectores conocidos.
+        "phpunit": {
+            "tactics": [
+                "reconnaissance",
+                "execution",
+                "discovery",
+            ],
+            "target": "10.10.0.70",
         },
         "full": {
             "tactics": [

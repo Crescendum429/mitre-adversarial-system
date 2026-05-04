@@ -159,6 +159,36 @@ services:
           memory: 2G
 
   # ---------------------------------------------------------------------------
+  # PHPUnit 5.6.2 (CVE-2017-9841): RCE pre-auth via eval-stdin.php.
+  # Vector: POST a /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php con
+  # codigo PHP en body — el archivo evalua el body como PHP (residuo de un
+  # helper interno que nunca debio quedar publico). Single request RCE.
+  # Util para validar generalizacion: vector distinto a wordlist+brute force
+  # (mrrobot/dc1/bpent), distinto a JNDI/Velocity (log4shell), distinto a
+  # SQLi/CommandInjection (dvwa). Aporta diversidad al benchmark sin sumar
+  # complejidad operativa al lab.
+  # Imagen oficial vulhub. Puerto 80 expuesto a la red attack_net.
+  # ---------------------------------------------------------------------------
+  phpunit:
+    image: vulhub/phpunit:5.6.2
+    container_name: phpunit
+    hostname: phpunit
+    networks:
+      attack_net:
+        ipv4_address: 10.10.0.70
+      monitor_net:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        tag: "phpunit"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ---------------------------------------------------------------------------
   # Atlassian Confluence 7.13.6 (CVE-2022-26134): OGNL injection RCE.
   # Vector: payload OGNL en URI, output regresa en header X-Cmd-Response.
   # Clase distinta de ataque — expression injection (no command injection).

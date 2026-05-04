@@ -44,5 +44,10 @@ external/
 data/attack_playbooks.json
 data/benchmark_*.json
 
+# Reports de corridas: artefactos HTML/JSON post-mortem, no son codigo
+# funcional. Se conservan localmente para evidencia empirica de la tesis
+# pero no van al repo (regenerables con python -m src.main).
+data/reports/
+
 .DS_Store
 Thumbs.db
