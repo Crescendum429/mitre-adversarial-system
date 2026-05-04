@@ -459,8 +459,13 @@ def _format_signals(signals: dict) -> str:
             sub_ts = data.get("webshell_sub_tactics", [])
             sub_str = ""
             if sub_ts:
+                # Preserva orden de aparicion deduplicando con un set auxiliar.
                 seen: set[str] = set()
-                unique_ts = [t for t in sub_ts if not (t in seen or seen.add(t))]
+                unique_ts: list[str] = []
+                for t in sub_ts:
+                    if t not in seen:
+                        seen.add(t)
+                        unique_ts.append(t)
                 sub_str = f" | sub-tacticas observadas: {', '.join(unique_ts)}"
             lines.append(
                 f"    [CRITICO] webshell_execution={data['webshell_execution']}"

@@ -92,6 +92,24 @@ _TRIAGE_LOG_RE = re.compile(
     r'"(\w+)\s+(\S+)\s+HTTP/[^"]+"\s+(\d{3})\s+(\d+|-)\s+"[^"]*"\s+"([^"]*)"'
 )
 
+# Apache Solr 8.x usa logging Java estilo (NO Apache combined). Formato:
+#   2026-05-04 22:54:32.585 INFO  (qtp1346799731-91) [   x:demo]
+#       o.a.s.c.S.Request [demo]  webapp=/solr path=/select
+#       params={q=*:*&rows=1&wt=json} hits=46 status=0 QTime=2
+# Solr NO incluye IP del cliente en este log handler. Para detectar
+# ataques (Log4Shell JNDI en params, Solr Velocity wt=velocity) basta
+# con extraer path + params + status. Asignamos un IP virtual "solr"
+# para usar la misma estructura ip_profiles.
+_SOLR_LOG_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}\s+(\d{2}):(\d{2}):\d{2}\.\d+\s+'   # timestamp -> hour, minute
+    r'(?:INFO|ERROR|WARN|DEBUG)\s+'                            # level
+    r'\(\S+\)\s+'                                              # thread name
+    r'\[\s*\S*\s*\]\s+'                                        # context [   x:demo]
+    r'.*?path=(\S+)'                                           # path -> group 3
+    r'(?:.*?params=\{([^}]*)\})?'                              # params -> group 4 (opcional)
+    r'.*?status=(\d+)',                                        # status -> group 5
+)
+
 # Firmas literales que SI aparecen en logs Apache reales. Verificado empiricamente:
 # - gobuster default UA: "gobuster/3.8.2"
 # - wpscan default UA: "WPScan v3.8.28 (https://wpscan.com/wordpress-security-scanner)"
@@ -162,12 +180,16 @@ _OGNL_CONFLUENCE_RE = re.compile(
 _SHELLSHOCK_EXTENDED_RE = re.compile(r"\(\s*\)\s*\{[^}]{0,20}\}[\s;]", re.IGNORECASE)
 
 # Apache Solr Velocity RCE (CVE-2019-17558): params.resource.loader.enabled=true.
-# Tambien capturamos el endpoint tipico /solr/<core>/select?wt=velocity (la
-# explotacion publica usa wt=velocity con un Velocity template inline).
+# Tambien capturamos:
+#   - Endpoint tipico /solr/<core>/select?wt=velocity (Apache combined logs).
+#   - wt=velocity en cualquier query string (Solr internal logs no incluyen
+#     prefix /solr/ en el `path` extraido). El signal es suficientemente
+#     especifico — wt=velocity en HTTP normal seria muy raro fuera de Solr.
 _SOLR_VELOCITY_RE = re.compile(
     r"params\.resource\.loader\.enabled"
     r"|VelocityResponseWriter"
-    r"|/solr/[^/?]+/[^?]*\?[^ ]*wt=velocity",
+    r"|/solr/[^/?]+/[^?]*\?[^ ]*wt=velocity"
+    r"|[?&]wt=velocity\b",
     re.IGNORECASE,
 )
 
@@ -439,6 +461,60 @@ def _build_ip_profiles(raw_logs: list[dict]) -> dict:
         msg = log.get("message", "")
         m = _TRIAGE_LOG_RE.match(msg)
         if not m:
+            # Si no es Apache combined, intentar parser Solr (Java logging).
+            # Solr no incluye IP del cliente — usamos virtual "solr-internal".
+            ms = _SOLR_LOG_RE.match(msg)
+            if ms:
+                hour, minute = ms.group(1), ms.group(2)
+                path = ms.group(3) or ""
+                params = ms.group(4) or ""
+                status = int(ms.group(5))
+                # Reconstruir un "URL" pseudo: path?params para que las
+                # heuristicas que buscan en url + url_decoded encuentren
+                # el payload (jndi, wt=velocity, etc).
+                url = f"{path}?{params}" if params else path
+                user_agent = ""
+                method = "GET"  # Solr expone via GET en query params; aproximacion
+                body_size = "-"
+                ip = "solr-internal"
+                ip_lower_skip = False
+                # Bypass: caer al codigo principal con esta info
+            else:
+                continue
+
+            url_lower = url.lower()
+            profile = get_profile(ip)
+            profile["total"] += 1
+            ip_per_second.setdefault(ip, Counter())[f"{hour}:{minute}"] += 1
+
+            # Para Solr solo evaluamos las heuristicas CVE-specific
+            # (Log4Shell JNDI, Solr Velocity, OGNL) y SQLi sobre los
+            # params extraidos. Las heuristicas que dependen de IP/UA
+            # no tienen sentido en este context.
+            full_request = url
+            try:
+                full_request_decoded = unquote(url)
+            except Exception:
+                full_request_decoded = url
+            if _LOG4SHELL_RE.search(full_request) or _LOG4SHELL_RE.search(full_request_decoded):
+                profile["log4shell_attempts"] += 1
+            if (_OGNL_RE.search(full_request) or _OGNL_CONFLUENCE_RE.search(full_request)
+                    or _OGNL_RE.search(full_request_decoded)
+                    or _OGNL_CONFLUENCE_RE.search(full_request_decoded)):
+                profile["ognl_attempts"] += 1
+            if _SOLR_VELOCITY_RE.search(full_request) or _SOLR_VELOCITY_RE.search(full_request_decoded):
+                profile["solr_velocity_attempts"] += 1
+            if _SPRING4SHELL_RE.search(full_request) or _SPRING4SHELL_RE.search(full_request_decoded):
+                profile["spring4shell_attempts"] += 1
+            try:
+                url_decoded_lower = unquote(url).lower()
+            except Exception:
+                url_decoded_lower = url_lower
+            if any(marker in url_decoded_lower or marker in url_lower for marker in _SQLI_MARKERS):
+                profile["sqli_attempts"] += 1
+            if status == 404:
+                profile["404_count"] += 1
+                seen_404_urls.setdefault(ip, set()).add(url)
             continue
 
         ip = m.group(1)
