@@ -490,3 +490,51 @@ def test_selective_tools_default_off(monkeypatch):
     # No podemos invocar _get_model sin un LLM real, pero podemos verificar
     # el setting default desde fuera.
     assert getattr(settings, "attacker_selective_tools_enabled", False) is False
+
+
+# ---------- _extract_usage cache key compatibility ----------
+
+def test_extract_usage_anthropic_long_keys():
+    """LangChain anthropic 1.4+ usa cache_creation_input_tokens / cache_read_input_tokens."""
+    from src.llm.provider import _extract_usage
+
+    class FakeResp:
+        usage_metadata = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "input_token_details": {
+                "cache_creation_input_tokens": 80,
+                "cache_read_input_tokens": 20,
+            },
+        }
+        response_metadata = {}
+
+    in_t, out_t, cc, cr = _extract_usage(FakeResp())
+    assert (in_t, out_t, cc, cr) == (100, 50, 80, 20)
+
+
+def test_extract_usage_anthropic_short_keys():
+    """Versiones anteriores usan cache_creation / cache_read sin suffix."""
+    from src.llm.provider import _extract_usage
+
+    class FakeResp:
+        usage_metadata = {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "input_token_details": {"cache_creation": 60, "cache_read": 10},
+        }
+        response_metadata = {}
+
+    in_t, out_t, cc, cr = _extract_usage(FakeResp())
+    assert (in_t, out_t, cc, cr) == (100, 50, 60, 10)
+
+
+def test_extract_usage_no_cache():
+    from src.llm.provider import _extract_usage
+
+    class FakeResp:
+        usage_metadata = {"input_tokens": 100, "output_tokens": 50}
+        response_metadata = {}
+
+    in_t, out_t, cc, cr = _extract_usage(FakeResp())
+    assert (in_t, out_t, cc, cr) == (100, 50, 0, 0)

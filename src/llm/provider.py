@@ -141,8 +141,20 @@ def _extract_usage(response) -> tuple[int, int, int, int]:
         out_t = int(usage.get("output_tokens") or 0)
         details = usage.get("input_token_details") or {}
         if isinstance(details, dict):
-            cache_creation = int(details.get("cache_creation") or 0)
-            cache_read = int(details.get("cache_read") or 0)
+            # langchain_anthropic 1.4+ usa keys largas con suffix _input_tokens;
+            # versiones anteriores y otras integraciones usan cortas. Aceptar
+            # ambas. Prioridad a la presente; si ambas existen se prefiere la
+            # corta (assumimos que el SDK ya unifico).
+            cache_creation = int(
+                details.get("cache_creation")
+                or details.get("cache_creation_input_tokens")
+                or 0
+            )
+            cache_read = int(
+                details.get("cache_read")
+                or details.get("cache_read_input_tokens")
+                or 0
+            )
         if in_t or out_t or cache_creation or cache_read:
             return in_t, out_t, cache_creation, cache_read
     meta = getattr(response, "response_metadata", {}) or {}
