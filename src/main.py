@@ -200,12 +200,18 @@ def run_attacker(
     # Excepciones que se capturan para emitir reporte parcial. Sin esto el
     # sistema descarta toda la metadata acumulada (acciones, evidencia,
     # tactic_evidence) cuando el atacante muere mid-run.
-    # - GraphRecursionError: el atacante no converge en recursion_limit acciones
-    #   (caso tipico: OpenRouter free atascado en init_access por sesgo de
-    #   frecuencia).
-    # - BadRequestError 400 con mensaje "credit balance is too low": cuota
-    #   Anthropic agotada mid-run. NO es transient (no procede retry); preservar
-    #   metadata acumulada hasta el punto del fallo es la conducta correcta.
+    # - GraphRecursionError: el atacante no converge en recursion_limit acciones.
+    # - anthropic.BadRequestError ("credit balance is too low"): cuota Anthropic
+    #   agotada mid-run. NO es transient (no procede retry).
+    # - openai.RateLimitError ("insufficient_quota" o rate-limit que excede los
+    #   8 reintentos de _with_retry): cuota OpenAI agotada o rate-limit
+    #   sostenido. La misma clase agrupa rate-limit transient (cubierto por
+    #   reintentos) y "insufficient_quota" (permanent); aqui solo llega lo que
+    #   sobrevive 8 reintentos exponenciales.
+    # - openai.APIStatusError (auth, permission, context overflow): redes ultima
+    #   para errores HTTP 4xx/5xx no transient que el SDK eleva. El parsing del
+    #   mensaje filtra los casos de quota/credit/context para preservar metadata
+    #   de manera silenciosa; los demas se re-elevan.
     try:
         from langgraph.errors import GraphRecursionError
     except ImportError:
@@ -215,6 +221,35 @@ def run_attacker(
         from anthropic import BadRequestError as _AnthropicBadRequestError
     except ImportError:
         _AnthropicBadRequestError = type("_NoSuchError", (Exception,), {})
+    try:
+        from openai import APIStatusError as _OpenAIAPIStatusError
+        from openai import RateLimitError as _OpenAIRateLimitError
+    except ImportError:
+        _OpenAIAPIStatusError = type("_NoSuchError", (Exception,), {})
+        _OpenAIRateLimitError = type("_NoSuchError", (Exception,), {})
+
+    quota_exception_types = (
+        _AnthropicBadRequestError,
+        _OpenAIRateLimitError,
+        _OpenAIAPIStatusError,
+    )
+    quota_keywords = (
+        "credit balance",
+        "credit_balance",
+        "insufficient_quota",
+        "quota",
+        "billing",
+    )
+    rate_keywords = (
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    )
+    context_keywords = (
+        "context_length_exceeded",
+        "context window",
+        "maximum context length",
+    )
 
     try:
         for event in graph.stream(initial_state, {"recursion_limit": settings.attacker_recursion_limit}):
@@ -256,15 +291,30 @@ def run_attacker(
             f"(p.ej. sesgo de frecuencia en user enumeration).[/dim]"
         )
         final_state["recursion_limit_hit"] = True
-    except _AnthropicBadRequestError as e:
+    except quota_exception_types as e:
         msg = str(e).lower()
-        if "credit balance" in msg or "credit_balance" in msg or "low" in msg:
+        if any(k in msg for k in quota_keywords):
             console.print(
-                "[bold red]CUOTA ANTHROPIC AGOTADA mid-run[/bold red]\n"
+                "[bold red]CUOTA LLM AGOTADA mid-run (insufficient_quota / "
+                "credit balance)[/bold red]\n"
                 "[dim]Emitiendo reporte parcial con la metadata acumulada. "
                 "Recargar la API key antes de re-correr el escenario.[/dim]"
             )
             final_state["quota_exhausted"] = True
+        elif any(k in msg for k in rate_keywords):
+            console.print(
+                "[bold red]RATE-LIMIT LLM SOSTENIDO mid-run "
+                "(supero los 8 reintentos exponenciales)[/bold red]\n"
+                "[dim]Emitiendo reporte parcial con la metadata acumulada.[/dim]"
+            )
+            final_state["rate_limit_exhausted"] = True
+        elif any(k in msg for k in context_keywords):
+            console.print(
+                "[bold red]CONTEXT-LENGTH EXCEEDED mid-run[/bold red]\n"
+                "[dim]El historial del atacante supero el context window del "
+                "modelo. Emitiendo reporte parcial con la metadata acumulada.[/dim]"
+            )
+            final_state["context_overflow"] = True
         else:
             raise
 

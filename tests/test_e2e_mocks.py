@@ -225,6 +225,167 @@ class TestProviderRetryClassifierIntegration:
         assert captured.get("stop_after_attempt") == 8
 
 
+class TestRunAttackerExceptionHandling:
+    """Regresion: run_attacker debe capturar quota/rate-limit/context-overflow
+    de cualquier provider y emitir reporte parcial con la metadata acumulada.
+
+    El bug previo capturaba unicamente anthropic.BadRequestError; con .env
+    OpenAI un insufficient_quota despues de 8 reintentos llegaba como
+    openai.RateLimitError sin captura -> action_history y tactic_evidence
+    perdidos.
+    """
+
+    def _patch_graph(self, monkeypatch, exception_factory, history_payload):
+        import src.main as m
+
+        events_to_yield = [
+            {"plan_tactic": {"current_tactic": "reconnaissance"}},
+            {"execute_tools": {
+                "current_tactic": "reconnaissance",
+                "action_history": history_payload,
+            }},
+        ]
+
+        class FakeGraph:
+            def stream(self, initial_state, config):
+                for ev in events_to_yield:
+                    yield ev
+                raise exception_factory()
+
+        monkeypatch.setattr(m, "build_attacker_graph", lambda: FakeGraph())
+        monkeypatch.setattr(
+            m,
+            "create_initial_state",
+            lambda **kw: {
+                "target": kw.get("target") or "10.10.0.10",
+                "tactic_sequence": kw.get("tactics") or ["reconnaissance"],
+                "action_history": [],
+                "current_tactic": "",
+            },
+        )
+
+    def test_openai_insufficient_quota_emits_partial(self, monkeypatch):
+        import httpx
+        import openai
+        from src.main import run_attacker
+
+        history = [{"tool": "run_nmap", "tactic": "reconnaissance"}]
+
+        def make_exc():
+            response = httpx.Response(
+                429,
+                request=httpx.Request("POST", "https://api.openai.com/v1/chat"),
+            )
+            return openai.RateLimitError(
+                message=(
+                    "Error code: 429 - {'error': {'code': 'insufficient_quota', "
+                    "'message': 'You exceeded your current quota'}}"
+                ),
+                response=response,
+                body={"error": {"code": "insufficient_quota"}},
+            )
+
+        self._patch_graph(monkeypatch, make_exc, history)
+        state = run_attacker(
+            tactics=["reconnaissance"],
+            target="10.10.0.10",
+            use_memory=False,
+        )
+        assert state.get("quota_exhausted") is True, (
+            f"quota_exhausted no seteado tras OpenAI insufficient_quota. "
+            f"state keys: {sorted(state)}"
+        )
+        assert state.get("action_history") == history, (
+            "action_history acumulado se perdio tras la captura."
+        )
+
+    def test_anthropic_credit_balance_emits_partial(self, monkeypatch):
+        import httpx
+        from anthropic import BadRequestError as AnthropicBad
+        from src.main import run_attacker
+
+        history = [{"tool": "run_gobuster", "tactic": "reconnaissance"}]
+
+        def make_exc():
+            response = httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+            )
+            return AnthropicBad(
+                message="credit balance is too low",
+                response=response,
+                body={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Your credit balance is too low",
+                    }
+                },
+            )
+
+        self._patch_graph(monkeypatch, make_exc, history)
+        state = run_attacker(
+            tactics=["reconnaissance"],
+            target="10.10.0.10",
+            use_memory=False,
+        )
+        assert state.get("quota_exhausted") is True
+        assert state.get("action_history") == history
+
+    def test_openai_rate_limit_sustained_emits_partial(self, monkeypatch):
+        import httpx
+        import openai
+        from src.main import run_attacker
+
+        history = [{"tool": "run_whatweb", "tactic": "reconnaissance"}]
+
+        def make_exc():
+            response = httpx.Response(
+                429,
+                request=httpx.Request("POST", "https://api.openai.com/v1/chat"),
+            )
+            return openai.RateLimitError(
+                message="Error code: 429 - rate limit exceeded, please try again later",
+                response=response,
+                body={"error": {"code": "rate_limit_exceeded"}},
+            )
+
+        self._patch_graph(monkeypatch, make_exc, history)
+        state = run_attacker(
+            tactics=["reconnaissance"],
+            target="10.10.0.10",
+            use_memory=False,
+        )
+        assert state.get("rate_limit_exhausted") is True
+        assert state.get("action_history") == history
+
+    def test_unrelated_apistatuserror_propagates(self, monkeypatch):
+        import httpx
+        import openai
+        import pytest
+        from src.main import run_attacker
+
+        history = [{"tool": "run_nmap", "tactic": "reconnaissance"}]
+
+        def make_exc():
+            response = httpx.Response(
+                403,
+                request=httpx.Request("POST", "https://api.openai.com/v1/chat"),
+            )
+            return openai.PermissionDeniedError(
+                message="Error code: 403 - your organization is not authorized",
+                response=response,
+                body={"error": {"code": "permission_denied"}},
+            )
+
+        self._patch_graph(monkeypatch, make_exc, history)
+        with pytest.raises(openai.APIStatusError):
+            run_attacker(
+                tactics=["reconnaissance"],
+                target="10.10.0.10",
+                use_memory=False,
+            )
+
+
 class TestSelectiveToolExposureInvariants:
     """Verifica las invariantes del selective tool exposure que
     podrian romper en runtime."""
