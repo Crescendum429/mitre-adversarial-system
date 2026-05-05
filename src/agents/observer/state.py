@@ -30,6 +30,14 @@ class Classification(TypedDict, total=False):
     window_end: str          # fin de la ventana de logs analizada
     tactics_in_window: list  # todas las tacticas detectadas en esta ventana
     llm_latency_ms: int      # tiempo que el LLM tardo en esta clasificacion
+    # Bandera de la ablation regex-only: cuando True, la clasificacion fue
+    # producida deterministicamente por derive_tactic_from_signals sin invocar
+    # al LLM. Persiste en el JSON del reporte.
+    regex_only: bool
+    # Aliases legacy mantenidos por compatibilidad con consumidores antiguos
+    # que leian current_tactic / current_tactic_id en vez de tactic / tactic_id.
+    current_tactic: str
+    current_tactic_id: str
 
 
 class ObserverState(TypedDict, total=False):

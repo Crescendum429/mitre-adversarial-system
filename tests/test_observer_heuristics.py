@@ -422,7 +422,11 @@ class TestDeriveTacticFromSignalsAblation:
         from src.agents.observer.nodes import derive_tactic_from_signals
         signals = {
             "suspicious_ips": {
-                "10.10.0.5": {"tool_ua_hits": 5, "not_found": 30, "auth_post_attempts": 0}
+                "10.10.0.5": {
+                    "tool_detected": "gobuster",
+                    "404_count": 30,
+                    "scanning_404": 25,
+                }
             }
         }
         out = derive_tactic_from_signals(self._state(signals))
@@ -437,12 +441,62 @@ class TestDeriveTacticFromSignalsAblation:
                 {"sub_tactic": "Discovery", "sub_tactic_id": "TA0007"},
             ],
             "suspicious_ips": {
-                "10.10.0.5": {"tool_ua_hits": 100}
+                "10.10.0.5": {"tool_detected": "gobuster", "404_count": 200}
             }
         }
         out = derive_tactic_from_signals(self._state(signals))
         cls = out["current_classification"]
         assert cls["tactic"] == "Discovery"
+
+    def test_webshell_list_empty_falls_through_to_cve(self):
+        """Si webshell_commands esta presente pero VACIO, derive debe caer
+        a la siguiente regla (CVE attempts) y no quedarse atascado."""
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "webshell_commands": [],
+            "suspicious_ips": {
+                "10.10.0.5": {"log4shell_attempts": 1}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Execution"
+
+    def test_webshell_without_sub_tactic_field_falls_through(self):
+        """Si webshell_commands tiene entries SIN sub_tactic clasificada,
+        derive debe caer a la siguiente regla en lugar de fallar silencioso."""
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "webshell_commands": [
+                {"timestamp": "x"},          # sin sub_tactic
+                {"sub_tactic": None},        # sub_tactic explicit None
+            ],
+            "suspicious_ips": {
+                "10.10.0.5": {"login_success": 1}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Initial Access"
+
+    def test_multiple_contradictory_signals_respect_precedence(self):
+        """Login_success + sqli + recon presentes simultaneamente: gana
+        Initial Access (regla 3, antes de sqli regla 4) por precedencia
+        operacional documentada en el nodo."""
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "suspicious_ips": {
+                "10.10.0.5": {
+                    "login_success": 1,
+                    "sqli_attempts": 4,
+                    "tool_detected": "sqlmap",
+                    "404_count": 50,
+                }
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Initial Access"
 
     def test_graph_uses_derive_when_regex_only_enabled(self, monkeypatch):
         """Cuando settings.observer_regex_only=True, build_observer_graph

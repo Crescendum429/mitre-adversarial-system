@@ -1274,18 +1274,25 @@ def derive_tactic_from_signals(state: ObserverState) -> dict:
             derived_tactic, derived_id = "Credential Access", "TA0006"
             evidence.append(f"sqli_attempts={sqli}")
 
-    # 5. Recon signals (tool_ua / 404_ratio / post_to_auth / shellshock)
+    # 5. Recon signals (tool_ua / 404_ratio / shellshock / weird_methods)
+    # Los nombres de campo corresponden al perfil construido por
+    # _build_ip_profiles + scoring de detect_anomalies (ver
+    # src/agents/observer/nodes.py:1066+). El score acumula evidencia de
+    # comportamiento de recon sin necesidad de invocar al LLM.
     if not derived_tactic:
         recon_score = 0
         for ip_data in suspicious.values():
             if not isinstance(ip_data, dict):
                 continue
-            recon_score += (
-                ip_data.get("tool_ua_hits", 0)
-                + min(ip_data.get("not_found", 0), 50)
-                + ip_data.get("auth_post_attempts", 0)
-                + ip_data.get("shellshock_attempts", 0)
-            )
+            if ip_data.get("tool_detected"):
+                recon_score += 10
+            recon_score += min(ip_data.get("404_count", 0), 50)
+            recon_score += ip_data.get("scanning_404", 0)
+            recon_score += ip_data.get("shellshock_attempts", 0)
+            if ip_data.get("uniform_404_ratio", 0) > 0:
+                recon_score += 5
+            if ip_data.get("distinct_uas", 0) >= 3:
+                recon_score += 4
         if recon_score > 0:
             derived_tactic, derived_id = "Reconnaissance", "TA0043"
             evidence.append(f"recon_score={recon_score}")
