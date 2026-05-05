@@ -1433,7 +1433,7 @@ def main():
                 observer_interval=args.observer_interval,
             )
             print_attack_summary(attacker_state)
-            _emit_report(args, scenario_config, attacker_state, [])
+            _emit_report(args, scenario_config, attacker_state, [], session_json_path)
         finally:
             if dashboard is not None:
                 dashboard.stop()
@@ -1441,13 +1441,19 @@ def main():
 
     # Ejecucion completa: atacante + observador en paralelo
     try:
-        _run_full_session(args, scenario_config, tactics, target)
+        _run_full_session(args, scenario_config, tactics, target, session_json_path)
     finally:
         if dashboard is not None:
             dashboard.stop()
 
 
-def _run_full_session(args, scenario_config: dict, tactics: list, target: str | None) -> None:
+def _run_full_session(
+    args,
+    scenario_config: dict,
+    tactics: list,
+    target: str | None,
+    session_json_path: Path,
+) -> None:
     """Cuerpo de la corrida completa atacante + observer (extraido para que main()
     pueda envolverlo en try/finally para shutdown del dashboard)."""
     observer_results: list = []
@@ -1531,7 +1537,7 @@ def _run_full_session(args, scenario_config: dict, tactics: list, target: str | 
     # el mismo tipo de target tenga prior calibrado.
     _update_observer_memory(observer_results_snapshot, attacker_state)
 
-    _emit_report(args, scenario_config, attacker_state, observer_results_snapshot)
+    _emit_report(args, scenario_config, attacker_state, observer_results_snapshot, session_json_path)
 
 
 def _update_observer_memory(observer_results: list, attacker_state: dict) -> None:
@@ -1567,7 +1573,13 @@ def _estimate_cost(role: str) -> float:
     return estimate_cost_usd(role)
 
 
-def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_results: list) -> None:
+def _emit_report(
+    args,
+    scenario_config: dict,
+    attacker_state: dict,
+    observer_results: list,
+    session_json_path: Path,
+) -> None:
     """Genera reporte HTML + JSON post-run con todos los eventos capturados."""
     if args.no_report:
         return

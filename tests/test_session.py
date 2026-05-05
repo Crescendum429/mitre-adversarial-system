@@ -99,3 +99,103 @@ class TestSessionSingleton:
         # Otra obtencion del singleton ve el mismo estado
         assert len(get_session().events) == 1
         s.reset()
+
+
+class TestEmitReportPersistsFinalMetadata:
+    """Regresion: _emit_report debe poblar costs/tokens/bootstrap_ci antes del
+    save_json final. El bug previo dejaba session_json_path como variable local
+    de main() invisible al top-level _emit_report -> NameError -> set_metadata
+    final nunca corre y los JSONs quedan sin attacker_cost_usd, time_*_llm_s,
+    bootstrap_ci, tactic_duration_seconds.
+    """
+
+    def test_emit_report_writes_final_metadata(self, tmp_path: Path, monkeypatch):
+        import src.main as m
+        from src.infrastructure.docker_client import DOCKER_STATS
+        from src.infrastructure.loki_client import LOKI_STATS
+        from src.llm.provider import USAGE_STATS, reset_usage_stats
+
+        reset_usage_stats()
+        USAGE_STATS["attacker"].update(
+            provider="openai",
+            model="gpt-4.1",
+            call_count=42,
+            input_tokens=10_000,
+            output_tokens=2_000,
+            total_tokens=12_000,
+            elapsed_seconds=120.5,
+        )
+        USAGE_STATS["observer"].update(
+            provider="openai",
+            model="gpt-4.1-mini",
+            call_count=15,
+            input_tokens=5_000,
+            output_tokens=500,
+            total_tokens=5_500,
+            elapsed_seconds=45.0,
+        )
+        DOCKER_STATS["total_seconds"] = 60.0
+        LOKI_STATS["total_seconds"] = 5.0
+
+        bootstrap_ci_payload = {
+            "macro_f1": {"mean": 0.485, "ci_low": 0.30, "ci_high": 0.69}
+        }
+        monkeypatch.setattr(m, "_LAST_BOOTSTRAP_CI", bootstrap_ci_payload)
+        monkeypatch.setattr(
+            m, "generate_report", lambda data, path: Path(path).write_text("stub")
+        )
+
+        session = get_session()
+        session.reset()
+        session.set_metadata(
+            scenario="basic",
+            attacker_provider="openai",
+            attacker_model="gpt-4.1",
+            observer_provider="openai",
+            observer_model="gpt-4.1-mini",
+        )
+
+        class FakeArgs:
+            no_report = False
+            target = ""
+            report_dir = str(tmp_path)
+            scenario = "basic"
+
+        scenario_config = {"tactics": ["reconnaissance"], "target": ""}
+        attacker_state = {
+            "attacker_elapsed_seconds": 175.0,
+            "tactic_objective_met": {"reconnaissance": True},
+            "tactic_duration_seconds": {"reconnaissance": 30.0},
+            "action_history": [{"tool": "nmap"}, {"tool": "gobuster"}],
+            "attempts_per_tactic": {"reconnaissance": 1},
+            "matched_playbook": None,
+            "target_fingerprint": "abc123",
+        }
+        json_path = tmp_path / "test_run.json"
+
+        try:
+            m._emit_report(
+                FakeArgs(), scenario_config, attacker_state, [], json_path
+            )
+        finally:
+            reset_usage_stats()
+            DOCKER_STATS["total_seconds"] = 0.0
+            LOKI_STATS["total_seconds"] = 0.0
+            session.reset()
+
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        md = data["metadata"]
+
+        assert md.get("attacker_cost_usd", 0) > 0, (
+            f"attacker_cost_usd vacio: posible regresion del NameError "
+            f"que omitia el set_metadata final. metadata={list(md)}"
+        )
+        assert md.get("time_attacker_llm_s", 0) > 0
+        assert md.get("time_observer_llm_s", 0) > 0
+        assert md.get("bootstrap_ci") == bootstrap_ci_payload
+        assert md.get("tactic_duration_seconds") == {"reconnaissance": 30.0}
+        assert md.get("memory_hit") is False
+        assert md.get("tool_calls") == 2
+        assert md.get("finished_at"), "finished_at no fue seteado"
+        assert md.get("tactics_completed") == 1
