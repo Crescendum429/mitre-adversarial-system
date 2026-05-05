@@ -351,6 +351,18 @@ def _enrich_for_frontend(data: dict) -> None:
             # ausencia de evaluation.
             pass
 
+    # Post-injection: si evaluation ya existia (incremental save corrio antes
+    # que set_metadata bootstrap_ci) y bootstrap_ci se seteo despues al
+    # top-level, replicarlo dentro de evaluation. El frontend lee
+    # ev.bootstrap_ci, no md.bootstrap_ci, asi que sin esto el modo live
+    # nunca muestra los IC95.
+    if (
+        isinstance(md.get("evaluation"), dict)
+        and md.get("bootstrap_ci")
+        and "bootstrap_ci" not in md["evaluation"]
+    ):
+        md["evaluation"]["bootstrap_ci"] = md["bootstrap_ci"]
+
 
 # Singleton global. Los nodos lo importan y usan directamente.
 _session = SessionRecorder()

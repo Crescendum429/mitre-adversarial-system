@@ -1,9 +1,15 @@
 """Tests del session recorder."""
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
-from src.ui.session import SessionRecorder, get_session
+from src.ui.session import (
+    SessionEvent,
+    SessionRecorder,
+    _enrich_for_frontend,
+    get_session,
+)
 
 
 class TestSessionRecorder:
@@ -99,6 +105,150 @@ class TestSessionSingleton:
         # Otra obtencion del singleton ve el mismo estado
         assert len(get_session().events) == 1
         s.reset()
+
+
+class TestEnrichForFrontendPropagatesTacticsInWindow:
+    """Regresion H1: el evento classify del observer transporta
+    tactics_in_window como list[dict]; metrics.evaluate filtra con
+    `isinstance(t, dict)` y descarta strings, cayendo al fallback
+    single-label que degrada macro_f1/micro_f1 en el JSON persistido.
+
+    Pre-fix el observer aplanaba la lista a list[str] al emitir el evento;
+    post-fix la pasa intacta. Este test exercises el camino end-to-end
+    desde el evento hasta evaluation.per_tactic.
+    """
+
+    def test_multilabel_observation_produces_fp_in_other_tactic(self):
+        recorder = SessionRecorder()
+        ts_pre = datetime(2026, 5, 6, 9, 59, 55, tzinfo=timezone.utc).isoformat()
+        ws = datetime(2026, 5, 6, 10, 0, 0, tzinfo=timezone.utc).isoformat()
+        ts_in = datetime(2026, 5, 6, 10, 0, 2, tzinfo=timezone.utc).isoformat()
+        we = datetime(2026, 5, 6, 10, 0, 5, tzinfo=timezone.utc).isoformat()
+        ts_post = datetime(2026, 5, 6, 10, 0, 10, tzinfo=timezone.utc).isoformat()
+
+        recorder.set_metadata(
+            scenario="basic",
+            attacker_provider="openai",
+            attacker_model="gpt-4.1",
+            observer_provider="openai",
+            observer_model="gpt-4.1-mini",
+            seed=42,
+            started_at=ts_pre,
+        )
+        # Atacante: initial_access antes de la ventana, durante, y despues
+        # (para que attack_end > ws y la ventana NO sea post-ataque).
+        for ts in (ts_pre, ts_in, ts_post):
+            recorder.events.append(SessionEvent(
+                timestamp=ts,
+                agent="attacker",
+                event_type="tool_call",
+                tactic="initial_access",
+                payload={"tool": "run_hydra"},
+            ))
+        recorder.events.append(SessionEvent(
+            timestamp=ws,
+            agent="observer",
+            event_type="classify",
+            tactic="initial_access",
+            payload={
+                "window_start": ws,
+                "window_end": we,
+                "tactics_in_window": [
+                    {"tactic": "initial_access", "tactic_id": "TA0001"},
+                    {"tactic": "reconnaissance", "tactic_id": "TA0043"},
+                ],
+            },
+        ))
+
+        data = recorder.to_dict()
+        _enrich_for_frontend(data)
+
+        ev = data["metadata"].get("evaluation")
+        assert isinstance(ev, dict), "evaluation no fue inyectada por enrichment"
+        per = ev.get("per_tactic", {})
+        rec = per.get("reconnaissance", {})
+        assert rec.get("fp", 0) == 1, (
+            f"Esperaba fp=1 en reconnaissance (multi-label correcto), vi {rec}. "
+            f"Si fp=0, el observer aplano tactics_in_window a list[str] y el "
+            f"filtro isinstance(t, dict) en metrics descarto las observaciones "
+            f"-> fallback single-label -> reconnaissance no cuenta como FP."
+        )
+        ia = per.get("initial_access", {})
+        assert ia.get("tp", 0) == 1, (
+            "initial_access esperaba tp=1 (real e observed coinciden)"
+        )
+
+
+class TestEnrichForFrontendInjectsBootstrapCi:
+    """Regresion H2: cuando incremental_save corre durante el run,
+    _enrich_for_frontend popula metadata.evaluation sin bootstrap_ci
+    (porque _LAST_BOOTSTRAP_CI aun es None). Cuando _emit_report tardio
+    setea metadata.bootstrap_ci al top-level, el gate "evaluation" not
+    in md impedia el recompute y bootstrap_ci nunca llegaba dentro de
+    evaluation. El frontend lee ev.bootstrap_ci -> sin CIs visibles.
+
+    Post-fix: post-injection inyecta bootstrap_ci en evaluation cuando
+    ya existe, sin tocar el gate.
+    """
+
+    def test_bootstrap_ci_set_after_evaluation_lands_in_evaluation(self):
+        recorder = SessionRecorder()
+        ws = datetime(2026, 5, 6, 10, 0, 0, tzinfo=timezone.utc).isoformat()
+        we = datetime(2026, 5, 6, 10, 0, 5, tzinfo=timezone.utc).isoformat()
+
+        recorder.set_metadata(
+            scenario="basic",
+            attacker_provider="openai",
+            attacker_model="gpt-4.1",
+            observer_provider="openai",
+            observer_model="gpt-4.1-mini",
+            seed=42,
+            started_at=ws,
+        )
+        recorder.events.append(SessionEvent(
+            timestamp=ws,
+            agent="attacker",
+            event_type="tool_call",
+            tactic="reconnaissance",
+            payload={"tool": "run_nmap"},
+        ))
+        recorder.events.append(SessionEvent(
+            timestamp=ws,
+            agent="observer",
+            event_type="classify",
+            tactic="reconnaissance",
+            payload={
+                "window_start": ws,
+                "window_end": we,
+                "tactics_in_window": [{"tactic": "reconnaissance"}],
+            },
+        ))
+
+        # 1ra pasada: incremental_save corre antes que set_metadata bootstrap_ci.
+        data1 = recorder.to_dict()
+        _enrich_for_frontend(data1)
+        recorder.metadata = data1["metadata"]
+        assert "evaluation" in recorder.metadata
+        assert "bootstrap_ci" not in recorder.metadata["evaluation"], (
+            "Setup: bootstrap_ci no deberia existir aun en evaluation."
+        )
+
+        # 2da pasada: _emit_report tardio setea bootstrap_ci al top-level y
+        # vuelve a guardar (otra invocacion de _enrich_for_frontend).
+        recorder.set_metadata(
+            bootstrap_ci={
+                "macro_f1": {"mean": 0.5, "ci_low": 0.4, "ci_high": 0.6},
+            }
+        )
+        data2 = recorder.to_dict()
+        _enrich_for_frontend(data2)
+
+        ev = data2["metadata"].get("evaluation", {})
+        assert "bootstrap_ci" in ev, (
+            "bootstrap_ci no fue inyectado en evaluation tras set_metadata "
+            "tardio. Frontend en modo live no veria los IC95."
+        )
+        assert ev["bootstrap_ci"]["macro_f1"]["mean"] == 0.5
 
 
 class TestEmitReportPersistsFinalMetadata:
