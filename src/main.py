@@ -1255,6 +1255,13 @@ def main():
     session_json_path = out_dir_live / f"{base_live}.json"
     session.enable_incremental_save(session_json_path, throttle_seconds=2.0)
 
+    # Si --open-frontend, levantar el http server AHORA (antes de los threads)
+    # para que el frontend pueda hacer polling del JSON desde el primer evento.
+    # Antes el server se lanzaba al final del run; eso impedia ver la corrida
+    # mientras avanzaba.
+    if args.open_frontend:
+        _launch_frontend_viewer(session_json_path)
+
     session.system_event("session_start", scenario=args.scenario)
 
     dashboard = None
@@ -1585,9 +1592,6 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
         f"\n[bold cyan]📄 Reporte HTML generado:[/bold cyan] {html_path}\n"
         f"[dim]   JSON crudo: {json_path}[/dim]"
     )
-
-    if args.open_frontend:
-        _launch_frontend_viewer(json_path)
 
 
 def _launch_frontend_viewer(json_path: Path) -> None:

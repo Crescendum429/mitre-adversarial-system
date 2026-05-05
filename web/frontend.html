@@ -547,18 +547,47 @@ document.getElementById('load-demo-btn').addEventListener('click', () => {
   fetch('sample_session.json').then(r=>r.json()).then(d=>loadSession(d)).catch(()=>alert('No se encontró sample_session.json'));
 });
 
-// Auto-load via query param ?session=/path/to.json. Usado por
+// Auto-load via query param ?session=/path/to.json[&live=1]. Usado por
 // `python -m src.main --open-frontend` para abrir el frontend apuntando al
-// JSON recien generado sin que el usuario haga upload manual.
+// JSON recien generado sin que el usuario haga upload manual. Si la URL
+// del JSON existe se considera que el run aun puede estar avanzando, asi
+// que activa modo live automaticamente con interval default 5s para que
+// el frontend siga al run en vivo. Para desactivar live: ?session=...&live=0.
 (function autoLoadFromQuery(){
   try {
     const params = new URLSearchParams(window.location.search);
     const sessionParam = params.get('session');
     if (!sessionParam) return;
+    const liveParam = params.get('live');
+    const autoLive = liveParam !== '0';
     fetch(sessionParam + (sessionParam.includes('?') ? '&' : '?') + '_=' + Date.now())
       .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-      .then(d => loadSession(d))
-      .catch(err => console.warn('No se pudo cargar session via ?session=:', err));
+      .then(d => {
+        if (autoLive) {
+          const liveCheck = document.getElementById('live-check');
+          const liveUrlInput = document.getElementById('live-url');
+          if (liveCheck) liveCheck.checked = true;
+          if (liveUrlInput) liveUrlInput.value = sessionParam;
+        }
+        loadSession(d);
+      })
+      .catch(err => {
+        console.warn('No se pudo cargar session via ?session=:', err);
+        // Si fall0 el primer fetch pero hay live mode, intentar empezar
+        // polling igual — quizas el JSON aun no se ha creado pero esta por
+        // crearse en segundos.
+        if (autoLive) {
+          const liveUrlInput = document.getElementById('live-url');
+          if (liveUrlInput) liveUrlInput.value = sessionParam;
+          // Hack: arrancar el timer para esperar a que aparezca el JSON
+          window.liveUrl = sessionParam;
+          window.liveInterval = 3000;
+          if (typeof startLive === 'function') {
+            // delay corto para dejar al DOM montar
+            setTimeout(()=>{ try { startLive(); } catch(_){} }, 300);
+          }
+        }
+      });
   } catch (err) { /* noop */ }
 })();
 
