@@ -367,6 +367,7 @@ def run_observer_loop(
     simulation_start: datetime | None = None,
     state_lock: "threading.RLock | None" = None,
     use_heuristics: bool = True,
+    attacker_completed: list | None = None,
 ):
     """
     Loop del observador que se ejecuta en un thread separado.
@@ -381,7 +382,19 @@ def run_observer_loop(
     shared mutable state (history, suspect_list, results) contra la race
     condition con el thread principal que hace join() al final.
 
-    Se detiene cuando stop_event es seteado por el thread principal.
+    Politica de parada (alineada al alcance de la tesis: priorizar cobertura
+    completa de ventanas sobre latencia):
+      1. Loop principal corre mientras stop_event no este seteado.
+      2. Cuando stop_event se setea, transicion a flush phase.
+      3. Flush phase procesa SIN limite de iteraciones todas las ventanas
+         hasta `attacker_completed[0] + interval`. Si attacker_completed esta
+         vacio o None, fallback al deadline now() (comportamiento legacy).
+      4. El thread principal hace join() con timeout largo para permitir el
+         drenaje completo.
+
+    `attacker_completed`: lista de un elemento (mutable holder) compartida
+    con el thread principal. Cuando run_attacker termina, main.py setea
+    `attacker_completed[0] = datetime` con el timestamp del fin del atacante.
     """
     interval = poll_interval or settings.observer_poll_interval
     interval_delta = timedelta(seconds=interval)
@@ -497,22 +510,34 @@ def run_observer_loop(
 
         last_end = next_end
 
-    # Flush: procesar ventanas pendientes hasta "now". Limite maximo de iteraciones
-    # para evitar loops infinitos si process_window genera excepciones recurrentes
-    # o si `now` se corrompe.
-    flush_deadline = datetime.now(timezone.utc)
-    max_flush_iters = max(5, int((flush_deadline - last_end).total_seconds() / interval) + 3)
+    # Flush phase: procesar TODAS las ventanas hasta cubrir el ultimo evento
+    # del atacante + un intervalo. La prioridad es cobertura completa, no
+    # latencia: el observador tiene que ver cada ventana que abarco actividad
+    # del atacante aunque procese con delay. Sin max_iters; un fallo en
+    # process_window cuenta como ventana pasada (incrementamos last_end igual)
+    # para evitar bucle infinito con excepciones recurrentes.
+    if attacker_completed and attacker_completed[0]:
+        flush_deadline = attacker_completed[0] + interval_delta
+    else:
+        flush_deadline = datetime.now(timezone.utc)
     pending = 0
-    iters = 0
-    while last_end < flush_deadline and iters < max_flush_iters:
-        iters += 1
+    consecutive_errors = 0
+    while last_end < flush_deadline:
         next_end = min(last_end + interval_delta, flush_deadline)
         try:
             process_window(last_end, next_end)
             pending += 1
+            consecutive_errors = 0
         except Exception as e:
-            logging.getLogger(__name__).error(f"Error en observador (flush): {e}")
-            break
+            consecutive_errors += 1
+            logging.getLogger(__name__).error(
+                f"Error en observador (flush, err {consecutive_errors}): {e}"
+            )
+            if consecutive_errors >= 5:
+                logging.getLogger(__name__).error(
+                    "5 errores consecutivos en flush; abortando para evitar loop"
+                )
+                break
         last_end = next_end
 
     if pending:
@@ -1409,13 +1434,22 @@ def _run_full_session(args, scenario_config: dict, tactics: list, target: str | 
     simulation_start = datetime.now(timezone.utc)
     _session_t0 = time.monotonic()
 
+    # Holder mutable compartido con el observer thread: cuando el atacante
+    # termina, main.py setea attacker_completed[0] = datetime y el observer
+    # usa ese timestamp como deadline del flush phase. Permite cobertura
+    # completa sin tiempo de gracia arbitrario.
+    attacker_completed: list = [None]
+
     # Iniciar observador en thread separado. El lock protege observer_results,
     # history y suspect_list (estado compartido con el thread principal que
     # hace join() y luego lee results).
     observer_thread = threading.Thread(
         target=run_observer_loop,
         args=(stop_event, observer_results, args.observer_interval, simulation_start, observer_lock),
-        kwargs={"use_heuristics": not args.no_heuristics},
+        kwargs={
+            "use_heuristics": not args.no_heuristics,
+            "attacker_completed": attacker_completed,
+        },
         daemon=True,
     )
     observer_thread.start()
@@ -1426,20 +1460,21 @@ def _run_full_session(args, scenario_config: dict, tactics: list, target: str | 
     # Ejecutar atacante en el thread principal
     attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
 
-    # Dar tiempo al observador para clasificar las ultimas acciones.
-    # Tres ciclos completos: el que estaba en curso termina + dos mas que ven
-    # el estado final del ataque, dando al observador tiempo suficiente para
-    # capturar tacticas que el atacante completo rapidamente.
-    time.sleep(args.observer_interval * 3 + settings.observer_shutdown_grace_seconds)
+    # Marcar el fin del atacante. El observer drenara hasta este timestamp
+    # + interval. Sin time.sleep arbitrario: el observer ya conoce el
+    # deadline y procesara las ventanas pendientes a su propio ritmo.
+    attacker_completed[0] = datetime.now(timezone.utc)
     stop_event.set()
-    # Join con timeout suficiente para permitir que se complete la ventana
-    # actual + el flush de pendientes. Si el observer tiene N ventanas
-    # pendientes, cada una puede tardar hasta 30s (LLM + loki), así que
-    # damos un margen proporcional al intervalo.
-    observer_thread.join(timeout=args.observer_interval * 4 + 30)
+    # Join con timeout proporcional al backlog estimado. Si el observer
+    # tiene un backlog pesado (LLM lento + cola larga), necesita minutos.
+    # 600s = 10 min cubre escenarios largos como mrrobot/dc1 con observer
+    # Sonnet (~22s/clasificacion x 30 ventanas pendientes ~ 11 min). Si se
+    # excede, se logea warning y se procede con los resultados parciales.
+    observer_thread.join(timeout=600)
     if observer_thread.is_alive():
         logging.getLogger(__name__).warning(
-            "Observer thread did not finish in time; proceeding with current results."
+            "Observer thread did not finish in 600s; proceeding with current "
+            "results. Algunas ventanas pueden haber quedado sin procesar."
         )
 
     # Leer results bajo lock (consistency con el thread background)

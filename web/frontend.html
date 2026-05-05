@@ -164,7 +164,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13
 .ev-pre{margin-top:5px;background:var(--bg);border:1px solid var(--border);
   border-radius:4px;padding:7px 9px;font-family:var(--mono);font-size:11px;
   color:var(--dim);white-space:pre-wrap;word-break:break-all;
-  max-height:100px;overflow-y:auto;line-height:1.5}
+  max-height:400px;overflow-y:auto;line-height:1.5}
 .ev-pre.g{border-color:rgba(63,185,80,.3);color:var(--green)}
 .ev-pre.r{border-color:rgba(248,81,73,.3);color:var(--red)}
 
@@ -777,15 +777,23 @@ function renderBattle(events, m) {
 }
 
 function buildObsWindows(events) {
+  // El observer NO emite event 'window_end' explicito (ver
+  // src/agents/observer/nodes.py:666 — solo emite 'window_start' con
+  // window_start/window_end en payload). Cerramos la ventana actual cuando
+  // (a) llega un nuevo 'window_start', o (b) se acaban los events.
   const windows = [];
   let cur = null;
   events.filter(e=>e.agent==='observer').forEach(e => {
     if (e.event_type==='window_start') {
-      cur = { start: e.payload.window_start||e.timestamp, end: e.payload.window_end||e.timestamp, events:[] };
-      cur.events.push(e);
+      if (cur) windows.push(cur);
+      cur = {
+        start: (e.payload && e.payload.window_start) || e.timestamp,
+        end:   (e.payload && e.payload.window_end)   || e.timestamp,
+        events: [e],
+      };
     } else if (cur) {
       cur.events.push(e);
-      if (e.event_type==='window_end') { windows.push(cur); cur=null; }
+      if (e.event_type === 'window_end') { windows.push(cur); cur = null; }
     }
   });
   if (cur) windows.push(cur);
@@ -818,7 +826,10 @@ function buildAtkCol(events) {
         <div class="ev-main"><span class="tool">${esc(tool)}</span><br><span class="arg">${esc(trunc(argStr,120))}</span></div>
       </div>`;
     } else if (ev.event_type==='tool_result') {
-      const preview=trunc(p.preview||'',250);
+      // Sin truncamiento del lado frontend: el payload ya viene truncado a
+      // 10000 chars desde el productor (src/agents/attacker/nodes.py). El
+      // contenedor .ev-pre tiene max-height + overflow-y para scroll.
+      const preview = p.preview || '';
       html+=`<div class="ev">
         <div class="ev-ts">${ts}</div>
         <div class="ev-kind d">
