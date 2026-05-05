@@ -104,8 +104,13 @@ def load_baselines() -> dict:
 
 
 def save_baselines(data: dict) -> None:
+    """Persiste baselines del observer. Atomico via tmp+rename para evitar
+    archivo a medio escribir si el proceso muere durante write (mismo
+    patron que attacker/memory.save_playbooks)."""
     BASELINE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BASELINE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp = BASELINE_FILE.with_suffix(BASELINE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp.replace(BASELINE_FILE)
 
 
 def get_prior(fingerprint: str) -> dict | None:
