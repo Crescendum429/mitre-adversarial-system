@@ -34,6 +34,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -1204,6 +1205,11 @@ def main():
         help="Activa dashboard Live (Rich split-screen) que muestra atacante + "
              "observador en tiempo real. Convive con los logs estandar."
     )
+    parser.add_argument(
+        "--open-frontend", action="store_true",
+        help="Al terminar, lanza un servidor http local en web/ y abre "
+             "frontend.html en el browser apuntando al JSON recien generado."
+    )
     args = parser.parse_args()
 
     if args.tool_output:
@@ -1569,6 +1575,67 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
         f"\n[bold cyan]📄 Reporte HTML generado:[/bold cyan] {html_path}\n"
         f"[dim]   JSON crudo: {json_path}[/dim]"
     )
+
+    if args.open_frontend:
+        _launch_frontend_viewer(json_path)
+
+
+def _launch_frontend_viewer(json_path: Path) -> None:
+    """Lanza el frontend web (web/frontend.html) en el browser apuntando al
+    JSON recien generado.
+
+    Levanta un http.server local en background sobre el directorio raiz del
+    repo (para que el frontend pueda fetchear el JSON via XHR) y abre el
+    browser. El servidor sigue corriendo hasta que el usuario lo mate
+    (Ctrl-C). La URL incluye el query param `?session=<path>` para que el
+    frontend cargue el JSON automaticamente si soporta esa convencion; de lo
+    contrario el usuario hace upload manual desde la UI.
+    """
+    import http.server
+    import socketserver
+    import threading
+    import webbrowser
+
+    repo_root = Path(__file__).resolve().parent.parent
+    frontend = repo_root / "web" / "frontend.html"
+    if not frontend.exists():
+        console.print(
+            f"[yellow]frontend.html no encontrado en {frontend}; "
+            f"--open-frontend ignorado[/yellow]"
+        )
+        return
+
+    rel_json = json_path.resolve().relative_to(repo_root)
+    port = 8765
+    handler = http.server.SimpleHTTPRequestHandler
+
+    class _Quiet(handler):
+        def log_message(self, fmt, *a):
+            return
+
+    server = socketserver.TCPServer(("127.0.0.1", port), _Quiet, bind_and_activate=False)
+    server.allow_reuse_address = True
+    try:
+        server.server_bind()
+        server.server_activate()
+    except OSError as exc:
+        console.print(f"[yellow]No se pudo levantar http.server :{port}: {exc}[/yellow]")
+        return
+
+    import os
+    os.chdir(repo_root)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    url = f"http://127.0.0.1:{port}/web/frontend.html?session=/{rel_json.as_posix()}"
+    console.print(
+        f"\n[bold green]🌐 Frontend disponible en[/bold green] {url}\n"
+        f"[dim]   (servidor http.server :{port} en background; "
+        f"Ctrl-C para parar)[/dim]"
+    )
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -179,6 +179,29 @@ poetry run python -m src.main --scenario basic --no-heuristics
 
 # Benchmark reproducible n=3 cold con cleanup explicito de memoria:
 poetry run python scripts/run_benchmark.py --scenarios basic --runs-per-scenario 3 --cold-all
+
+# Visualizacion grafica del run en browser (frontend en web/frontend.html):
+poetry run python -m src.main --scenario basic --open-frontend
+```
+
+### Frontend gráfico (`web/frontend.html`)
+
+Visor self-contained de un solo archivo HTML — sin frameworks ni build step. Acepta `data/reports/<run>.json` como input. Cuatro vistas:
+
+- **Batalla en Paralelo**: ventanas temporales del observador con eventos del atacante a la izquierda y triage/clasificación del observador a la derecha, sincronizados por rango de tiempo.
+- **Resumen**: bootstrap CI 95 % de macro-F1 / micro-F1 / strict-accuracy, matriz de confusión, métricas por táctica, pipeline del observador (triage signal/no-signal, refines), tokens y costo por agente, infraestructura (Docker exec, Loki queries).
+- **Tácticas**: cards colapsables por táctica del atacante con herramientas ejecutadas, replans y evidencia.
+- **Timeline**: todos los eventos cronológicos con filtros por agente.
+
+**Uso manual** (sin `--open-frontend`):
+
+```bash
+poetry run python -m http.server 8765
+# abrir http://127.0.0.1:8765/web/frontend.html
+# luego "Cargar session.json" → seleccionar data/reports/<run>.json
+```
+
+**Modo live** (polling del JSON mientras corre el ataque): activar el checkbox "Modo live" en la pantalla inicial e ingresar la URL del JSON (e.g. `/data/reports/<run>.json`).
 ```
 
 ## Stack tecnológico

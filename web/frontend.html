@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Sistema Adversarial MITRE ATT&CK</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+  --bg:     #0d1117; --bg2:    #161b22; --bg3:    #21262d;
+  --border: #30363d; --text:   #c9d1d9; --dim:    #8b949e;
+  --bright: #e6edf3;
+  --red:    #f85149; --red-bg:    rgba(248,81,73,.13);
+  --blue:   #58a6ff; --blue-bg:   rgba(88,166,255,.12);
+  --green:  #3fb950; --green-bg:  rgba(63,185,80,.11);
+  --yellow: #e3b341; --yellow-bg: rgba(227,179,65,.13);
+  --purple: #bc8cff; --purple-bg: rgba(188,140,255,.12);
+  --mono: 'SF Mono','Fira Code','Cascadia Code',monospace;
+  --sans: 'Helvetica Neue',Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:13px;line-height:1.5;min-height:100vh}
+
+/* ── ICONS (inline SVG helpers) ─────────────────────────── */
+.icon{display:inline-block;vertical-align:middle;flex-shrink:0}
+
+/* ── HEADER ──────────────────────────────────────────────── */
+.app-header{background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:0 20px;display:flex;align-items:center;gap:16px;height:50px;
+  position:sticky;top:0;z-index:200}
+.logo{display:flex;align-items:center;gap:9px;text-decoration:none}
+.logo-text{font-size:14px;font-weight:600;color:var(--bright);letter-spacing:-.3px}
+.logo-badge{font-size:10px;background:var(--red-bg);color:var(--red);
+  border:1px solid var(--red);border-radius:3px;padding:1px 6px;
+  letter-spacing:.5px;white-space:nowrap}
+.header-pills{display:flex;gap:10px;margin-left:auto;align-items:center}
+.hpill{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:5px}
+.hpill strong{color:var(--text)}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot-red{background:var(--red)} .dot-blue{background:var(--blue)}
+.dot-green{background:var(--green)} .dot-yellow{background:var(--yellow)}
+
+/* live indicator */
+.live-badge{display:none;align-items:center;gap:5px;font-size:11px;
+  color:var(--green);padding:3px 9px;border:1px solid rgba(63,185,80,.4);
+  border-radius:10px;background:var(--green-bg)}
+.live-badge.on{display:flex}
+.live-dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+  animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
+
+/* ── NAV ─────────────────────────────────────────────────── */
+.nav{background:var(--bg2);border-bottom:1px solid var(--border);
+  display:none;padding:0 20px;position:sticky;top:50px;z-index:199}
+.nav-inner{display:flex}
+.ntab{padding:10px 15px;font-size:13px;color:var(--dim);
+  border-bottom:2px solid transparent;cursor:pointer;
+  transition:color .15s;display:flex;align-items:center;gap:7px;white-space:nowrap;user-select:none}
+.ntab:hover{color:var(--text)}
+.ntab.active{color:var(--bright);border-bottom-color:var(--blue)}
+
+/* ── UPLOAD ───────────────────────────────────────────────── */
+#upload-screen{display:flex;align-items:center;justify-content:center;
+  min-height:calc(100vh - 50px);padding:20px}
+.upload-card{background:var(--bg2);border:1px dashed var(--border);
+  border-radius:10px;max-width:500px;width:100%;padding:48px 36px;text-align:center}
+.upload-card h2{font-size:17px;color:var(--bright);margin-bottom:8px}
+.upload-card p{color:var(--dim);font-size:13px;line-height:1.7;margin-bottom:28px}
+.upload-card code{background:var(--bg3);padding:1px 6px;border-radius:3px;
+  font-family:var(--mono);font-size:12px;color:var(--blue)}
+.btn-primary{background:var(--blue);color:#0d1117;border:none;
+  padding:9px 22px;border-radius:6px;font-size:13px;font-weight:600;
+  cursor:pointer;transition:opacity .15s;display:inline-flex;align-items:center;gap:7px}
+.btn-primary:hover{opacity:.85}
+.btn-ghost{background:transparent;color:var(--blue);border:1px solid var(--border);
+  padding:8px 20px;border-radius:6px;font-size:13px;cursor:pointer;
+  transition:border-color .15s;display:inline-flex;align-items:center;gap:7px}
+.btn-ghost:hover{border-color:var(--blue)}
+.file-input-wrap{position:relative;display:inline-block}
+.file-input-wrap input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.sep{color:var(--dim);font-size:12px;margin:16px 0}
+.upload-hint{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:20px}
+
+/* live mode toggle */
+.live-row{display:flex;align-items:center;gap:10px;margin-top:20px;
+  padding-top:20px;border-top:1px solid var(--border);font-size:12px;color:var(--dim)}
+.live-row input{accent-color:var(--green)}
+.live-row label{cursor:pointer;color:var(--text)}
+.live-url-input{flex:1;background:var(--bg3);border:1px solid var(--border);
+  color:var(--text);border-radius:5px;padding:5px 10px;font-size:12px;
+  font-family:var(--mono);outline:none}
+.live-url-input:focus{border-color:var(--blue)}
+
+/* ── APP ─────────────────────────────────────────────────── */
+#app{display:none}
+.page{display:none;padding:20px}
+.page.active{display:block}
+
+/* ── SESSION BAR ─────────────────────────────────────────── */
+.sbar{background:var(--bg2);border:1px solid var(--border);border-radius:8px;
+  padding:12px 20px;margin-bottom:18px;
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px}
+.sfield .sl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px;margin-bottom:3px}
+.sfield .sv{font-size:13px;color:var(--bright);font-family:var(--mono);word-break:break-all}
+.sv.g{color:var(--green)} .sv.r{color:var(--red)} .sv.b{color:var(--blue)} .sv.y{color:var(--yellow)}
+
+/* ── BATTLE ──────────────────────────────────────────────── */
+.battle-wrap{display:flex;flex-direction:column;gap:0;
+  border:1px solid var(--border);border-radius:8px;overflow:hidden}
+
+/* column headers (sticky) */
+.battle-headers{display:grid;grid-template-columns:1fr 1fr;
+  position:sticky;top:100px;z-index:100;background:var(--bg)}
+.bh{display:flex;align-items:center;gap:9px;padding:11px 16px;
+  border-bottom:1px solid var(--border)}
+.bh.atk{background:#130d0d;border-right:1px solid var(--border)}
+.bh.obs{background:#0d1020}
+.bh-label{font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase}
+.bh-label.r{color:var(--red)} .bh-label.b{color:var(--blue)}
+.bh-model{font-size:11px;color:var(--dim);font-family:var(--mono);margin-left:auto;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* window block */
+.win-block{border-bottom:2px solid var(--border)}
+.win-block:last-child{border-bottom:none}
+.win-header{display:grid;grid-template-columns:1fr 1fr;
+  background:var(--bg2);border-bottom:1px solid var(--border)}
+.wh-cell{display:flex;align-items:center;gap:8px;padding:8px 16px;font-size:11px}
+.wh-cell.atk{border-right:1px solid var(--border)}
+.win-num{font-size:10px;font-weight:700;letter-spacing:.5px;
+  padding:1px 7px;border-radius:3px;text-transform:uppercase}
+.win-num.r{background:var(--red-bg);color:var(--red);border:1px solid rgba(248,81,73,.3)}
+.win-num.b{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(88,166,255,.3)}
+.win-range{font-family:var(--mono);color:var(--dim)}
+
+/* two-col event rows */
+.win-body{display:grid;grid-template-columns:1fr 1fr;min-height:60px}
+.wcol{padding:0}
+.wcol.atk{border-right:1px solid var(--border)}
+
+/* individual events */
+.ev{padding:9px 16px;border-bottom:1px solid var(--bg3);transition:background .1s}
+.ev:last-child{border-bottom:none}
+.ev:hover{background:var(--bg2)}
+
+.ev.tactic-start{background:#130d0d;border-left:3px solid var(--red)}
+.ev.tactic-start.obs-side{background:#0d1020;border-left:3px solid var(--blue)}
+.ev.ev-ok{background:rgba(63,185,80,.06)}
+.ev.ev-fail{background:rgba(248,81,73,.05)}
+.ev.ev-warn{background:rgba(227,179,65,.07)}
+.ev.ev-refine{background:rgba(188,140,255,.07)}
+
+.ev-ts{font-size:10px;color:var(--dim);font-family:var(--mono);margin-bottom:3px}
+.ev-kind{font-size:10px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;
+  margin-bottom:4px;display:flex;align-items:center;gap:5px}
+.ev-kind.r{color:var(--red)} .ev-kind.b{color:var(--blue)}
+.ev-kind.g{color:var(--green)} .ev-kind.y{color:var(--yellow)}
+.ev-kind.d{color:var(--dim)} .ev-kind.p{color:var(--purple)}
+
+.ev-main{font-size:12px;color:var(--text);line-height:1.5}
+.ev-main .tool{color:var(--yellow);font-family:var(--mono);font-weight:600}
+.ev-main .arg{color:var(--dim);font-family:var(--mono);font-size:11px}
+.ev-main .tname{font-size:14px;font-weight:700}
+.ev-main .tname.r{color:var(--red)} .ev-main .tname.b{color:var(--blue)}
+
+.ev-pre{margin-top:5px;background:var(--bg);border:1px solid var(--border);
+  border-radius:4px;padding:7px 9px;font-family:var(--mono);font-size:11px;
+  color:var(--dim);white-space:pre-wrap;word-break:break-all;
+  max-height:100px;overflow-y:auto;line-height:1.5}
+.ev-pre.g{border-color:rgba(63,185,80,.3);color:var(--green)}
+.ev-pre.r{border-color:rgba(248,81,73,.3);color:var(--red)}
+
+/* confidence bar */
+.cbar-row{display:flex;align-items:center;gap:7px;margin-top:5px}
+.cbar{width:54px;height:4px;background:var(--bg3);border-radius:2px;overflow:hidden}
+.cfill{height:100%;border-radius:2px}
+.cfill.hi{background:var(--green)} .cfill.md{background:var(--yellow)} .cfill.lo{background:var(--red)}
+.cpct{font-size:11px;font-family:var(--mono)}
+
+/* signals */
+.signals{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.sig{font-size:10px;background:var(--blue-bg);color:var(--blue);
+  border:1px solid rgba(88,166,255,.3);border-radius:3px;padding:1px 6px;font-family:var(--mono)}
+.sig.y{background:var(--yellow-bg);color:var(--yellow);border-color:rgba(227,179,65,.3)}
+
+/* evidence */
+.ev-list{margin-top:5px;padding-left:14px}
+.ev-list li{font-size:11px;color:var(--dim);list-style:disc;line-height:1.6;font-family:var(--mono)}
+.ev-list li::marker{color:var(--blue)}
+
+/* recommendation */
+.rec{margin-top:6px;padding:5px 9px;background:var(--yellow-bg);
+  border-left:3px solid var(--yellow);border-radius:0 4px 4px 0;
+  font-size:11px;color:var(--text);line-height:1.5}
+
+/* empty observer cell */
+.obs-pending{display:flex;align-items:center;justify-content:center;
+  min-height:80px;color:var(--dim);font-size:12px;gap:8px;font-style:italic}
+
+/* ── SUMMARY ─────────────────────────────────────────────── */
+.sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:12px;margin-bottom:22px}
+.scard{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px 18px}
+.scard .sl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
+.scard .sv{font-size:26px;font-weight:700;line-height:1}
+.scard .ssub{font-size:11px;color:var(--dim);margin-top:4px}
+.sv.g{color:var(--green)} .sv.r{color:var(--red)} .sv.b{color:var(--blue)} .sv.y{color:var(--yellow)}
+
+.sec-title{font-size:13px;font-weight:600;color:var(--bright);
+  margin:20px 0 12px;display:flex;align-items:center;gap:8px}
+.sec-title::before{content:'';width:3px;height:13px;background:var(--blue);
+  border-radius:2px;display:inline-block}
+
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:800px){.two-col{grid-template-columns:1fr}}
+
+/* generic table */
+.gtable{width:100%;border-collapse:collapse;margin-bottom:18px}
+.gtable th{text-align:left;padding:7px 12px;font-size:10px;color:var(--dim);
+  text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);
+  background:var(--bg2)}
+.gtable td{padding:9px 12px;border-bottom:1px solid var(--bg3);font-size:12px;vertical-align:middle}
+.gtable tr:hover td{background:var(--bg2)}
+.gtable td.mono{font-family:var(--mono)}
+.badge{padding:2px 7px;border-radius:4px;font-size:10px;font-weight:700;
+  letter-spacing:.5px;text-transform:uppercase}
+.badge.ok{background:var(--green-bg);color:var(--green)}
+.badge.fail{background:var(--red-bg);color:var(--red)}
+.badge.warn{background:var(--yellow-bg);color:var(--yellow)}
+
+/* per-tactic metric row */
+.metric-bar-row{display:flex;align-items:center;gap:10px;padding:5px 0;
+  border-bottom:1px solid var(--bg3)}
+.metric-bar-row:last-child{border-bottom:none}
+.mbr-name{font-size:12px;color:var(--bright);width:130px;flex-shrink:0;font-family:var(--mono)}
+.mbr-bar{flex:1;height:5px;background:var(--bg3);border-radius:3px;overflow:hidden}
+.mbr-fill{height:100%;border-radius:3px}
+.mbr-val{font-size:11px;font-family:var(--mono);color:var(--dim);width:36px;text-align:right}
+
+/* ci table */
+.ci-row{display:grid;grid-template-columns:140px 60px 60px 60px 60px;
+  gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--bg3);font-size:12px}
+.ci-row:last-child{border-bottom:none}
+.ci-row .name{color:var(--bright);font-family:var(--mono)}
+.ci-row .val{font-family:var(--mono);color:var(--dim);text-align:right}
+.ci-row .val.hi{color:var(--green)}
+
+/* confusion matrix */
+.cm-wrap{overflow-x:auto;margin-bottom:18px}
+.cm-table{border-collapse:collapse;font-size:11px}
+.cm-table th{padding:7px 11px;background:var(--bg2);color:var(--dim);
+  font-size:10px;text-transform:uppercase;letter-spacing:.4px;
+  border:1px solid var(--border);white-space:nowrap}
+.cm-table td{padding:7px 11px;text-align:center;border:1px solid var(--bg3);font-family:var(--mono)}
+.cm-table td.diag{background:var(--green-bg);color:var(--green);font-weight:700}
+.cm-table td.miss{background:var(--red-bg);color:var(--red)}
+.cm-table td.zero{color:var(--bg3)}
+
+/* usage bars */
+.usage-row{display:flex;align-items:center;gap:10px;padding:5px 0;
+  border-bottom:1px solid var(--bg3);font-size:12px}
+.usage-row:last-child{border-bottom:none}
+.usage-label{width:160px;flex-shrink:0;color:var(--dim)}
+.usage-atk{text-align:right;width:90px;font-family:var(--mono);color:var(--red)}
+.usage-obs{text-align:right;width:90px;font-family:var(--mono);color:var(--blue)}
+
+/* ── TACTICS PAGE ─────────────────────────────────────────── */
+.tc-list{display:flex;flex-direction:column;gap:14px}
+.tc-card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.tc-card.ok{border-left:4px solid var(--green)}
+.tc-card.fail{border-left:4px solid var(--red)}
+.tc-hdr{padding:13px 18px;display:flex;align-items:center;gap:10px;cursor:pointer}
+.tc-hdr:hover{background:var(--bg3)}
+.tc-name{font-size:14px;font-weight:600;color:var(--bright)}
+.tc-meta{display:flex;gap:14px;margin-left:auto;font-size:11px;color:var(--dim);
+  align-items:center}
+.tc-body{padding:16px 18px;display:none}
+.tc-body.open{display:block}
+
+.tool-list{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.tool-card{background:var(--bg);border:1px solid var(--bg3);border-radius:6px;padding:10px 12px}
+.tool-hdr{display:flex;align-items:center;gap:8px;margin-bottom:5px}
+.tool-name{font-family:var(--mono);font-size:12px;color:var(--yellow);font-weight:600}
+.tool-ts{font-size:10px;color:var(--dim);font-family:var(--mono);margin-left:auto}
+.tool-args{font-size:11px;color:var(--dim);font-family:var(--mono);word-break:break-all;line-height:1.5}
+.tool-result{margin-top:6px;padding:6px 8px;background:var(--bg2);border-radius:4px;
+  font-size:11px;font-family:var(--mono);color:var(--dim);
+  white-space:pre-wrap;word-break:break-all;max-height:80px;overflow-y:auto}
+
+.ev-block-card{background:var(--bg);border:1px solid var(--bg3);border-radius:6px;
+  padding:9px 12px;margin-bottom:6px;font-size:12px}
+.ev-block-card.warn{border-left:3px solid var(--yellow);background:var(--yellow-bg)}
+
+.evidence-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:12px;margin-top:10px}
+.evidence-box .ebt{font-size:10px;color:var(--dim);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:8px}
+.ekv{display:grid;grid-template-columns:160px 1fr;gap:3px 10px}
+.ekv .ek{font-family:var(--mono);font-size:11px;color:var(--dim)}
+.ekv .ev2{font-family:var(--mono);font-size:11px;color:var(--green);word-break:break-all}
+
+/* ── TIMELINE ─────────────────────────────────────────────── */
+.tl-filters{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+.fbtn{padding:5px 12px;border-radius:4px;font-size:12px;cursor:pointer;
+  background:var(--bg2);color:var(--dim);border:1px solid var(--border);
+  transition:all .15s;display:flex;align-items:center;gap:5px}
+.fbtn:hover{color:var(--text)}
+.fbtn.on{background:var(--bg3);color:var(--bright);border-color:var(--dim)}
+.fbtn.on.fa{background:var(--red-bg);color:var(--red);border-color:var(--red)}
+.fbtn.on.fo{background:var(--blue-bg);color:var(--blue);border-color:var(--blue)}
+
+.tl-list{display:flex;flex-direction:column}
+.tl-ev{display:grid;grid-template-columns:74px 88px 110px 1fr;
+  gap:10px;padding:7px 12px;border-bottom:1px solid var(--bg3);
+  font-size:12px;align-items:start;transition:background .1s;cursor:default}
+.tl-ev:hover{background:var(--bg2)}
+.tl-ev.ea{border-left:3px solid var(--red)}
+.tl-ev.eo{border-left:3px solid var(--blue)}
+.tl-ev.es{border-left:3px solid var(--dim)}
+.tl-ts{font-family:var(--mono);font-size:10px;color:var(--dim);padding-top:2px}
+.tl-agent{font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;padding-top:2px}
+.tl-agent.a{color:var(--red)} .tl-agent.o{color:var(--blue)} .tl-agent.s{color:var(--dim)}
+.tl-tactic{font-size:10px;color:var(--dim);font-family:var(--mono);padding-top:2px;word-break:break-word}
+.tl-desc{color:var(--text);line-height:1.5}
+.tl-desc code{background:var(--bg3);padding:1px 4px;border-radius:2px;
+  font-family:var(--mono);font-size:11px;color:var(--blue)}
+
+/* ── SCROLLBAR ───────────────────────────────────────────── */
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--border)}
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ──────────────────────────────────────────── -->
+<header class="app-header">
+  <div class="logo">
+    <svg class="icon" width="22" height="22" viewBox="0 0 22 22" fill="none">
+      <path d="M11 2L20 7V15L11 20L2 15V7L11 2Z" stroke="#f85149" stroke-width="1.4" fill="rgba(248,81,73,.08)"/>
+      <path d="M11 2L20 7V15L11 20L2 15V7L11 2Z" stroke="#58a6ff" stroke-width="1.4" fill="none" stroke-dasharray="3 3" opacity=".55"/>
+      <circle cx="11" cy="11" r="2.2" fill="#c9d1d9"/>
+    </svg>
+    <span class="logo-text">Sistema Adversarial</span>
+    <span class="logo-badge" style="white-space:nowrap">MITRE ATT&amp;CK</span>
+  </div>
+  <div class="header-pills" id="header-pills" style="display:none">
+    <span class="hpill"><span class="dot dot-red"></span><strong id="hm-scenario">—</strong></span>
+    <span class="hpill"><span class="dot dot-blue"></span><strong id="hm-target">—</strong></span>
+    <span class="hpill"><span class="dot dot-green"></span><strong id="hm-elapsed">—</strong></span>
+  </div>
+  <div class="live-badge" id="live-badge">
+    <span class="live-dot"></span>LIVE
+  </div>
+</header>
+
+<!-- ── NAV ─────────────────────────────────────────────── -->
+<nav class="nav" id="nav">
+  <div class="nav-inner">
+    <div class="ntab active" data-page="battle">
+      <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M2 8h5M9 8h5M7 2l-2 6 2 6M9 2l2 6-2 6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      Batalla en Paralelo
+    </div>
+    <div class="ntab" data-page="summary">
+      <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="2" y="9" width="3" height="5" rx="1" fill="currentColor"/><rect x="6.5" y="6" width="3" height="8" rx="1" fill="currentColor"/><rect x="11" y="3" width="3" height="11" rx="1" fill="currentColor"/></svg>
+      Resumen
+    </div>
+    <div class="ntab" data-page="tactics">
+      <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 4h10M3 8h7M3 12h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      Tácticas
+    </div>
+    <div class="ntab" data-page="timeline">
+      <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.4"/><path d="M8 5v3.5l2 1.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+      Timeline
+    </div>
+  </div>
+</nav>
+
+<!-- ── UPLOAD ───────────────────────────────────────────── -->
+<div id="upload-screen">
+  <div class="upload-card">
+    <svg width="42" height="42" viewBox="0 0 42 42" fill="none" style="margin-bottom:18px">
+      <path d="M21 4L37 13V29L21 38L5 29V13L21 4Z" stroke="#58a6ff" stroke-width="1.4" fill="rgba(88,166,255,.07)"/>
+      <path d="M21 4L37 13V29L21 38L5 29V13L21 4Z" stroke="#f85149" stroke-width="1.4" fill="none" stroke-dasharray="4 4" opacity=".4"/>
+      <circle cx="21" cy="21" r="4.5" fill="#c9d1d9"/>
+    </svg>
+    <h2>Sistema Adversarial MITRE ATT&amp;CK</h2>
+    <p>Carga el archivo <code>session.json</code> generado por una corrida del sistema para visualizar los eventos del atacante y observador en paralelo.</p>
+    <div class="file-input-wrap">
+      <button class="btn-primary">
+        <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 2v8M5 7l3-3 3 3M3 13h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Cargar session.json
+      </button>
+      <input type="file" id="file-input" accept=".json">
+    </div>
+    <div class="sep">— o —</div>
+    <button class="btn-ghost" id="load-demo-btn">
+      <svg class="icon" width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.4"/><path d="M6 5.5l4 2.5-4 2.5V5.5Z" fill="currentColor"/></svg>
+      Cargar demo (mrrobot)
+    </button>
+    <div class="upload-hint">poetry run python -m src.main --scenario mrrobot → session.json</div>
+
+    <!-- LIVE MODE -->
+    <div class="live-row">
+      <input type="checkbox" id="live-check">
+      <label for="live-check">
+        <svg class="icon" width="12" height="12" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="3" fill="var(--green)"/><circle cx="7" cy="7" r="6" stroke="var(--green)" stroke-width="1.2" opacity=".4"/></svg>
+        Modo live — polling cada
+      </label>
+      <select id="live-interval" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px">
+        <option value="3000">3s</option>
+        <option value="5000" selected>5s</option>
+        <option value="10000">10s</option>
+        <option value="30000">30s</option>
+      </select>
+      <input type="text" id="live-url" class="live-url-input" placeholder="URL de session.json" value="session.json">
+    </div>
+    <div style="font-size:11px;color:var(--dim);margin-top:8px">
+      En live mode el frontend hace polling al archivo JSON y actualiza automáticamente mientras corre el ataque.
+    </div>
+  </div>
+</div>
+
+<!-- ── APP ──────────────────────────────────────────────── -->
+<div id="app">
+
+  <!-- BATTLE PAGE -->
+  <div class="page active" id="page-battle">
+    <div class="sbar" id="sbar"></div>
+    <div class="battle-wrap" id="battle-wrap">
+      <div class="battle-headers">
+        <div class="bh atk">
+          <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 13L8 2l5 11M5.5 9h5" stroke="#f85149" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span class="bh-label r">Atacante</span>
+          <span class="bh-model" id="atk-model">—</span>
+        </div>
+        <div class="bh obs">
+          <svg class="icon" width="14" height="14" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" stroke="#58a6ff" stroke-width="1.4"/><path d="M2 8s2-5 6-5 6 5 6 5-2 5-6 5-6-5-6-5Z" stroke="#58a6ff" stroke-width="1.4"/></svg>
+          <span class="bh-label b">Observador</span>
+          <span class="bh-model" id="obs-model">—</span>
+        </div>
+      </div>
+      <div id="battle-body"></div>
+    </div>
+  </div>
+
+  <!-- SUMMARY PAGE -->
+  <div class="page" id="page-summary">
+    <div class="sgrid" id="sgrid"></div>
+    <div class="two-col">
+      <div>
+        <div class="sec-title">Tácticas del Atacante</div>
+        <table class="gtable" id="tactics-table">
+          <thead><tr><th>Táctica</th><th>Estado</th><th>Acciones</th><th>Replans</th><th>Duración</th></tr></thead>
+          <tbody id="tactics-tbody"></tbody>
+        </table>
+        <div class="sec-title">Comparación Ground Truth vs Observador</div>
+        <div id="comparison-block"></div>
+        <div class="sec-title">Uso del LLM</div>
+        <div id="llm-usage-block"></div>
+      </div>
+      <div>
+        <div class="sec-title">F1 por Táctica (multi-label)</div>
+        <div id="f1-chart" style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px"></div>
+        <div class="sec-title">Bootstrap CI 95% (1000 resamples)</div>
+        <div id="ci-block" style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px"></div>
+        <div class="sec-title">Pipeline del Observador</div>
+        <div id="pipeline-block" style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px"></div>
+        <div class="sec-title">Infraestructura</div>
+        <div id="infra-block" style="border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:18px"></div>
+      </div>
+    </div>
+    <div class="sec-title">Matriz de Confusión</div>
+    <div class="cm-wrap" id="cm-wrap"></div>
+  </div>
+
+  <!-- TACTICS PAGE -->
+  <div class="page" id="page-tactics">
+    <div style="font-size:12px;color:var(--dim);margin-bottom:16px">
+      Herramientas ejecutadas, evidencia recolectada y feedback del validador por táctica del atacante.
+    </div>
+    <div class="tc-list" id="tc-list"></div>
+  </div>
+
+  <!-- TIMELINE PAGE -->
+  <div class="page" id="page-timeline">
+    <div class="tl-filters">
+      <button class="fbtn on" data-f="all">
+        <svg class="icon" width="12" height="12" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.3"/></svg>
+        Todos
+      </button>
+      <button class="fbtn fa" data-f="attacker">
+        <svg class="icon" width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M2 12L7 1l5 11M4 9h6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Atacante
+      </button>
+      <button class="fbtn fo" data-f="observer">
+        <svg class="icon" width="12" height="12" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2.5" stroke="currentColor" stroke-width="1.3"/><path d="M1.5 7s2-4.5 5.5-4.5S12.5 7 12.5 7s-2 4.5-5.5 4.5S1.5 7 1.5 7Z" stroke="currentColor" stroke-width="1.3"/></svg>
+        Observador
+      </button>
+      <button class="fbtn" data-f="system">
+        <svg class="icon" width="12" height="12" viewBox="0 0 14 14" fill="none"><rect x="2" y="3" width="10" height="8" rx="1" stroke="currentColor" stroke-width="1.3"/><path d="M5 11v1.5M9 11v1.5M4 13.5h6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        Sistema
+      </button>
+    </div>
+    <div class="tl-list" id="tl-list"></div>
+  </div>
+
+</div><!-- #app -->
+
+<script>
+// ════════════════════════════════════════════════════════════
+// DATA & STATE
+// ════════════════════════════════════════════════════════════
+let SESSION = null;
+let liveTimer = null;
+let liveUrl = 'session.json';
+let liveInterval = 5000;
+
+// ════════════════════════════════════════════════════════════
+// UTILS
+// ════════════════════════════════════════════════════════════
+const esc = s => String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const trunc = (s,n) => { s=String(s??''); return s.length>n?s.slice(0,n)+'…':s; };
+const fmtTs = iso => { try{return new Date(iso).toISOString().slice(11,19);}catch{return String(iso??'').slice(11,19);} };
+const fmtElapsed = s => { s=Math.floor(s); const m=Math.floor(s/60),h=Math.floor(m/60); return h?`${h}h ${m%60}m ${s%60}s`:`${m}m ${s%60}s`; };
+const fmtK = n => n>=1000?(n/1000).toFixed(1)+'K':String(n);
+const confCls = c => c>=.8?'hi':c>=.6?'md':'lo';
+const confColor = c => c>=.8?'var(--green)':c>=.6?'var(--yellow)':'var(--red)';
+
+const SHORT = {
+  'reconnaissance':'recon','initial access':'init_acc','execution':'exec',
+  'discovery':'disc','credential access':'cred_acc','privilege escalation':'priv_esc',
+  'persistence':'persist','lateral movement':'lateral','defense evasion':'def_ev',
+  'command and control':'c2','exfiltration':'exfil','impact':'impact'
+};
+const shortT = t => SHORT[t.toLowerCase()] || t.slice(0,8);
+
+// ════════════════════════════════════════════════════════════
+// FILE INPUT
+// ════════════════════════════════════════════════════════════
+document.getElementById('file-input').addEventListener('change', e => {
+  const f = e.target.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = ev => { try{loadSession(JSON.parse(ev.target.result));}catch(err){alert('JSON inválido: '+err.message);} };
+  r.readAsText(f);
+});
+
+document.getElementById('load-demo-btn').addEventListener('click', () => {
+  fetch('sample_session.json').then(r=>r.json()).then(d=>loadSession(d)).catch(()=>alert('No se encontró sample_session.json'));
+});
+
+// Auto-load via query param ?session=/path/to.json. Usado por
+// `python -m src.main --open-frontend` para abrir el frontend apuntando al
+// JSON recien generado sin que el usuario haga upload manual.
+(function autoLoadFromQuery(){
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const sessionParam = params.get('session');
+    if (!sessionParam) return;
+    fetch(sessionParam + (sessionParam.includes('?') ? '&' : '?') + '_=' + Date.now())
+      .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(d => loadSession(d))
+      .catch(err => console.warn('No se pudo cargar session via ?session=:', err));
+  } catch (err) { /* noop */ }
+})();
+
+// ════════════════════════════════════════════════════════════
+// LIVE MODE
+// ════════════════════════════════════════════════════════════
+function startLive() {
+  liveUrl = document.getElementById('live-url').value || 'session.json';
+  liveInterval = parseInt(document.getElementById('live-interval').value) || 5000;
+  document.getElementById('live-badge').classList.add('on');
+  fetchAndUpdate();
+  liveTimer = setInterval(fetchAndUpdate, liveInterval);
+}
+
+function stopLive() {
+  clearInterval(liveTimer); liveTimer = null;
+  document.getElementById('live-badge').classList.remove('on');
+}
+
+function fetchAndUpdate() {
+  fetch(liveUrl+'?_='+Date.now())
+    .then(r=>r.json())
+    .then(d=>{
+      const wasNull = !SESSION;
+      SESSION = d;
+      if(wasNull){
+        showApp();
+      } else {
+        renderAll();
+      }
+    })
+    .catch(err=>console.warn('Live fetch failed:',err));
+}
+
+// ════════════════════════════════════════════════════════════
+// LOAD SESSION
+// ════════════════════════════════════════════════════════════
+function loadSession(data) {
+  SESSION = data;
+  showApp();
+  if(document.getElementById('live-check').checked) startLive();
+}
+
+function showApp() {
+  document.getElementById('upload-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('nav').style.display = 'block';
+  document.getElementById('header-pills').style.display = 'flex';
+  renderAll();
+}
+
+// ════════════════════════════════════════════════════════════
+// NAV
+// ════════════════════════════════════════════════════════════
+document.querySelectorAll('.ntab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.ntab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById('page-'+tab.dataset.page).classList.add('active');
+  });
+});
+
+// ════════════════════════════════════════════════════════════
+// RENDER ALL
+// ════════════════════════════════════════════════════════════
+function renderAll() {
+  const m = SESSION.metadata||{}, events = SESSION.events||[];
+  // header
+  document.getElementById('hm-scenario').textContent = m.scenario||'—';
+  document.getElementById('hm-target').textContent = m.target||'—';
+  document.getElementById('hm-elapsed').textContent = m.elapsed_seconds?fmtElapsed(m.elapsed_seconds):'—';
+  document.getElementById('atk-model').textContent = trunc(m.attacker_model||'—',34);
+  document.getElementById('obs-model').textContent = trunc(m.observer_model||'—',34);
+  renderSessionBar(m,events);
+  renderBattle(events,m);
+  renderSummary(events,m);
+  renderTactics(events);
+  renderTimeline(events);
+}
+
+// ════════════════════════════════════════════════════════════
+// SESSION BAR
+// ════════════════════════════════════════════════════════════
+function renderSessionBar(m, events) {
+  const atk = events.filter(e=>e.agent==='attacker');
+  const obs = events.filter(e=>e.agent==='observer');
+  const met = atk.filter(e=>e.event_type==='objective_check'&&e.payload.success).length;
+  const total = atk.filter(e=>e.event_type==='tactic_end').length;
+  const actions = atk.filter(e=>e.event_type==='tool_call').length;
+  const replans = atk.filter(e=>e.event_type==='replan').length;
+  const classifs = obs.filter(e=>e.event_type==='classify').length;
+  const ev = m.evaluation||{};
+  const acc = ev.strict_accuracy!=null ? Math.round(ev.strict_accuracy*100)+'%' : '—';
+
+  const fields = [
+    {l:'Escenario',v:m.scenario||'—',c:''},
+    {l:'Target',v:m.target||'—',c:'b'},
+    {l:'Tácticas',v:`${met}/${total}`,c:met===total&&total>0?'g':'r'},
+    {l:'Accuracy obs.',v:acc,c:ev.strict_accuracy>=.8?'g':ev.strict_accuracy>=.6?'y':'r'},
+    {l:'Acciones',v:actions,c:''},
+    {l:'Replans',v:replans,c:replans>0?'y':''},
+    {l:'Clasificaciones',v:classifs,c:'b'},
+    {l:'Atacante',v:trunc(m.attacker_model||'—',20),c:'r'},
+    {l:'Observador',v:trunc(m.observer_model||'—',20),c:'b'},
+    {l:'Seed',v:m.seed??'—',c:''},
+    {l:'Duración',v:m.elapsed_seconds?fmtElapsed(m.elapsed_seconds):'—',c:''},
+  ];
+  document.getElementById('sbar').innerHTML = fields.map(f=>
+    `<div class="sfield"><div class="sl">${esc(f.l)}</div><div class="sv ${f.c}">${esc(String(f.v))}</div></div>`
+  ).join('');
+}
+
+// ════════════════════════════════════════════════════════════
+// BATTLE — WINDOWED VIEW
+// ════════════════════════════════════════════════════════════
+function renderBattle(events, m) {
+  // Build observer windows
+  const obsWindows = buildObsWindows(events);
+  // Build attacker events grouped by which obs window they fall in
+  const atkEvents = events.filter(e=>e.agent==='attacker');
+
+  let html = '';
+
+  obsWindows.forEach((win, idx) => {
+    const winStart = new Date(win.start).getTime();
+    const winEnd   = new Date(win.end).getTime();
+
+    // Attacker events in this window's time range
+    const atkInWin = atkEvents.filter(e => {
+      const t = new Date(e.timestamp).getTime();
+      return t >= winStart && t <= winEnd;
+    });
+
+    // Attacker events before first window
+    let extraAtk = [];
+    if (idx === 0) {
+      extraAtk = atkEvents.filter(e => new Date(e.timestamp).getTime() < winStart);
+    }
+    const allAtk = [...extraAtk, ...atkInWin];
+
+    html += `
+      <div class="win-block">
+        <div class="win-header">
+          <div class="wh-cell atk">
+            <span class="win-num r">Ventana ${idx+1}</span>
+            <span class="win-range">${fmtTs(win.start)} → ${fmtTs(win.end)}</span>
+          </div>
+          <div class="wh-cell obs">
+            <span class="win-num b">Ventana obs. ${idx+1}</span>
+            <span class="win-range">${fmtTs(win.start)} → ${fmtTs(win.end)}</span>
+          </div>
+        </div>
+        <div class="win-body">
+          <div class="wcol atk">${buildAtkCol(allAtk)}</div>
+          <div class="wcol obs">${buildObsCol(win.events)}</div>
+        </div>
+      </div>`;
+  });
+
+  // Attacker events after all windows
+  const lastWinEnd = obsWindows.length ? new Date(obsWindows[obsWindows.length-1].end).getTime() : 0;
+  const atkTail = atkEvents.filter(e => new Date(e.timestamp).getTime() > lastWinEnd);
+  if (atkTail.length) {
+    html += `
+      <div class="win-block">
+        <div class="win-header">
+          <div class="wh-cell atk">
+            <span class="win-num r" style="opacity:.5">Post-ataque</span>
+          </div>
+          <div class="wh-cell obs">
+            <span style="font-size:11px;color:var(--dim);padding:0 4px">Sin ventana</span>
+          </div>
+        </div>
+        <div class="win-body">
+          <div class="wcol atk">${buildAtkCol(atkTail)}</div>
+          <div class="wcol obs"><div class="obs-pending">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".3"/></svg>
+            Sin clasificación
+          </div></div>
+        </div>
+      </div>`;
+  }
+
+  if (!html) html = '<div style="padding:40px;text-align:center;color:var(--dim)">Sin eventos</div>';
+  document.getElementById('battle-body').innerHTML = html;
+}
+
+function buildObsWindows(events) {
+  const windows = [];
+  let cur = null;
+  events.filter(e=>e.agent==='observer').forEach(e => {
+    if (e.event_type==='window_start') {
+      cur = { start: e.payload.window_start||e.timestamp, end: e.payload.window_end||e.timestamp, events:[] };
+      cur.events.push(e);
+    } else if (cur) {
+      cur.events.push(e);
+      if (e.event_type==='window_end') { windows.push(cur); cur=null; }
+    }
+  });
+  if (cur) windows.push(cur);
+  return windows;
+}
+
+function buildAtkCol(events) {
+  if (!events.length) return '<div class="obs-pending"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.2" opacity=".3"/></svg>Sin actividad</div>';
+  let html = '';
+  for (let i=0;i<events.length;i++) {
+    const ev=events[i], p=ev.payload||{}, ts=fmtTs(ev.timestamp);
+    if (ev.event_type==='tactic_start') {
+      html+=`<div class="ev tactic-start">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind r">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M2 12L7 1l5 11M4.5 9h5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          NUEVA TÁCTICA
+        </div>
+        <div class="ev-main"><span class="tname r">${esc(ev.tactic)}</span></div>
+      </div>`;
+    } else if (ev.event_type==='tool_call') {
+      const tool=p.tool||'?', args=p.args||{};
+      const argStr=Object.entries(args).map(([k,v])=>`${k}=${trunc(String(v),50)}`).join(' ');
+      html+=`<div class="ev">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind y">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M9 2l3 3-7 7-3-3L9 2zM11 5l-1-1M2 12l1-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          HERRAMIENTA
+        </div>
+        <div class="ev-main"><span class="tool">${esc(tool)}</span><br><span class="arg">${esc(trunc(argStr,120))}</span></div>
+      </div>`;
+    } else if (ev.event_type==='tool_result') {
+      const preview=trunc(p.preview||'',250);
+      html+=`<div class="ev">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind d">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><rect x="2" y="2" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.3"/><path d="M5 5h4M5 7h3M5 9h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+          RESULTADO — ${p.size||0} chars
+        </div>
+        <div class="ev-pre">${esc(preview)}</div>
+      </div>`;
+    } else if (ev.event_type==='replan') {
+      html+=`<div class="ev ev-warn">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind y">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M7 2v6M7 10v2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".4"/></svg>
+          REPLAN #${p.attempt||''}
+        </div>
+        <div class="ev-main">${esc(trunc(p.feedback||'',160))}</div>
+      </div>`;
+    } else if (ev.event_type==='objective_check') {
+      const ok=p.success;
+      html+=`<div class="ev ${ok?'ev-ok':'ev-fail'}">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind ${ok?'g':'r'}">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none">${ok?'<path d="M2.5 7l3 3 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>':'<path d="M3 3l8 8M11 3l-8 8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>'}<circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".4"/></svg>
+          ${ok?'OBJETIVO CUMPLIDO':'OBJETIVO FALLIDO'}
+        </div>
+        <div class="ev-main">${esc(trunc(p.reason||'',160))}</div>
+      </div>`;
+    } else if (ev.event_type==='tactic_end') {
+      const ok=p.success;
+      html+=`<div class="ev ${ok?'ev-ok':'ev-fail'}">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind ${ok?'g':'r'}">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M2 7h10M9 4l3 3-3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          TÁCTICA ${ok?'COMPLETADA':'FALLIDA'}
+        </div>
+        <div class="ev-main" style="font-weight:600">${esc(ev.tactic)}</div>
+      </div>`;
+    }
+  }
+  return html;
+}
+
+function buildObsCol(events) {
+  if (!events.length) return `<div class="obs-pending">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".3"/></svg>
+    Sin eventos
+  </div>`;
+  let html = '';
+  events.forEach(ev => {
+    const p=ev.payload||{}, ts=fmtTs(ev.timestamp);
+    if (ev.event_type==='window_start') return; // handled in header
+    if (ev.event_type==='window_end') return;
+    if (ev.event_type==='triage') {
+      const sig=p.result==='signal', sigs=p.signals||[];
+      html+=`<div class="ev tactic-start obs-side">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind ${sig?'y':'d'}">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M7 1v3M7 10v3M1 7h3M10 7h3M3.2 3.2l2.1 2.1M8.7 8.7l2.1 2.1M10.8 3.2l-2.1 2.1M5.3 8.7l-2.1 2.1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+          TRIAGE — ${sig?'SEÑAL':'SIN SEÑAL'}
+        </div>
+        ${sigs.length?`<div class="signals">${sigs.map(s=>`<span class="sig ${sig?'y':''}">${esc(s)}</span>`).join('')}</div>`:''}
+      </div>`;
+    } else if (ev.event_type==='refine') {
+      html+=`<div class="ev ev-refine">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind p">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M3 7a4 4 0 0 1 7.5-2M11 7a4 4 0 0 1-7.5 2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M11 3v2h-2M3 11v-2h2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          REFINAMIENTO #${p.count||''}
+        </div>
+        <div class="ev-main">${esc(trunc(p.reason||'Confianza baja',140))}</div>
+      </div>`;
+    } else if (ev.event_type==='classify') {
+      const tactic=p.tactic||ev.tactic||'?', conf=p.confidence||0;
+      const evidence=p.evidence||[], rec=p.recommendation||'';
+      const tiw=p.tactics_in_window||[];
+      html+=`<div class="ev ${conf>=.8?'ev-ok':conf>=.6?'':' ev-fail'}">
+        <div class="ev-ts">${ts}</div>
+        <div class="ev-kind b">
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2.5" stroke="currentColor" stroke-width="1.3"/><path d="M1.5 7s2-4.5 5.5-4.5S12.5 7 12.5 7s-2 4.5-5.5 4.5S1.5 7 1.5 7Z" stroke="currentColor" stroke-width="1.3"/></svg>
+          CLASIFICACIÓN${p.refinement_count>0?' ⟳':''}
+        </div>
+        <div class="ev-main"><span class="tname b">${esc(tactic)}</span></div>
+        <div class="cbar-row">
+          <div class="cbar"><div class="cfill ${confCls(conf)}" style="width:${Math.round(conf*100)}%"></div></div>
+          <span class="cpct" style="color:${confColor(conf)}">${Math.round(conf*100)}%</span>
+          ${p.llm_latency_ms?`<span style="font-size:10px;color:var(--dim);font-family:var(--mono);margin-left:4px">${(p.llm_latency_ms/1000).toFixed(1)}s</span>`:''}
+        </div>
+        ${tiw.length>1?`<div style="margin-top:4px;font-size:10px;color:var(--dim)">en ventana: ${tiw.map(t=>esc(t.tactic||t)).join(', ')}</div>`:''}
+        ${evidence.length?`<ul class="ev-list">${evidence.slice(0,3).map(e=>`<li>${esc(trunc(String(e),100))}</li>`).join('')}</ul>`:''}
+        ${rec?`<div class="rec">${esc(trunc(rec,180))}</div>`:''}
+      </div>`;
+    }
+  });
+  return html || `<div class="obs-pending">
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".3"/></svg>
+    Sin clasificación
+  </div>`;
+}
+
+// ════════════════════════════════════════════════════════════
+// SUMMARY
+// ════════════════════════════════════════════════════════════
+function renderSummary(events, m) {
+  const atk=events.filter(e=>e.agent==='attacker');
+  const obs=events.filter(e=>e.agent==='observer');
+  const ev=m.evaluation||{};
+  const met=atk.filter(e=>e.event_type==='objective_check'&&e.payload.success).length;
+  const total=atk.filter(e=>e.event_type==='tactic_end').length;
+  const actions=atk.filter(e=>e.event_type==='tool_call').length;
+  const replans=atk.filter(e=>e.event_type==='replan').length;
+  const classifs=obs.filter(e=>e.event_type==='classify');
+  const triages=obs.filter(e=>e.event_type==='triage');
+  const avgConf = classifs.length? classifs.reduce((a,c)=>a+(c.payload.confidence||0),0)/classifs.length : 0;
+
+  // Stat cards
+  const cards = [
+    {l:'Accuracy Estricta', v:ev.strict_accuracy!=null?`${Math.round(ev.strict_accuracy*100)}%`:'—', c:ev.strict_accuracy>=.8?'g':ev.strict_accuracy>=.6?'y':'r', sub:`${ev.evaluable_windows||'?'}/${ev.total_windows||'?'} ventanas`},
+    {l:'Accuracy Ventana', v:ev.window_accuracy!=null?`${Math.round(ev.window_accuracy*100)}%`:'—', c:ev.window_accuracy>=.8?'g':ev.window_accuracy>=.6?'y':'r', sub:'multi-tactic match'},
+    {l:'Micro F1', v:ev.micro_f1!=null?ev.micro_f1.toFixed(3):'—', c:ev.micro_f1>=.8?'g':ev.micro_f1>=.6?'y':'r', sub:'micro avg'},
+    {l:'Macro F1', v:ev.macro_f1!=null?ev.macro_f1.toFixed(3):'—', c:ev.macro_f1>=.8?'g':ev.macro_f1>=.6?'y':'r', sub:'macro avg'},
+    {l:'Tácticas Atacante', v:`${met}/${total}`, c:met===total&&total>0?'g':'r', sub:'cumplidas'},
+    {l:'Confianza Promedio', v:`${Math.round(avgConf*100)}%`, c:avgConf>=.8?'g':avgConf>=.6?'y':'r', sub:'observador LLM'},
+    {l:'Acciones', v:actions, c:'', sub:'herramientas'},
+    {l:'Replans', v:replans, c:replans>0?'y':'', sub:'replanificaciones'},
+  ];
+  document.getElementById('sgrid').innerHTML = cards.map(c=>
+    `<div class="scard"><div class="sl">${esc(c.l)}</div><div class="sv ${c.c}">${esc(String(c.v))}</div><div class="ssub">${esc(c.sub)}</div></div>`
+  ).join('');
+
+  // Tactics table
+  const tacticInfo = buildTacticInfo(atk);
+  const durs = (m.tactic_durations)||{};
+  document.getElementById('tactics-tbody').innerHTML = Object.entries(tacticInfo).map(([t,info])=>`
+    <tr>
+      <td><strong>${esc(t)}</strong></td>
+      <td><span class="badge ${info.success?'ok':'fail'}">${info.success?'CUMPLIDA':'FALLIDA'}</span></td>
+      <td class="mono">${info.actions}</td>
+      <td class="mono">${info.replans}</td>
+      <td class="mono">${durs[t]?fmtElapsed(durs[t]):'—'}</td>
+    </tr>`).join('');
+
+  // Comparison block
+  const realTactics=[...new Set(atk.filter(e=>e.event_type==='tactic_start').map(e=>e.tactic))];
+  document.getElementById('comparison-block').innerHTML = `
+    <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:18px">
+      <div style="display:grid;grid-template-columns:130px 1fr 1fr 60px;gap:8px;padding:7px 12px;background:var(--bg2);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px">
+        <span>Táctica</span><span style="color:var(--red)">Real</span><span style="color:var(--blue)">Observador</span><span>Match</span>
+      </div>
+      ${realTactics.map(t => {
+        const cls=classifs.find(c=>(c.payload.tactic||c.tactic||'').toLowerCase().trim()===t.toLowerCase().trim());
+        const obsName=cls?(cls.payload.tactic||cls.tactic):'—';
+        const match=obsName.toLowerCase().trim()===t.toLowerCase().trim();
+        return `<div style="display:grid;grid-template-columns:130px 1fr 1fr 60px;gap:8px;padding:8px 12px;border-top:1px solid var(--bg3);font-size:12px;align-items:center">
+          <span style="font-weight:600;color:var(--bright)">${esc(t)}</span>
+          <span style="font-family:var(--mono);color:var(--red)">${esc(t)}</span>
+          <span style="font-family:var(--mono);color:var(--blue)">${esc(obsName)}</span>
+          <span style="font-size:11px;font-weight:700;color:${match?'var(--green)':'var(--red)'}">${match?'✓ OK':'✗ MISS'}</span>
+        </div>`;
+      }).join('')}
+    </div>`;
+
+  // F1 per tactic
+  const perTactic = ev.per_tactic||{};
+  document.getElementById('f1-chart').innerHTML = Object.keys(perTactic).length ? `
+    <div style="margin-bottom:8px;display:grid;grid-template-columns:130px 50px 1fr 40px;gap:6px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px">
+      <span>Táctica</span><span style="text-align:right">F1</span><span>Barra</span><span>Sup.</span>
+    </div>
+    ${Object.entries(perTactic).map(([t,d])=>{
+      const f1=d.f1||0;
+      return `<div style="display:grid;grid-template-columns:130px 50px 1fr 40px;gap:6px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bg3)">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--bright)">${esc(shortT(t))}</span>
+        <span style="font-family:var(--mono);font-size:11px;text-align:right;color:${confColor(f1)}">${f1.toFixed(2)}</span>
+        <div style="height:5px;background:var(--bg3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${Math.round(f1*100)}%;background:${confColor(f1)};border-radius:3px"></div></div>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right">${d.support||0}</span>
+      </div>`;
+    }).join('')}
+    <div style="display:grid;grid-template-columns:130px 50px 1fr 40px;gap:6px;align-items:center;padding:7px 0;margin-top:4px;border-top:2px solid var(--border)">
+      <span style="font-size:11px;font-weight:600;color:var(--bright)">Micro F1</span>
+      <span style="font-family:var(--mono);font-size:12px;font-weight:700;text-align:right;color:${confColor(ev.micro_f1||0)}">${(ev.micro_f1||0).toFixed(3)}</span>
+      <span></span><span></span>
+    </div>` : '<div style="color:var(--dim);font-size:12px">Sin datos de evaluación en el JSON.</div>';
+
+  // Bootstrap CI
+  const ci=ev.bootstrap_ci||{};
+  document.getElementById('ci-block').innerHTML = Object.keys(ci).length ? `
+    <div style="display:grid;grid-template-columns:130px 60px 60px 60px 60px;gap:6px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">
+      <span>Métrica</span><span style="text-align:right">Mean</span><span style="text-align:right">CI low</span><span style="text-align:right">CI high</span><span style="text-align:right">Width</span>
+    </div>
+    ${Object.entries(ci).map(([k,arr])=>{
+      const [mean,lo,hi]=arr;
+      const w=hi-lo;
+      return `<div style="display:grid;grid-template-columns:130px 60px 60px 60px 60px;gap:6px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bg3);font-size:12px">
+        <span style="font-family:var(--mono);color:var(--bright)">${esc(k)}</span>
+        <span style="font-family:var(--mono);text-align:right;color:${confColor(mean)};font-weight:600">${mean.toFixed(3)}</span>
+        <span style="font-family:var(--mono);text-align:right;color:var(--dim)">${lo.toFixed(3)}</span>
+        <span style="font-family:var(--mono);text-align:right;color:var(--dim)">${hi.toFixed(3)}</span>
+        <span style="font-family:var(--mono);text-align:right;color:var(--dim)">${w.toFixed(3)}</span>
+      </div>`;
+    }).join('')}` : '<div style="color:var(--dim);font-size:12px">No hay datos de bootstrap CI. Se calculan con <code>--run</code> completo.</div>';
+
+  // Pipeline
+  const pipe=m.observer_pipeline||{};
+  const t_sig=pipe.triage_signal||0, t_no=pipe.triage_no_signal||0, tot=t_sig+t_no;
+  document.getElementById('pipeline-block').innerHTML = tot ? `
+    ${pipeRow('Ventanas totales', tot, tot, '')}
+    ${pipeRow('Con señal (→ LLM)', t_sig, tot, 'var(--yellow)')}
+    ${pipeRow('Sin señal (corto-circuito)', t_no, tot, 'var(--green)')}
+    ${pipeRow('Refinamientos', pipe.refine_calls||0, t_sig||1, 'var(--purple)')}
+    ${pipeRow('Clasificaciones totales', pipe.classify_calls||0, t_sig||1, 'var(--blue)')}
+    <div style="margin-top:8px;font-size:11px;color:var(--dim)">Tasa corto-circuito: <strong style="color:var(--green)">${tot?Math.round(t_no/tot*100):0}%</strong> — ventanas que evitaron el LLM</div>
+  ` : '<div style="color:var(--dim);font-size:12px">Sin datos de pipeline.</div>';
+
+  // Infra
+  const dk=m.docker_stats||{}, lk=m.loki_stats||{};
+  document.getElementById('infra-block').innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Docker exec</div>
+        ${infraRow('Execs totales', dk.exec_count||0)}
+        ${infraRow('Tiempo total', dk.total_seconds?fmtElapsed(dk.total_seconds):'—')}
+        ${infraRow('Avg por exec', dk.exec_count?(dk.total_seconds/dk.exec_count).toFixed(1)+'s':'—')}
+        ${infraRow('Timeouts', dk.timed_out_count||0)}
+        ${infraRow('Errores API', dk.error_count||0)}
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Loki queries</div>
+        ${infraRow('Queries totales', lk.query_count||0)}
+        ${infraRow('Tiempo total', lk.total_seconds?fmtElapsed(lk.total_seconds):'—')}
+        ${infraRow('Avg por query', lk.query_count?(lk.total_seconds/lk.query_count*1000).toFixed(0)+'ms':'—')}
+        ${infraRow('Errores', lk.error_count||0)}
+      </div>
+    </div>`;
+
+  // LLM Usage
+  const lu=m.llm_usage||{}, la=lu.attacker||{}, lo=lu.observer||{};
+  document.getElementById('llm-usage-block').innerHTML = `
+    <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:18px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;background:var(--bg2)">
+        <div style="padding:8px 12px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border)">Métrica</div>
+        <div style="padding:8px 12px;font-size:10px;color:var(--red);text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);text-align:right">Atacante</div>
+        <div style="padding:8px 12px;font-size:10px;color:var(--blue);text-transform:uppercase;letter-spacing:.6px;border-bottom:1px solid var(--border);text-align:right">Observador</div>
+      </div>
+      ${llmRow('Proveedor', la.provider||'—', lo.provider||'—')}
+      ${llmRow('Llamadas LLM', la.call_count||0, lo.call_count||0)}
+      ${llmRow('Tokens input', fmtK(la.input_tokens||0), fmtK(lo.input_tokens||0))}
+      ${llmRow('Tokens output', fmtK(la.output_tokens||0), fmtK(lo.output_tokens||0))}
+      ${llmRow('Cache creation', fmtK(la.cache_creation_input_tokens||0), fmtK(lo.cache_creation_input_tokens||0))}
+      ${llmRow('Cache read', fmtK(la.cache_read_input_tokens||0), fmtK(lo.cache_read_input_tokens||0))}
+      ${llmRow('Tiempo LLM', la.elapsed_seconds?fmtElapsed(la.elapsed_seconds):'—', lo.elapsed_seconds?fmtElapsed(lo.elapsed_seconds):'—')}
+    </div>`;
+
+  // Confusion matrix
+  const cm=ev.confusion_matrix||{};
+  const cmTactics=[...new Set([...Object.keys(cm), ...Object.values(cm).flatMap(r=>Object.keys(r))])];
+  document.getElementById('cm-wrap').innerHTML = cmTactics.length ? `
+    <table class="cm-table">
+      <thead><tr><th>real \\ obs</th>${cmTactics.map(t=>`<th>${esc(shortT(t))}</th>`).join('')}</tr></thead>
+      <tbody>${cmTactics.map(r=>`<tr>
+        <th style="text-align:left">${esc(shortT(r))}</th>
+        ${cmTactics.map(c=>{const v=(cm[r]||{})[c]||0;const cls=r===c&&v>0?'diag':v>0?'miss':'zero';return `<td class="${cls}">${v||'·'}</td>`;}).join('')}
+      </tr>`).join('')}</tbody>
+    </table>` : '<div style="color:var(--dim);font-size:12px">Sin datos de matriz de confusión.</div>';
+}
+
+function pipeRow(label, val, denom, color) {
+  const pct = denom>0?Math.round(val/denom*100):0;
+  return `<div style="display:grid;grid-template-columns:180px 40px 1fr 36px;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bg3);font-size:12px">
+    <span style="color:var(--text)">${esc(label)}</span>
+    <span style="font-family:var(--mono);text-align:right;color:var(--bright)">${val}</span>
+    <div style="height:5px;background:var(--bg3);border-radius:3px;overflow:hidden"><div style="height:100%;width:${pct}%;background:${color||'var(--blue)'};border-radius:3px"></div></div>
+    <span style="font-family:var(--mono);font-size:10px;color:var(--dim);text-align:right">${pct}%</span>
+  </div>`;
+}
+
+function infraRow(label, val) {
+  return `<div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--bg3);font-size:12px">
+    <span style="color:var(--dim)">${esc(label)}</span>
+    <span style="font-family:var(--mono);color:var(--bright)">${esc(String(val))}</span>
+  </div>`;
+}
+
+function llmRow(label, atk, obs) {
+  return `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:0;border-top:1px solid var(--bg3)">
+    <div style="padding:7px 12px;font-size:12px;color:var(--dim)">${esc(label)}</div>
+    <div style="padding:7px 12px;font-size:12px;font-family:var(--mono);color:var(--red);text-align:right">${esc(String(atk))}</div>
+    <div style="padding:7px 12px;font-size:12px;font-family:var(--mono);color:var(--blue);text-align:right">${esc(String(obs))}</div>
+  </div>`;
+}
+
+// ════════════════════════════════════════════════════════════
+// TACTICS
+// ════════════════════════════════════════════════════════════
+function renderTactics(events) {
+  const atk=events.filter(e=>e.agent==='attacker');
+  const byTactic={};
+  atk.forEach(e=>{ if(!e.tactic) return; if(!byTactic[e.tactic]) byTactic[e.tactic]=[]; byTactic[e.tactic].push(e); });
+
+  let html='';
+  Object.entries(byTactic).forEach(([tactic,tevents])=>{
+    const obj=tevents.find(e=>e.event_type==='objective_check');
+    const success=obj?obj.payload.success:null;
+    const tools=tevents.filter(e=>e.event_type==='tool_call');
+    const repl=tevents.filter(e=>e.event_type==='replan');
+    const evidence=obj?(obj.payload.evidence||{}):{};
+    const reason=obj?(obj.payload.reason||''):'';
+    const cid='tc_'+tactic.replace(/\s+/g,'_');
+
+    // pair tool calls with results
+    const pairs=[];
+    let i=0;
+    while(i<tevents.length){
+      if(tevents[i].event_type==='tool_call'){
+        const call=tevents[i];
+        const res=(i+1<tevents.length&&tevents[i+1].event_type==='tool_result')?tevents[i+1]:null;
+        pairs.push({call,res}); i+=res?2:1;
+      } else i++;
+    }
+
+    html+=`<div class="tc-card ${success===true?'ok':success===false?'fail':''}">
+      <div class="tc-hdr" onclick="toggleTC('${cid}')">
+        <span class="tc-name">${esc(tactic)}</span>
+        ${success===true?`<span class="badge ok" style="font-size:10px">Cumplida</span>`:success===false?`<span class="badge fail" style="font-size:10px">Fallida</span>`:''}
+        <div class="tc-meta">
+          <span>
+            <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M9 2l3 3-7 7-3-3L9 2z" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            ${tools.length}
+          </span>
+          <span>
+            <svg width="11" height="11" viewBox="0 0 14 14" fill="none"><path d="M7 2v6M7 10v2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="7" cy="7" r="5.5" stroke="currentColor" stroke-width="1.2" opacity=".4"/></svg>
+            ${repl.length}
+          </span>
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" style="color:var(--dim)"><path d="M3 7l3 3 5-6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+      </div>
+      <div class="tc-body" id="${cid}">
+        ${reason?`<p style="font-size:12px;color:var(--dim);margin-bottom:12px;line-height:1.6;font-style:italic">${esc(reason)}</p>`:''}
+        <div class="tool-list">
+          ${pairs.map(({call,res})=>{
+            const args=call.payload.args||{};
+            const argStr=Object.entries(args).map(([k,v])=>`  ${k}: ${trunc(String(v),80)}`).join('\n');
+            return `<div class="tool-card">
+              <div class="tool-hdr">
+                <svg width="12" height="12" viewBox="0 0 14 14" fill="none"><path d="M9 2l3 3-7 7-3-3L9 2z" stroke="#e3b341" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span class="tool-name">${esc(call.payload.tool||'?')}</span>
+                <span class="tool-ts">${fmtTs(call.timestamp)}</span>
+              </div>
+              <div class="tool-args">${esc(argStr)}</div>
+              ${res?`<div class="tool-result">${esc(trunc(res.payload.preview||'',400))}</div>`:''}
+            </div>`;
+          }).join('')}
+        </div>
+        ${repl.length?`
+          <div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Replans</div>
+          ${repl.map(r=>`<div class="ev-block-card warn">
+            <strong style="color:var(--yellow)">Replan #${r.payload.attempt||''}:</strong> ${esc(trunc(r.payload.feedback||'',200))}
+          </div>`).join('')}` : ''}
+        ${Object.keys(evidence).length?`
+          <div class="evidence-box">
+            <div class="ebt">Evidencia</div>
+            <div class="ekv">
+              ${Object.entries(evidence).map(([k,v])=>`
+                <span class="ek">${esc(k)}</span>
+                <span class="ev2">${esc(Array.isArray(v)?v.join(', '):String(v))}</span>`).join('')}
+            </div>
+          </div>` : ''}
+      </div>
+    </div>`;
+  });
+
+  document.getElementById('tc-list').innerHTML = html || '<div style="padding:40px;text-align:center;color:var(--dim)">Sin tácticas</div>';
+}
+
+function toggleTC(id){
+  const b=document.getElementById(id); if(!b) return;
+  const open=b.classList.contains('open');
+  b.classList.toggle('open',!open);
+  b.style.display=open?'none':'block';
+}
+
+// ════════════════════════════════════════════════════════════
+// TIMELINE
+// ════════════════════════════════════════════════════════════
+function renderTimeline(events) {
+  function desc(ev) {
+    const p=ev.payload||{}, et=ev.event_type;
+    if(et==='tactic_start') return `<strong>→ ${esc(ev.tactic)} iniciada</strong>`;
+    if(et==='tool_call') return `<code>${esc(p.tool||'?')}</code> ${esc(trunc(Object.entries(p.args||{}).map(([k,v])=>`${k}=${v}`).join(' '),100))}`;
+    if(et==='tool_result') return `resultado ${p.size||0} chars — ${esc(trunc(p.preview||'',100))}`;
+    if(et==='objective_check') return `${p.success?'✓':'✗'} <strong>${esc(ev.tactic)}</strong>: ${esc(trunc(p.reason||'',110))}`;
+    if(et==='replan') return `replan #${p.attempt||''}: ${esc(trunc(p.feedback||'',110))}`;
+    if(et==='tactic_end') return `${p.success?'✓':'✗'} <strong>${esc(ev.tactic)}</strong> cerrada`;
+    if(et==='triage') return `triage: <strong>${esc(p.result||'?')}</strong> (${p.signals_count||0} señales)`;
+    if(et==='classify') return `clasificación: <strong style="color:var(--blue)">${esc(p.tactic||ev.tactic||'?')}</strong> (${Math.round((p.confidence||0)*100)}% conf)`;
+    if(et==='refine') return `refinamiento #${p.count||''}`;
+    if(et==='window_start') return `ventana iniciada ${fmtTs(p.window_start)} → ${fmtTs(p.window_end)}`;
+    if(et==='window_end') return `ventana cerrada`;
+    if(et==='session_start') return `<strong>sesión iniciada:</strong> ${esc(p.scenario||'?')}`;
+    if(et==='session_end') return `<strong>sesión finalizada</strong>`;
+    if(et==='error') return `<span style="color:var(--red)">error: ${esc(p.message||'')}</span>`;
+    return esc(et);
+  }
+
+  function build(filter) {
+    const filtered = filter==='all' ? events : events.filter(e=>e.agent===filter);
+    const ag = {attacker:'a',observer:'o',system:'s'};
+    return filtered.map(ev=>`
+      <div class="tl-ev e${ag[ev.agent]||'s'}">
+        <span class="tl-ts">${fmtTs(ev.timestamp)}</span>
+        <span class="tl-agent ${ag[ev.agent]||'s'}">${esc(ev.agent)}</span>
+        <span class="tl-tactic">${esc(ev.tactic||'')}</span>
+        <span class="tl-desc">${desc(ev)}</span>
+      </div>`).join('');
+  }
+
+  document.getElementById('tl-list').innerHTML = build('all');
+
+  document.querySelectorAll('.fbtn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      document.querySelectorAll('.fbtn').forEach(b=>{
+        b.classList.remove('on');
+      });
+      btn.classList.add('on');
+      document.getElementById('tl-list').innerHTML = build(btn.dataset.f);
+    });
+  });
+}
+
+// ════════════════════════════════════════════════════════════
+// HELPERS
+// ════════════════════════════════════════════════════════════
+function buildTacticInfo(atkEvents) {
+  const info={};
+  atkEvents.forEach(e=>{
+    if(!e.tactic) return;
+    if(!info[e.tactic]) info[e.tactic]={actions:0,replans:0,success:null,evidence:{}};
+    if(e.event_type==='tool_call') info[e.tactic].actions++;
+    if(e.event_type==='replan') info[e.tactic].replans++;
+    if(e.event_type==='objective_check'){
+      info[e.tactic].success=e.payload.success;
+      info[e.tactic].evidence=e.payload.evidence||{};
+    }
+  });
+  return info;
+}
+</script>
+</body>
+</html>

@@ -32,6 +32,7 @@ results/
 *.csv
 *.json
 !src/config/*.json
+!web/sample_session.json
 
 docs/
 *_run_output*.txt
