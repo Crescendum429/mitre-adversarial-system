@@ -63,8 +63,13 @@ def estimate_cost_usd(role: str = "attacker") -> float:
     # en claude-sonnet-4-5 si no se registra la fecha)
     prices = _PRICE_PER_M_TOKENS.get(model)
     if prices is None:
+        # Prefix-match unidireccional: aceptamos que el nombre del modelo (con
+        # snapshot date suffix) extienda una key registrada (sin date suffix).
+        # La forma reversa (key extiende model) producia colisiones erroneas:
+        # un modelo nuevo "claude-sonnet-4-6" matcheaba la key "claude-sonnet-4-5"
+        # y heredaba un pricing equivocado.
         for key, val in _PRICE_PER_M_TOKENS.items():
-            if model.startswith(key) or key.startswith(model):
+            if model.startswith(key):
                 prices = val
                 break
     if prices is None:

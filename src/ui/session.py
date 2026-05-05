@@ -61,10 +61,17 @@ class SessionRecorder:
         self._listeners: list[Callable[[SessionEvent], None]] = []
 
     def reset(self) -> None:
-        """Limpia eventos. Llamar al inicio de cada corrida nueva."""
+        """Limpia eventos. Llamar al inicio de cada corrida nueva.
+
+        Tambien drena los listeners suscritos: si un proceso ejecuta varios
+        runs back-to-back (e.g. tests, harness embebido), un
+        `enable_incremental_save` previo dejaria su `_on_event` callback vivo
+        y duplicaria los writes en runs subsiguientes.
+        """
         with self._lock:
             self.events = []
             self.metadata = {}
+            self._listeners = []
 
     def subscribe(self, callback: Callable[[SessionEvent], None]) -> None:
         """Registra un callback que recibe cada evento al ser grabado.
