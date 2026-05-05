@@ -155,13 +155,28 @@ def run_attacker(
     tactics: list[str] | None = None,
     target: str | None = None,
     use_memory: bool = True,
+    simulation_start: datetime | None = None,
+    observer_interval: int | None = None,
 ) -> dict:
     """
     Ejecuta el agente atacante y retorna el estado final.
 
     El grafo se ejecuta con stream() para poder ver el progreso en tiempo real.
     Cada paso del grafo emite un evento que podemos loguear.
+
+    `simulation_start` y `observer_interval` configuran la sincronizacion del
+    atacante con las ventanas del observer cuando settings.attacker_tactic_per_window
+    es True (default). El atacante espera al inicio de la siguiente ventana
+    antes de ejecutar la primera accion de cada nueva tactica. Si los dos
+    parametros son None, la sincronizacion queda desactivada (modo
+    --attacker-only sin observer).
     """
+    from src.agents.attacker.nodes import configure_window_alignment
+    configure_window_alignment(
+        simulation_start,
+        observer_interval if observer_interval is not None else settings.observer_poll_interval,
+    )
+
     graph = build_attacker_graph()
     initial_state = create_initial_state(target=target, tactics=tactics, use_memory=use_memory)
 
@@ -1404,9 +1419,19 @@ def main():
         dashboard.target = target or ""
 
     if args.attacker_only:
-        # Solo atacante, sin observador
+        # Solo atacante, sin observador. La sincronizacion atacante↔ventana
+        # del observer (settings.attacker_tactic_per_window) sigue activa pero
+        # con simulation_start = ahora; el atacante respeta los slots
+        # temporales aunque no haya observer escuchando, lo cual es util si
+        # luego se procesan los logs offline con el observer en flush.
         try:
-            attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
+            attacker_state = run_attacker(
+                tactics=tactics,
+                target=target,
+                use_memory=not args.no_memory,
+                simulation_start=datetime.now(timezone.utc),
+                observer_interval=args.observer_interval,
+            )
             print_attack_summary(attacker_state)
             _emit_report(args, scenario_config, attacker_state, [])
         finally:
@@ -1457,8 +1482,17 @@ def _run_full_session(args, scenario_config: dict, tactics: list, target: str | 
     # Dar tiempo al observador para su primera recoleccion
     time.sleep(3)
 
-    # Ejecutar atacante en el thread principal
-    attacker_state = run_attacker(tactics=tactics, target=target, use_memory=not args.no_memory)
+    # Ejecutar atacante en el thread principal. simulation_start y
+    # observer_interval se pasan para que el atacante sincronice sus
+    # transiciones de tactica con las ventanas del observer
+    # (settings.attacker_tactic_per_window).
+    attacker_state = run_attacker(
+        tactics=tactics,
+        target=target,
+        use_memory=not args.no_memory,
+        simulation_start=simulation_start,
+        observer_interval=args.observer_interval,
+    )
 
     # Marcar el fin del atacante. El observer drenara hasta este timestamp
     # + interval. Sin time.sleep arbitrario: el observer ya conoce el

@@ -118,6 +118,18 @@ El contenedor atacante solo ve `attack_net`; la infraestructura de observabilida
 - **Ventanas pre/post-ataque** se reportan como N/A o falso positivo, no se incluyen en la accuracy.
 - **Bootstrap CI 95%** (1000 resamples, ref. Efron 1979) calculado por corrida: macro-F1, micro-F1, strict-accuracy con sus límites inferior y superior. La varianza intra-corrida queda explícita; la varianza inter-corrida se reporta agregando ≥3 corridas independientes con cleanup de memoria (`scripts/run_benchmark.py --cold-all`) y reportando μ ± σ.
 
+### Restricción metodológica del atacante: una táctica por ventana
+
+Desde mayo 2026 el atacante respeta un **rate-limit de tácticas alineado a las ventanas del observer** (`settings.attacker_tactic_per_window`, default `True`). Antes de iniciar la primera acción de cada nueva táctica, `execute_tools` espera al inicio de la siguiente ventana del observer (`now → simulation_start + interval × k`). El razonamiento del LLM, los replans y las acciones intra-táctica **no** se bloquean — sólo se difiere el `docker exec` del primer tool de cada táctica nueva.
+
+Consecuencia metodológica: cada ventana del observer contiene **a lo más una táctica del kill chain** (1:N — una táctica puede ocupar varias ventanas, pero ninguna ventana abarca dos). Esto fortalece la separabilidad temporal del ground truth y simplifica el `strict_accuracy` y la matriz de confusión, al precio de un overhead de wall-clock acotado por el número de transiciones × intervalo (e.g. 4 tácticas con `interval=10s` añaden ≈30 s).
+
+Para comparar con corridas previas a este cambio (sin sincronización), correr con la flag desactivada:
+
+```bash
+ATTACKER_TACTIC_PER_WINDOW=0 poetry run python -m src.main --scenario basic
+```
+
 ### Régimen de operación del observer
 
 El observer es un **analista forense con ventana deslizante de 5 s** calibrada empíricamente (Bhuyan et al. 2014, NIST SP 800-94). El loop de polling cierra una ventana cada 5 s y la encola para clasificación. La latencia LLM por ventana es 8–17 s (Haiku/Sonnet), por lo que la cola acumula trabajo: la métrica `observer_backlog_ratio = (Σ latencia_LLM − Σ tiempo_polled) / Σ tiempo_polled` cuantifica el atraso relativo. Valores observados (`data/reports/`): basic con observer Haiku 4.5 = 0.48–0.80; basic con observer Sonnet 4.5 = 2.21–2.39; phpunit Haiku = 0.82.

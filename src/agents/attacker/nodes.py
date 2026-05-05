@@ -79,6 +79,75 @@ _models_by_tactic: dict[str, object] = {}
 _model_lock = __import__("threading").Lock()
 
 
+# Sincronizacion del atacante con ventanas del observer (ver
+# settings.attacker_tactic_per_window). main.py setea estos valores via
+# configure_window_alignment() al inicio del run. _last_executed_tactic se
+# actualiza en execute_tools cuando arranca una nueva tactica; se compara
+# contra current_tactic para detectar transiciones y esperar al boundary.
+_WINDOW_LOCK = __import__("threading").Lock()
+_WINDOW_CONFIG: dict = {
+    "simulation_start": None,    # datetime UTC
+    "observer_interval": 10,     # segundos
+}
+_LAST_EXECUTED_TACTIC: dict[str, str] = {"value": ""}
+
+
+def configure_window_alignment(
+    simulation_start: "datetime | None",
+    observer_interval: int,
+) -> None:
+    """Configura la sincronizacion del atacante con las ventanas del observer.
+
+    Llamado por main.py al inicio del run. Cuando settings.attacker_tactic_per_window
+    es True, execute_tools espera al inicio de la siguiente ventana del
+    observer antes de ejecutar la primera accion de cada nueva tactica.
+    Llamadas multiples sobreescriben (util para tests).
+    """
+    with _WINDOW_LOCK:
+        _WINDOW_CONFIG["simulation_start"] = simulation_start
+        _WINDOW_CONFIG["observer_interval"] = max(1, int(observer_interval or 10))
+        _LAST_EXECUTED_TACTIC["value"] = ""
+
+
+def _wait_for_next_window_boundary(target_tactic: str) -> float:
+    """Bloquea hasta el inicio de la siguiente ventana del observer.
+
+    Calcula la siguiente ventana como
+    `simulation_start + interval * (ceil((now - simulation_start) / interval))`.
+    Si el wait excede `interval + 1` segundos (sintoma de simulation_start
+    desfasado o reloj corrompido), aborta defensivamente sin esperar.
+
+    Returns: segundos efectivamente esperados.
+    """
+    with _WINDOW_LOCK:
+        sim_start = _WINDOW_CONFIG.get("simulation_start")
+        interval = _WINDOW_CONFIG.get("observer_interval", 10)
+    if not sim_start:
+        return 0.0
+    now = datetime.now(timezone.utc)
+    elapsed = (now - sim_start).total_seconds()
+    if elapsed < 0:
+        return 0.0
+    next_boundary_offset = (int(elapsed // interval) + 1) * interval
+    wait_secs = next_boundary_offset - elapsed
+    # Cap defensivo: no esperar mas que un intervalo + 1s. Si el reloj o
+    # simulation_start estan corruptos, no detener el atacante.
+    if wait_secs <= 0.05 or wait_secs > interval + 1:
+        return 0.0
+    logger.info(
+        f"[Atacante] Sincronizando con ventana observer: esperando "
+        f"{wait_secs:.1f}s antes de iniciar tactica '{target_tactic}'"
+    )
+    get_session().attacker_event(
+        "tactic_wait_for_window",
+        tactic=target_tactic,
+        wait_seconds=round(wait_secs, 2),
+        observer_interval=interval,
+    )
+    time.sleep(wait_secs)
+    return wait_secs
+
+
 def _get_model(tactic: str | None = None):
     """Singleton thread-safe del modelo con tools bound.
 
@@ -314,6 +383,24 @@ def execute_tools(state: AttackerState) -> dict:
     tactic_info = get_tactic_by_name(tactic_name)
     # Solo el historial de la tactica actual cuenta para loop detection
     tactic_history = [h for h in new_history if h.get("tactic") == tactic_name]
+
+    # Sincronizacion con ventanas del observer (settings.attacker_tactic_per_window).
+    # Si la tactica actual difiere de la ultima ejecutada, esperamos al inicio
+    # de la siguiente ventana antes de invocar el primer tool. La primera
+    # tactica del run no espera (last == ""). Replans dentro de la misma
+    # tactica tampoco esperan. Solo bloquea el docker exec, no el razonamiento
+    # ni nodos previos.
+    if (
+        getattr(settings, "attacker_tactic_per_window", False)
+        and tactic_name
+        and tactic_name != "unknown"
+    ):
+        with _WINDOW_LOCK:
+            last = _LAST_EXECUTED_TACTIC.get("value", "")
+        if last and tactic_name != last:
+            _wait_for_next_window_boundary(tactic_name)
+        with _WINDOW_LOCK:
+            _LAST_EXECUTED_TACTIC["value"] = tactic_name
 
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]

@@ -156,6 +156,19 @@ class Settings(BaseSettings):
     # LLM o la del pipeline asistido por LLM?"
     observer_regex_only: bool = False
 
+    # Restriccion metodologica: rate-limiting de tacticas del atacante por
+    # ventana del observer. Cuando True, execute_tools espera al inicio de la
+    # siguiente ventana antes de ejecutar la PRIMERA accion de cada nueva
+    # tactica. Esto fuerza correspondencia 1:N entre tactica y ventanas
+    # observables (una tactica ocupa N >= 1 ventanas; ninguna ventana
+    # contiene mas de una tactica). Mejora la separabilidad temporal del
+    # ground truth para el observer y simplifica strict_accuracy + matriz
+    # de confusion. NO interrumpe replans ni razonamiento del LLM — solo el
+    # docker exec del primer tool_call de cada tactica nueva. Default ON
+    # desde mayo 2026; desactivar via env para comparar con corridas previas
+    # (pre-mayo-2026) o medir el overhead de la sincronizacion.
+    attacker_tactic_per_window: bool = True
+
     def validate_credentials(self) -> list[str]:
         """
         Chequea que las API keys requeridas esten presentes. Devuelve la lista
