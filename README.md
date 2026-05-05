@@ -17,7 +17,9 @@ El sistema opera con dos agentes autónomos que corren en paralelo sin comunicac
 | Atacante | Ejecuta la cadena de ataque contra la red objetivo | ReAct con validador code-based, replan con feedback, memoria de playbooks |
 | Observador | Analiza logs y clasifica tácticas MITRE en tiempo real | Grafo condicional con triaje heurístico + refinamiento forense |
 
-Modelo configurable por agente vía `.env`: soporta OpenAI (GPT-4.1), Anthropic (Claude Sonnet 4.5), Google (Gemini 2.5 Flash), Groq (Llama 3.3 70B), OpenRouter y Cerebras. Reproducibilidad académica garantizada por `LLM_SEED=42` + temperaturas separadas por rol (atacante 0.2 para exploración, observador 0.0 para clasificación determinista).
+Modelo configurable por agente vía `.env`: soporta OpenAI (GPT-4.1), Anthropic (Claude Sonnet 4.5 / Haiku 4.5), Google (Gemini 2.5 Flash), Groq (Llama 3.3 70B), OpenRouter y Cerebras. Stack default reportado: atacante `claude-sonnet-4-5-20250929`, observador `claude-haiku-4-5-20251001`.
+
+**Reproducibilidad** (referencia: Bender & Friedman 2018, *Data Statements for NLP*): el sistema fija `LLM_SEED=42` y temperaturas separadas por rol (atacante 0.2 para exploración, observador 0.0 para clasificación determinista). El parámetro seed es respetado a nivel API por OpenAI, Google, Groq, Cerebras y OpenRouter; **Anthropic no expone seed determinista en su API actual** (documentado en `src/config/settings.py:6-12` y `src/llm/provider.py:379-380`). Para corridas Anthropic la reproducibilidad estadística depende del `model_snapshot` fijo (e.g. `claude-sonnet-4-5-20250929`), `temperature=0.0` para el observador, y reporte explícito de varianza inter-corrida (μ ± σ + IC95% bootstrap) sobre n≥3. Cualquier afirmación cuantitativa sobre Anthropic en este repositorio cita el JSON específico que la sustenta.
 
 El proveedor de cada agente es independiente, lo que permite combinar cualquier par sin tocar el código. El único canal entre agentes es indirecto: el atacante genera actividad de red, el observador la lee desde Loki.
 
@@ -41,7 +43,7 @@ Ciclo `plan_tactic → execute_tools → validate_result → check_objective →
 
 Cada táctica tiene un **validador determinista** en `src/agents/attacker/objectives.py` que revisa el historial de acciones y decide si el objetivo real fue cumplido (credenciales verificadas vía POST live, RCE con evidencia `uid=`, hash crackeado en texto plano, root confirmado por `uid=0` o lectura de `/etc/shadow` o de archivo en `/root/`). Si el validador rechaza el avance, el grafo replanifica con feedback explícito hasta 15 veces antes de aceptar la táctica como fallida.
 
-**Memoria de playbooks** (`data/attack_playbooks.json`): tras Recon el sistema computa un fingerprint SHA-256 del target (puertos + tech + paths) y consulta memoria. Si hay match, inyecta el playbook previo en los prompts de las tácticas siguientes como hipótesis a verificar. Tras cada táctica exitosa se registra el `tool` + `payload_template` (con secretos sanitizados). Reducción empírica observada: -63% de acciones en warm runs vs cold runs.
+**Memoria de playbooks** (`data/attack_playbooks.json`): tras Recon el sistema computa un fingerprint SHA-256 del target (puertos + tech anchor + paths normalizados) y consulta memoria. Si hay match, inyecta el playbook previo en los prompts de las tácticas siguientes como hipótesis a verificar. Tras cada táctica exitosa se registra el `tool` + `payload_template` (con secretos sanitizados). Reducción empírica observada en pares cold/warm directamente comparables sobre `dvwa` (basic, 4 tácticas) con atacante Claude Sonnet 4.5: −48 % de acciones (25 → 13) entre `data/reports/basic_20260501_154808.json` (cold) y `data/reports/basic_20260501_155237.json` (warm). El efecto se concentra en Initial Access y Execution; Recon mantiene la exploración inicial porque el fingerprint aún no está computado en la primera táctica.
 
 Catálogo de herramientas disponibles:
 
@@ -110,12 +112,21 @@ El contenedor atacante solo ve `attack_net`; la infraestructura de observabilida
 
 ## Metodología de evaluación
 
-- **Ground truth**: el atacante registra cada acción con timestamp, técnica y táctica activa.
-- **Match estricto**: `Obs(actual)` debe coincidir con la última táctica real ejecutada en la ventana observada.
+- **Ground truth**: el atacante registra cada acción con timestamp, técnica y táctica activa. La asignación `action_tool → MITRE technique` es definicional (e.g. `run_nmap` implementa T1046 por construcción) y queda documentada en `src/agents/attacker/tactics.py`. Los validadores code-based (`src/agents/attacker/objectives.py`) verifican la evidencia concreta de cada táctica antes de avanzar (uid=, login_verified, /etc/shadow leído, archivo en `/root/`).
+- **Match estricto**: `Obs(actual)` debe coincidir con la última táctica real ejecutada en la ventana observada (`src/evaluation/metrics.py`, ref. Sokolova & Lapalme 2009).
 - **Match ventana**: todas las tácticas reales presentes en la ventana deben aparecer en `tactics_in_window` del observador.
 - **Ventanas pre/post-ataque** se reportan como N/A o falso positivo, no se incluyen en la accuracy.
+- **Bootstrap CI 95%** (1000 resamples, ref. Efron 1979) calculado por corrida: macro-F1, micro-F1, strict-accuracy con sus límites inferior y superior. La varianza intra-corrida queda explícita; la varianza inter-corrida se reporta agregando ≥3 corridas independientes con cleanup de memoria (`scripts/run_benchmark.py --cold-all`) y reportando μ ± σ.
 
-Los resultados cuantitativos (accuracy por escenario, matriz de confusión, latencia de detección) se reportan en el documento final; varían entre ejecuciones y se actualizan a medida que se amplía el set de escenarios.
+### Régimen de operación del observer
+
+El observer es un **analista forense con ventana deslizante de 5 s** calibrada empíricamente (Bhuyan et al. 2014, NIST SP 800-94). El loop de polling cierra una ventana cada 5 s y la encola para clasificación. La latencia LLM por ventana es 8–17 s (Haiku/Sonnet), por lo que la cola acumula trabajo: la métrica `observer_backlog_ratio = (Σ latencia_LLM − Σ tiempo_polled) / Σ tiempo_polled` cuantifica el atraso relativo. Valores observados (`data/reports/`): basic con observer Haiku 4.5 = 0.48–0.80; basic con observer Sonnet 4.5 = 2.21–2.39; phpunit Haiku = 0.82.
+
+Esto significa explícitamente: el observer **no garantiza tiempo real estricto** (clasificar cada ventana en ≤5 s). Es un **inspector post-hoc parcial con resolución temporal de 5 s** que termina su análisis con un retraso acotado al final del ataque (poll_interval × 3 + grace=15 s). Para el caso de uso de tesis — medir empíricamente qué tan bien un LLM puede inferir tácticas MITRE desde sólo logs HTTP — esta semántica es informativa: la métrica reportada es accuracy de inferencia táctica sobre ventanas observables, no latencia de detección reactiva. Un SOC en producción que requiera detección reactiva inmediata debe escalar el polling con paralelización del LLM o usar Haiku para reducir la latencia per-clasificación.
+
+### Resultados cuantitativos
+
+Los resultados (accuracy por escenario, matriz de confusión, latencia de detección, costo USD por corrida) están en `data/reports/*.json` con esquema estable. Cada cifra reportada en el documento final cita el JSON específico que la sustenta. Para la matriz cross-modelo y cross-escenario con μ ± σ + IC95%, ver el capítulo 6 del documento final del proyecto integrador.
 
 ## Requisitos
 
@@ -136,11 +147,13 @@ cp .env.example .env
 Variables principales de `.env`:
 
 ```
-LLM_PROVIDER=openai            # proveedor del agente atacante
-OPENAI_MODEL=gpt-4.1
-OBSERVER_PROVIDER=anthropic    # proveedor del agente observador
-OBSERVER_MODEL=claude-sonnet-4-5-20250929
+LLM_PROVIDER=anthropic            # proveedor del agente atacante
+ANTHROPIC_MODEL=claude-sonnet-4-5-20250929
+OBSERVER_PROVIDER=anthropic       # proveedor del agente observador
+OBSERVER_MODEL=claude-haiku-4-5-20251001
 ```
+
+El stack de referencia para los resultados reportados es atacante Claude Sonnet 4.5 + observador Claude Haiku 4.5. Otros pares válidos están documentados en `data/reports/` junto a sus métricas. Un usuario que cambie el stack debe re-correr para validar reproducibilidad bajo su nueva combinación.
 
 ## Uso
 

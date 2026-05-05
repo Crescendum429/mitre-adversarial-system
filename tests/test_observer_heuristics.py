@@ -349,3 +349,116 @@ class TestSolrJavaLogParsing:
         assert m is not None
         assert m.group(3) == "/select"  # path
         assert m.group(5) == "0"  # status
+
+
+class TestDeriveTacticFromSignalsAblation:
+    """Ablation regex-only: verifica que el nodo deterministico deriva la
+    tactica correcta a partir de anomaly_signals sin invocar LLM. Cubre las
+    cinco reglas del nodo y precedencia entre ellas."""
+
+    def _state(self, signals):
+        return {"anomaly_signals": signals, "has_new_logs": True}
+
+    def test_no_logs_returns_empty(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        out = derive_tactic_from_signals({"anomaly_signals": {}, "has_new_logs": False})
+        assert out == {}
+
+    def test_no_signals_returns_none_classification(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        out = derive_tactic_from_signals(self._state({"request_velocity": {"total": 0}}))
+        assert out["current_classification"] is None
+
+    def test_webshell_priv_esc_priority(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "webshell_commands": [
+                {"sub_tactic": "Discovery", "sub_tactic_id": "TA0007"},
+                {"sub_tactic": "Privilege Escalation", "sub_tactic_id": "TA0004"},
+            ]
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Privilege Escalation"
+        assert cls["confidence"] == 0.99
+        assert cls["regex_only"] is True
+
+    def test_cve_specific_attempt_maps_to_execution(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "suspicious_ips": {
+                "10.10.0.5": {"log4shell_attempts": 2, "tool_ua_hits": 0}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Execution"
+        assert cls["tactic_id"] == "TA0002"
+
+    def test_login_success_maps_to_initial_access(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "suspicious_ips": {
+                "10.10.0.5": {"login_success": 1}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Initial Access"
+        assert cls["tactic_id"] == "TA0001"
+
+    def test_sqli_maps_to_credential_access(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "suspicious_ips": {
+                "10.10.0.5": {"sqli_attempts": 4}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Credential Access"
+
+    def test_recon_signals_map_to_reconnaissance(self):
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "suspicious_ips": {
+                "10.10.0.5": {"tool_ua_hits": 5, "not_found": 30, "auth_post_attempts": 0}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Reconnaissance"
+
+    def test_webshell_priority_over_recon(self):
+        """Si hay webshell command Y recon score, gana webshell."""
+        from src.agents.observer.nodes import derive_tactic_from_signals
+        signals = {
+            "webshell_commands": [
+                {"sub_tactic": "Discovery", "sub_tactic_id": "TA0007"},
+            ],
+            "suspicious_ips": {
+                "10.10.0.5": {"tool_ua_hits": 100}
+            }
+        }
+        out = derive_tactic_from_signals(self._state(signals))
+        cls = out["current_classification"]
+        assert cls["tactic"] == "Discovery"
+
+    def test_graph_uses_derive_when_regex_only_enabled(self, monkeypatch):
+        """Cuando settings.observer_regex_only=True, build_observer_graph
+        sustituye classify_tactic por derive_tactic_from_signals."""
+        from src.config.settings import settings
+        from src.agents.observer import graph as g
+        monkeypatch.setattr(settings, "observer_regex_only", True)
+        compiled = g.build_observer_graph()
+        node_names = list(compiled.get_graph().nodes.keys())
+        assert "classify_tactic" in node_names
+        # No hay edge classify -> refine en regex_only
+        edges = compiled.get_graph().edges
+        # Con regex_only el grafo NO contiene refine_analysis -> classify_tactic
+        # como edge condicional cargada — el nodo refine_analysis sigue presente
+        # como nodo pero no participa del flujo activo.
+        # Validacion estructural: el nodo classify_tactic apunta directo a
+        # generate_recommendation.
+        targets_from_classify = [e.target for e in edges if e.source == "classify_tactic"]
+        assert "generate_recommendation" in targets_from_classify

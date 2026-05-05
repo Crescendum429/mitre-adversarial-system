@@ -1183,6 +1183,152 @@ def detect_anomalies(state: ObserverState) -> dict:
     return {"anomaly_signals": signals, "suspect_list": suspect_list}
 
 
+_DERIVE_PRIORITY = (
+    ("Privilege Escalation", "TA0004"),
+    ("Credential Access",    "TA0006"),
+    ("Impact",               "TA0040"),
+    ("Exfiltration",         "TA0010"),
+    ("Collection",           "TA0009"),
+    ("Discovery",            "TA0007"),
+    ("Execution",            "TA0002"),
+)
+
+
+def derive_tactic_from_signals(state: ObserverState) -> dict:
+    """
+    Ablation regex-only del clasificador: cortocircuita el LLM y deriva
+    `current_tactic` a partir de `anomaly_signals` por reglas deterministas.
+
+    Heuristicas (orden de precedencia):
+      1. webshell_commands con sub_tactic clasificada (PrivEsc > CredAccess >
+         Impact > Exfiltration > Collection > Discovery > Execution).
+      2. Senales CVE-specific T4b-T4e (log4shell, ognl, solr_velocity,
+         spring4shell) -> Execution (TA0002).
+      3. login_success confirmado (T10 o suspicious_ips.confirmed_actions) ->
+         Initial Access (TA0001).
+      4. sqli_attempts > 0 -> Credential Access (TA0006).
+      5. tool_ua / 404_ratio / post_to_auth_path / shellshock attempts ->
+         Reconnaissance (TA0043).
+      6. Sin ningun signal -> none.
+
+    No invoca LLM. Confianza fija = 0.99 (regla deterministica).
+    Sirve para cuantificar la contribucion marginal del LLM sobre el pipeline
+    determinista de heuristicas T1-T10 + classify_webshell_cmd. Activable via
+    `OBSERVER_REGEX_ONLY=1`. Default OFF.
+    """
+    if not state.get("has_new_logs", False):
+        return {}
+
+    signals = state.get("anomaly_signals") or {}
+    suspicious = signals.get("suspicious_ips") or {}
+    webshell_cmds = signals.get("webshell_commands") or []
+
+    derived_tactic: str | None = None
+    derived_id: str = ""
+    evidence: list[str] = []
+
+    # 1. Webshell commands con sub-tactic ya derivada por classify_webshell_cmd
+    if webshell_cmds:
+        seen = {c.get("sub_tactic") for c in webshell_cmds if c.get("sub_tactic")}
+        for tac, tac_id in _DERIVE_PRIORITY:
+            if tac in seen:
+                derived_tactic, derived_id = tac, tac_id
+                evidence.append(
+                    f"webshell_command sub_tactic='{tac}' detectado por classify_webshell_cmd"
+                )
+                break
+
+    # 2. CVE-specific RCE attempts -> Execution
+    if not derived_tactic:
+        cve_attempts = 0
+        for ip_data in suspicious.values():
+            for k in (
+                "log4shell_attempts", "ognl_attempts",
+                "solr_velocity_attempts", "spring4shell_attempts",
+            ):
+                cve_attempts += ip_data.get(k, 0) if isinstance(ip_data, dict) else 0
+        if cve_attempts > 0:
+            derived_tactic, derived_id = "Execution", "TA0002"
+            evidence.append(f"CVE-specific RCE attempts={cve_attempts}")
+
+    # 3. login_success confirmado -> Initial Access
+    if not derived_tactic:
+        login_success = 0
+        for ip_data in suspicious.values():
+            if not isinstance(ip_data, dict):
+                continue
+            login_success += ip_data.get("login_success", 0)
+            confirmed = ip_data.get("confirmed_actions", {}) or {}
+            login_success += confirmed.get("login_success", 0)
+        if login_success > 0:
+            derived_tactic, derived_id = "Initial Access", "TA0001"
+            evidence.append(f"login_success confirmado n={login_success}")
+
+    # 4. SQLi attempts -> Credential Access
+    if not derived_tactic:
+        sqli = sum(
+            ip.get("sqli_attempts", 0) for ip in suspicious.values()
+            if isinstance(ip, dict)
+        )
+        if sqli > 0:
+            derived_tactic, derived_id = "Credential Access", "TA0006"
+            evidence.append(f"sqli_attempts={sqli}")
+
+    # 5. Recon signals (tool_ua / 404_ratio / post_to_auth / shellshock)
+    if not derived_tactic:
+        recon_score = 0
+        for ip_data in suspicious.values():
+            if not isinstance(ip_data, dict):
+                continue
+            recon_score += (
+                ip_data.get("tool_ua_hits", 0)
+                + min(ip_data.get("not_found", 0), 50)
+                + ip_data.get("auth_post_attempts", 0)
+                + ip_data.get("shellshock_attempts", 0)
+            )
+        if recon_score > 0:
+            derived_tactic, derived_id = "Reconnaissance", "TA0043"
+            evidence.append(f"recon_score={recon_score}")
+
+    if not derived_tactic:
+        return {"current_classification": None}
+
+    classification = {
+        "tactic": derived_tactic,
+        "tactic_id": derived_id,
+        "current_tactic": derived_tactic,
+        "current_tactic_id": derived_id,
+        "tactics_in_window": [{
+            "tactic": derived_tactic,
+            "tactic_id": derived_id,
+            "confidence": 0.99,
+            "evidence": evidence,
+        }],
+        "confidence": 0.99,
+        "evidence": evidence,
+        "reasoning": "regex-only ablation: derived from anomaly_signals without LLM",
+        "recommendation": "see anomaly_signals for raw evidence",
+        "llm_latency_ms": 0,
+        "regex_only": True,
+    }
+
+    logger.info(
+        f"[Observador|regex-only] Clasificacion derivada: {derived_tactic} "
+        f"(evidence={evidence})"
+    )
+    get_session().observer_event(
+        "classify",
+        tactic=derived_tactic,
+        confidence=0.99,
+        tactics_in_window=[derived_tactic],
+        evidence=evidence,
+        reasoning="regex-only ablation",
+        refinement_count=0,
+        llm_latency_ms=0,
+    )
+    return {"current_classification": classification}
+
+
 def classify_tactic(state: ObserverState) -> dict:
     """
     Nodo clasificador: el LLM analiza los logs y clasifica la tactica MITRE.

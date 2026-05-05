@@ -147,6 +147,15 @@ class Settings(BaseSettings):
     # falla. Default on; desactivar solo en tests.
     preflight_check_enabled: bool = True
 
+    # Ablation regex-only del observer (default OFF). Cuando True, el grafo
+    # corta ANTES de classify_tactic LLM y deriva current_tactic por reglas
+    # deterministas a partir de anomaly_signals + webshell_sub_tactics. Permite
+    # cuantificar la contribucion marginal del LLM sobre el pipeline regex de
+    # heuristicas T1-T10 + classify_webshell_cmd. Util para responder la
+    # critica de revisor: "¿la pregunta de investigacion mide la capacidad del
+    # LLM o la del pipeline asistido por LLM?"
+    observer_regex_only: bool = False
+
     def validate_credentials(self) -> list[str]:
         """
         Chequea que las API keys requeridas esten presentes. Devuelve la lista

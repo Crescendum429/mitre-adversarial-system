@@ -38,12 +38,14 @@ from src.agents.observer.calibration import DEFAULT_THRESHOLD, adaptive_threshol
 from src.agents.observer.nodes import (
     classify_tactic,
     collect_logs,
+    derive_tactic_from_signals,
     detect_anomalies,
     generate_recommendation,
     refine_analysis,
     triage_anomalies,
 )
 from src.agents.observer.state import ObserverState
+from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -97,13 +99,24 @@ def should_refine(state: ObserverState) -> str:
 
 
 def build_observer_graph() -> StateGraph:
-    """Construye y compila el grafo del agente observador."""
+    """Construye y compila el grafo del agente observador.
+
+    Modo default (LLM): collect -> triage -> [signal] -> detect -> classify_tactic
+    -> refine? -> recommend. Cuando settings.observer_regex_only=True, el grafo
+    sustituye classify_tactic por derive_tactic_from_signals (deterministic
+    ablation) y desactiva el loop de refinamiento. Permite cuantificar la
+    contribucion marginal del LLM sobre el pipeline regex de heuristicas.
+    """
     graph = StateGraph(ObserverState)
+    regex_only = settings.observer_regex_only
 
     graph.add_node("collect_logs", collect_logs)
     graph.add_node("triage_anomalies", triage_anomalies)
     graph.add_node("detect_anomalies", detect_anomalies)
-    graph.add_node("classify_tactic", classify_tactic)
+    if regex_only:
+        graph.add_node("classify_tactic", derive_tactic_from_signals)
+    else:
+        graph.add_node("classify_tactic", classify_tactic)
     graph.add_node("refine_analysis", refine_analysis)
     graph.add_node("generate_recommendation", generate_recommendation)
 
@@ -121,16 +134,21 @@ def build_observer_graph() -> StateGraph:
 
     graph.add_edge("detect_anomalies", "classify_tactic")
 
-    graph.add_conditional_edges(
-        "classify_tactic",
-        should_refine,
-        {
-            "refine": "refine_analysis",
-            "done": "generate_recommendation",
-        },
-    )
+    if regex_only:
+        # En ablation regex-only no hay loop de refinamiento (el LLM esta
+        # desactivado). La clasificacion deterministica va directo a recommend.
+        graph.add_edge("classify_tactic", "generate_recommendation")
+    else:
+        graph.add_conditional_edges(
+            "classify_tactic",
+            should_refine,
+            {
+                "refine": "refine_analysis",
+                "done": "generate_recommendation",
+            },
+        )
+        graph.add_edge("refine_analysis", "classify_tactic")
 
-    graph.add_edge("refine_analysis", "classify_tactic")
     graph.add_edge("generate_recommendation", END)
 
     return graph.compile()

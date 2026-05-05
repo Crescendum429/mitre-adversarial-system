@@ -180,17 +180,19 @@ class TestObserverPipelineWithMocks:
         except Exception as e:
             pytest.fail(f"Observer graph fallo: {e}")
 
-        # 5. Asserts
-        # Si el triage detecto signals, el classify deberia haber producido
-        # current_classification con tactic Reconnaissance
-        if final.get("triage_result") == "signal":
-            cls = final.get("current_classification")
-            if cls is not None:
-                tactic = getattr(cls, "tactic", None) or (
-                    cls.get("tactic") if isinstance(cls, dict) else None
-                )
-                assert tactic in (None, "Reconnaissance"), \
-                    f"Esperaba Reconnaissance, vi {tactic}"
+        # 5. Asserts: con la fixture de logs gobuster + UA tool, el triage debe
+        # disparar 'signal' y classify debe producir Reconnaissance. El test
+        # original aceptaba (None, Reconnaissance) — relajacion que dejaba pasar
+        # el caso degenerado donde el grafo no clasifica nada. Endurecido:
+        # exigimos signal del triage y tactic == Reconnaissance.
+        assert final.get("triage_result") == "signal", \
+            f"Esperaba triage 'signal' por logs gobuster, vi {final.get('triage_result')}"
+        cls = final.get("current_classification")
+        assert cls is not None, "classify_tactic debio producir current_classification"
+        tactic = getattr(cls, "tactic", None) or (
+            cls.get("tactic") if isinstance(cls, dict) else None
+        )
+        assert tactic == "Reconnaissance", f"Esperaba Reconnaissance, vi {tactic}"
 
 
 class TestProviderRetryClassifierIntegration:

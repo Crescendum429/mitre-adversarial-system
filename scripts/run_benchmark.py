@@ -47,29 +47,46 @@ def _clean_state(scenario: str) -> None:
     """Limpia webshells residuales del target. Critico para reproducibilidad:
     si shell.php quedo de una corrida previa, el atacante podria saltarse el
     paso de deploy y parecer mas rapido que en realidad.
+
+    Cubre los 8 escenarios soportados. Cada target tiene un docroot y vector
+    distinto; los comandos de limpieza correspondientes a cada uno se aplican
+    sin error si el contenedor no esta corriendo.
     """
-    target_container = {
-        "basic": "dvwa",
-        "dvwa": "dvwa",
-        "mrrobot": "mrrobot",
-        "dc1": "dc1",
-        "bpent": "bpent",
-        "log4shell": "log4shell",
-        "confluence": "confluence",
-    }.get(scenario)
-    if not target_container:
+    cleanups = {
+        "basic": ("dvwa", "find /var/www/html -name '*.php' -newer /var/www/html/index.* -delete 2>/dev/null; rm -f /var/www/html/shell.php /var/www/html/hackable/shell.php 2>/dev/null"),
+        "dvwa": ("dvwa", "find /var/www/html -name '*.php' -newer /var/www/html/index.* -delete 2>/dev/null; rm -f /var/www/html/shell.php /var/www/html/hackable/shell.php 2>/dev/null"),
+        "mrrobot": ("mrrobot", "find /var/www/html -name '*.php' -newer /var/www/html/wp-login.php -delete 2>/dev/null; rm -f /var/www/html/shell.php 2>/dev/null"),
+        "dc1": ("dc1", "find /var/www/html -name '*.php' -newer /var/www/html/index.php -delete 2>/dev/null; rm -f /var/www/html/shell.php /var/www/html/wp-content/uploads/shell.php 2>/dev/null"),
+        "bpent": ("bpent", "find /var/www/html -name '*.php' -newer /var/www/html/index.php -delete 2>/dev/null; rm -f /var/www/html/shell.php 2>/dev/null"),
+        "log4shell": ("log4shell", "rm -f /tmp/exploit.* /tmp/*.class 2>/dev/null; true"),
+        "confluence": ("confluence", "rm -f /tmp/exploit.* 2>/dev/null; true"),
+        "phpunit": ("phpunit", "find /var/www/html -name '*.php' -newer /var/www/html/index.php -delete 2>/dev/null; rm -f /var/www/html/shell.php 2>/dev/null"),
+    }
+    spec = cleanups.get(scenario)
+    if not spec:
         return
-    # Limpia cualquier .php nuevo en el document root del target
+    container, command = spec
     try:
         subprocess.run(
-            ["docker", "exec", target_container, "bash", "-c",
-             "find /var/www/html -name '*.php' -newer /var/www/html/index.* "
-             "-delete 2>/dev/null; rm -f /var/www/html/shell.php /var/www/html/hackable/shell.php 2>/dev/null"],
+            ["docker", "exec", container, "bash", "-c", command],
             capture_output=True,
             timeout=10,
         )
     except Exception:
         pass
+
+
+def _reset_memory_artifacts() -> None:
+    """Borra todos los artefactos de memoria persistente entre celdas.
+
+    El attacker memoriza fingerprints en `data/attack_playbooks.json`; el
+    observer mantiene baselines de trafico en `data/observer_baselines.json`.
+    Para corridas verdaderamente cold (n=3 sin contaminacion warm), ambos
+    archivos se eliminan antes de cada run.
+    """
+    for fname in ("attack_playbooks.json", "observer_baselines.json"):
+        path = REPO_ROOT / "data" / fname
+        path.unlink(missing_ok=True)
 
 
 def _run_scenario(scenario: str, python_exec: str, use_memory: bool = True) -> dict:
@@ -137,6 +154,8 @@ def main():
                    help="Path JSON de salida. Default: data/benchmark_<ts>.json")
     p.add_argument("--no-memory", action="store_true",
                    help="Desactiva memoria para medir cold runs")
+    p.add_argument("--cold-all", action="store_true",
+                   help="Borra memoria + observer_baselines antes de cada corrida (cold real, no solo run_idx==0)")
     p.add_argument("--python-exec", default=sys.executable,
                    help="Python executable (usa el mismo venv que pytest)")
     args = p.parse_args()
@@ -147,15 +166,34 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
 
     # Carga config actual para metadata
-    from src.config.settings import settings
+    from src.config.settings import LLMProvider, settings
+    # Reporta el modelo real del provider seleccionado, no "varies".
+    # Trazabilidad cross-provider para que la metadata documente fielmente
+    # con que stack se obtuvieron las cifras.
+    provider_to_model = {
+        LLMProvider.OPENAI: settings.openai_model,
+        LLMProvider.ANTHROPIC: settings.anthropic_model,
+        LLMProvider.GOOGLE: settings.google_model,
+        LLMProvider.GROQ: settings.groq_model,
+        LLMProvider.OPENROUTER: settings.openrouter_model,
+        LLMProvider.CEREBRAS: settings.cerebras_model,
+    }
+    attacker_model = provider_to_model.get(settings.llm_provider, "unknown")
+    observer_provider = settings.observer_provider or settings.llm_provider
+    observer_model = settings.observer_model or provider_to_model.get(observer_provider, "unknown")
+
     report = {
         "metadata": {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "git_commit": _git_hash(),
             "attacker_provider": settings.llm_provider.value,
-            "attacker_model": settings.openai_model if settings.llm_provider.value == "openai" else "varies",
+            "attacker_model": attacker_model,
+            "observer_provider": observer_provider.value if hasattr(observer_provider, "value") else str(observer_provider),
+            "observer_model": observer_model,
             "seed": settings.llm_seed,
             "attacker_temperature": settings.attacker_temperature,
+            "observer_temperature": settings.observer_temperature,
+            "cold_all": args.cold_all,
             "python": sys.version,
         },
         "results": [],
@@ -168,11 +206,13 @@ def main():
             current += 1
             print(f"\n[{current}/{total_scenarios}] {scenario} (run {run_idx+1})")
             _clean_state(scenario)
-            # Memoria: borrar en la primera corrida de cada escenario para
-            # medir cold; despues queda para warm runs
-            if run_idx == 0:
-                memory_file = REPO_ROOT / "data" / "attack_playbooks.json"
-                memory_file.unlink(missing_ok=True)
+            # Reset de memoria para garantizar separacion cold/warm.
+            # --cold-all: borra memoria del attacker Y baselines del observer antes
+            #             de CADA run (n=3 cold real, sin contaminacion entre runs).
+            # default:    borra solo en el primer run de cada escenario (run 0 cold,
+            #             runs 1+ son warm via memoria persistida del run 0).
+            if args.cold_all or run_idx == 0:
+                _reset_memory_artifacts()
 
             r = _run_scenario(
                 scenario,
