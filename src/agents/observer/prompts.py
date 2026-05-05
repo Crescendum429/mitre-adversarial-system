@@ -248,6 +248,28 @@ Razonamiento: la sub_tactic de los cmd= mapea a Discovery por classify_webshell_
               degradar a Execution generica — la sub_tactic es informacion mas
               especifica que la fase generica.
 
+EJEMPLO 7B — EXECUTION via Solr Java logs (path+params CVE):
+Logs (formato Java logging Solr 8.x, NO Apache combined):
+  "2026-05-05 04:29:32 INFO o.a.s.c.S.Request [demo] webapp=/solr path=/select
+   params={q=*:*&v.template=custom&v.template.custom=#set($x=$rt.exec("id"))&wt=velocity}
+   hits=47 status=0 QTime=1"
+EVENTOS CRITICOS: solr_velocity_attempts > 0 (T4d signal disparado por
+                  v.template.custom + wt=velocity en params).
+Senales pre-calculadas: T4d solr_velocity activo desde IP virtual "solr-internal".
+Clasificacion: Execution (TA0002), confianza 0.90, evidence
+              ["params contiene v.template.custom + wt=velocity = CVE-2019-17558 SSTI",
+               "log Solr Java-style (no Apache combined) — el observer parsea con _SOLR_LOG_RE"].
+Razonamiento: los logs de Apache Solr 8.x no son Apache combined log format. El
+              parser _SOLR_LOG_RE extrae path y params, y las heuristicas
+              T4b-T4e disparan signals CVE-specific aun cuando el formato del log
+              es no-canonico. NO descartar logs Solr como "infraestructura
+              interna" — un payload v.template.custom + wt=velocity O ${{jndi:...}}
+              es un intento de RCE explicito y concreto.
+              Equivalente para JNDI Log4Shell: "params={... ${{jndi:ldap://...}} ...}"
+              dispara T4b log4shell_attempts -> Execution (cuando el atacante ya
+              esta exitosamente comunicado con el target) o Initial Access (en
+              recon, primer payload).
+
 EJEMPLO 7 — PRIVILEGE ESCALATION via cmd= con uid=0(root):
 Logs: GET /shell.php?cmd=find%20%2F%20-perm%20-u%3Ds%20-type%20f status 200.
       GET /shell.php?cmd=cat%20%2Fetc%2Fshadow status 200 (response contiene

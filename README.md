@@ -169,6 +169,16 @@ poetry run python -m src.main --scenario basic --attacker-only
 
 # Ver output raw de las herramientas de pentesting:
 poetry run python -m src.main --scenario basic --tool-output
+
+# Ablation regex-only del observer (sin LLM, derivacion deterministica
+# desde anomaly_signals + classify_webshell_cmd):
+OBSERVER_REGEX_ONLY=1 poetry run python -m src.main --scenario basic --no-memory
+
+# Ablation pure-LLM del observer (sin heuristicas T1-T10):
+poetry run python -m src.main --scenario basic --no-heuristics
+
+# Benchmark reproducible n=3 cold con cleanup explicito de memoria:
+poetry run python scripts/run_benchmark.py --scenarios basic --runs-per-scenario 3 --cold-all
 ```
 
 ## Stack tecnológico
