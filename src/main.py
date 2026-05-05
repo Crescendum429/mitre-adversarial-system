@@ -181,14 +181,24 @@ def run_attacker(
     accumulated_flags = []
     accumulated_met = {}
     accumulated_attempts = {}
-    # GraphRecursionError se captura para emitir reporte parcial: sin esto el
-    # sistema descarta toda la metadata acumulada cuando el atacante no
-    # converge en recursion_limit acciones (caso tipico: OpenRouter free
-    # atascado en init_access por sesgo de frecuencia).
+    # Excepciones que se capturan para emitir reporte parcial. Sin esto el
+    # sistema descarta toda la metadata acumulada (acciones, evidencia,
+    # tactic_evidence) cuando el atacante muere mid-run.
+    # - GraphRecursionError: el atacante no converge en recursion_limit acciones
+    #   (caso tipico: OpenRouter free atascado en init_access por sesgo de
+    #   frecuencia).
+    # - BadRequestError 400 con mensaje "credit balance is too low": cuota
+    #   Anthropic agotada mid-run. NO es transient (no procede retry); preservar
+    #   metadata acumulada hasta el punto del fallo es la conducta correcta.
     try:
         from langgraph.errors import GraphRecursionError
     except ImportError:
         GraphRecursionError = Exception
+
+    try:
+        from anthropic import BadRequestError as _AnthropicBadRequestError
+    except ImportError:
+        _AnthropicBadRequestError = type("_NoSuchError", (Exception,), {})
 
     try:
         for event in graph.stream(initial_state, {"recursion_limit": settings.attacker_recursion_limit}):
@@ -230,6 +240,17 @@ def run_attacker(
             f"(p.ej. sesgo de frecuencia en user enumeration).[/dim]"
         )
         final_state["recursion_limit_hit"] = True
+    except _AnthropicBadRequestError as e:
+        msg = str(e).lower()
+        if "credit balance" in msg or "credit_balance" in msg or "low" in msg:
+            console.print(
+                "[bold red]CUOTA ANTHROPIC AGOTADA mid-run[/bold red]\n"
+                "[dim]Emitiendo reporte parcial con la metadata acumulada. "
+                "Recargar la API key antes de re-correr el escenario.[/dim]"
+            )
+            final_state["quota_exhausted"] = True
+        else:
+            raise
 
     final_state["action_history"] = accumulated_history
     if accumulated_evidence:

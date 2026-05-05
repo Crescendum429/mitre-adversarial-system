@@ -78,7 +78,12 @@ class TestAttackerHappyPath:
                 ],
             },
         ])
+        # Patchear en el alias de attacker.nodes (que importo via
+        # `from src.llm.provider import get_chat_model`). Patchear en provider
+        # directamente NO afecta porque el alias ya esta resuelto en el modulo
+        # nodes — el patch al modulo provider no actualiza el alias en nodes.
         monkeypatch.setattr("src.llm.provider.get_chat_model", lambda: fake)
+        monkeypatch.setattr("src.agents.attacker.nodes.get_chat_model", lambda: fake)
 
         # Mock DockerClient para no exec en containers reales
         class FakeResult:
