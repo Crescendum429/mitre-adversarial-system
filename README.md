@@ -201,7 +201,7 @@ poetry run python -m http.server 8765
 # luego "Cargar session.json" → seleccionar data/reports/<run>.json
 ```
 
-**Modo live** (polling del JSON mientras corre el ataque): activar el checkbox "Modo live" en la pantalla inicial e ingresar la URL del JSON (e.g. `/data/reports/<run>.json`).
+**Modo live** (polling del JSON mientras corre el ataque): cada `python -m src.main` reescribe el JSON de la sesión cada 2 s (atómico via tmp+rename) sobre `data/reports/<scenario>_<ts_inicio>.json` desde el primer evento. Para activar el polling: abrir `frontend.html`, marcar el checkbox "Modo live" en la pantalla inicial, ingresar la URL del JSON (e.g. `/data/reports/basic_20260505_134510.json`), elegir el intervalo (3 s / 5 s / 10 s / 30 s) y dar "Cargar". El frontend hace fetch periódico y actualiza las cuatro vistas a medida que avanza el run. La forma rápida es lanzar el run con `--open-frontend`: el browser se abre con la URL que ya apunta al JSON correcto vía `?session=`.
 ```
 
 ## Stack tecnológico

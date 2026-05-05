@@ -1243,6 +1243,18 @@ def main():
         observer_temperature=settings.observer_temperature,
         started_at=datetime.now(timezone.utc).isoformat(),
     )
+
+    # Path estable del JSON de la sesion: se computa al inicio (no al fin)
+    # para que el modo live del frontend pueda hacer polling sobre el mismo
+    # path desde el primer evento. enable_incremental_save reescribe atomico
+    # via tmp+rename con throttle, evitando que el polling lea state parcial.
+    out_dir_live = Path(args.report_dir)
+    out_dir_live.mkdir(parents=True, exist_ok=True)
+    ts_tag_live = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_live = f"{args.scenario}_{ts_tag_live}"
+    session_json_path = out_dir_live / f"{base_live}.json"
+    session.enable_incremental_save(session_json_path, throttle_seconds=2.0)
+
     session.system_event("session_start", scenario=args.scenario)
 
     dashboard = None
@@ -1557,14 +1569,12 @@ def _emit_report(args, scenario_config: dict, attacker_state: dict, observer_res
     )
     session.system_event("session_end")
 
-    from pathlib import Path
-    out_dir = Path(args.report_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"{args.scenario}_{ts_tag}"
-
-    # JSON crudo (analizable por scripts)
-    json_path = out_dir / f"{base}.json"
+    # Reuso del path computado al inicio (session_json_path) para que el
+    # save final coincida con el mismo archivo que el frontend live polling
+    # estuvo leyendo. El timestamp del nombre = inicio del run.
+    json_path = session_json_path
+    out_dir = json_path.parent
+    base = json_path.stem
     session.save_json(json_path)
 
     # HTML autosuficiente para revision visual / tesis

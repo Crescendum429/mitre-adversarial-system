@@ -130,6 +130,10 @@ class SessionRecorder:
         `loki_stats`, `observer_pipeline`, `tactic_durations` derivados de
         events y de la metadata raw. La metadata raw original se preserva
         intacta — los nuevos campos son additive.
+
+        El write se hace atomico via tmp+rename para evitar que el frontend
+        en modo live lea un JSON parcialmente escrito (race condition entre
+        polling y persist).
         """
         data = self.to_dict()
         try:
@@ -139,7 +143,45 @@ class SessionRecorder:
                 f"frontend enrichment fallo: {exc}; persisting raw schema"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        tmp.replace(path)
+
+    def enable_incremental_save(
+        self, path: Path, throttle_seconds: float = 2.0
+    ) -> None:
+        """Habilita persistencia incremental del JSON sobre `path`.
+
+        Cada evento grabado dispara un check throttled: si han pasado al menos
+        `throttle_seconds` desde la ultima escritura, se reescribe el JSON
+        completo. Util para que el frontend en modo live haga polling sobre
+        un path estable y vea los eventos a medida que ocurren.
+
+        El throttle protege de I/O excesivo en bursts (e.g. detect_anomalies
+        emite varios eventos seguidos). Falla silenciosamente si el write
+        no es exitoso (no interrumpe el run principal).
+        """
+        import time as _time
+        last_save = [_time.monotonic() - throttle_seconds]
+        save_lock = threading.Lock()
+
+        def _on_event(_ev: SessionEvent) -> None:
+            now = _time.monotonic()
+            if now - last_save[0] < throttle_seconds:
+                return
+            if not save_lock.acquire(blocking=False):
+                return
+            try:
+                self.save_json(path)
+                last_save[0] = now
+            except Exception as exc:
+                logging.getLogger(__name__).debug(
+                    f"incremental save fallo: {exc}"
+                )
+            finally:
+                save_lock.release()
+
+        self.subscribe(_on_event)
 
 
 def _enrich_for_frontend(data: dict) -> None:
