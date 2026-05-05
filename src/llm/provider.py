@@ -34,6 +34,8 @@ _PRICE_PER_M_TOKENS: dict[str, tuple[float, float, float, float]] = {
     "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
     "claude-haiku-4-5-20251001": (1.0, 5.0, 0.1, 1.25),
     # OpenAI
+    "gpt-5.5": (2.5, 10.0, 0.5, 1.0),
+    "gpt-5": (2.5, 10.0, 0.5, 1.0),
     "gpt-4.1": (2.0, 8.0, 0.5, 1.0),
     "gpt-4.1-mini": (0.4, 1.6, 0.5, 1.0),
     "gpt-4.1-nano": (0.1, 0.4, 0.5, 1.0),
@@ -42,8 +44,18 @@ _PRICE_PER_M_TOKENS: dict[str, tuple[float, float, float, float]] = {
     "o3": (2.0, 8.0, 0.5, 1.0),
     "o4-mini": (1.1, 4.4, 0.5, 1.0),
     # Google
+    "gemini-3-pro": (2.5, 15.0, 0.0, 1.0),
+    "gemini-3.1-pro": (2.5, 15.0, 0.0, 1.0),
     "gemini-2.5-pro": (1.25, 10.0, 0.0, 1.0),
     "gemini-2.5-flash": (0.075, 0.3, 0.0, 1.0),
+    # DeepSeek (OpenAI-compatible API)
+    "deepseek-chat": (0.27, 1.10, 0.5, 1.0),
+    "deepseek-reasoner": (0.55, 2.19, 0.5, 1.0),
+    "deepseek-v4-flash": (0.14, 0.28, 0.5, 1.0),
+    "deepseek-v4-pro": (1.74, 3.48, 0.5, 1.0),
+    # Moonshot Kimi (OpenAI-compatible)
+    "kimi-k2-turbo-preview": (0.30, 2.50, 0.5, 1.0),
+    "moonshot-v1-128k": (0.30, 2.50, 0.5, 1.0),
     # Free-tier (cost = 0)
     "qwen-3-235b-a22b-instruct-2507": (0.0, 0.0, 0.0, 1.0),
     "openai/gpt-oss-120b:free": (0.0, 0.0, 0.0, 1.0),
@@ -444,6 +456,32 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
             model_kwargs={"seed": seed},
         )
 
+    if provider == LLMProvider.DEEPSEEK:
+        # DeepSeek expone API OpenAI-compatible. Reusamos ChatOpenAI con
+        # base_url personalizado. seed es honrado al estar en kwargs.
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model_name,
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            temperature=temp,
+            max_tokens=settings.llm_max_tokens,
+            seed=seed,
+        )
+
+    if provider == LLMProvider.KIMI:
+        # Moonshot Kimi expone API OpenAI-compatible (Moonshot AI Open Platform).
+        # No documenta soporte explicito de seed; la reproducibilidad depende
+        # de temperature=0 para el observador.
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model_name,
+            api_key=settings.kimi_api_key,
+            base_url=settings.kimi_base_url,
+            temperature=temp,
+            max_tokens=settings.llm_max_tokens,
+        )
+
     raise ValueError(f"Proveedor LLM no soportado: {provider}")
 
 
@@ -462,6 +500,10 @@ def _model_for(provider: LLMProvider, role: str) -> str:
             return settings.openrouter_model
         if provider == LLMProvider.CEREBRAS:
             return settings.cerebras_model
+        if provider == LLMProvider.DEEPSEEK:
+            return settings.deepseek_model
+        if provider == LLMProvider.KIMI:
+            return settings.kimi_model
     # rol = atacante (o default)
     if provider == LLMProvider.OPENAI:
         return settings.openai_model
@@ -475,6 +517,10 @@ def _model_for(provider: LLMProvider, role: str) -> str:
         return settings.openrouter_model
     if provider == LLMProvider.CEREBRAS:
         return settings.cerebras_model
+    if provider == LLMProvider.DEEPSEEK:
+        return settings.deepseek_model
+    if provider == LLMProvider.KIMI:
+        return settings.kimi_model
     raise ValueError(f"Proveedor LLM no soportado: {provider}")
 
 

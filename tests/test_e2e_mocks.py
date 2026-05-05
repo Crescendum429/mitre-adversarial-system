@@ -225,6 +225,62 @@ class TestProviderRetryClassifierIntegration:
         assert captured.get("stop_after_attempt") == 8
 
 
+class TestNewProvidersWiring:
+    """Confirma que los providers DeepSeek y Kimi (OpenAI-compatible) se
+    construyen sin error y respetan model + base_url. No hace llamadas reales
+    a la API; solo valida el wiring."""
+
+    def test_deepseek_provider_builds_chatopenai(self, monkeypatch):
+        from src.config.settings import LLMProvider, settings
+        from src.llm import provider
+
+        monkeypatch.setattr(settings, "deepseek_api_key", "ds-test-key")
+        monkeypatch.setattr(settings, "deepseek_model", "deepseek-chat")
+        model = provider._build_model(LLMProvider.DEEPSEEK, "deepseek-chat", role="attacker")
+        assert model is not None
+        assert getattr(model, "model_name", "") == "deepseek-chat" or \
+               getattr(model, "model", "") == "deepseek-chat"
+        base = str(getattr(model, "openai_api_base", "") or
+                   getattr(model, "base_url", ""))
+        assert "deepseek" in base.lower(), f"base_url no apunta a deepseek: {base}"
+
+    def test_kimi_provider_builds_chatopenai(self, monkeypatch):
+        from src.config.settings import LLMProvider, settings
+        from src.llm import provider
+
+        monkeypatch.setattr(settings, "kimi_api_key", "kimi-test-key")
+        monkeypatch.setattr(settings, "kimi_model", "kimi-k2-turbo-preview")
+        model = provider._build_model(LLMProvider.KIMI, "kimi-k2-turbo-preview", role="observer")
+        assert model is not None
+        base = str(getattr(model, "openai_api_base", "") or
+                   getattr(model, "base_url", ""))
+        assert "moonshot" in base.lower(), f"base_url no apunta a moonshot: {base}"
+
+    def test_pricing_dict_has_new_models(self):
+        from src.llm.provider import _PRICE_PER_M_TOKENS
+        for k in (
+            "gpt-5.5",
+            "gemini-3.1-pro",
+            "deepseek-chat",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "kimi-k2-turbo-preview",
+        ):
+            assert k in _PRICE_PER_M_TOKENS, f"pricing falta: {k}"
+
+    def test_validate_credentials_detects_missing_new_keys(self, monkeypatch):
+        from src.config.settings import LLMProvider, Settings
+        s = Settings(
+            llm_provider=LLMProvider.DEEPSEEK,
+            observer_provider=LLMProvider.KIMI,
+            deepseek_api_key="",
+            kimi_api_key="",
+        )
+        missing = s.validate_credentials()
+        assert "DEEPSEEK_API_KEY" in missing
+        assert "KIMI_API_KEY" in missing
+
+
 class TestRunAttackerExceptionHandling:
     """Regresion: run_attacker debe capturar quota/rate-limit/context-overflow
     de cualquier provider y emitir reporte parcial con la metadata acumulada.

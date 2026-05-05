@@ -23,6 +23,8 @@ class LLMProvider(str, Enum):
     GROQ = "groq"
     OPENROUTER = "openrouter"
     CEREBRAS = "cerebras"
+    DEEPSEEK = "deepseek"
+    KIMI = "kimi"
 
 
 class Settings(BaseSettings):
@@ -46,6 +48,15 @@ class Settings(BaseSettings):
     openrouter_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
     cerebras_api_key: str = ""
     cerebras_model: str = "qwen-3-235b-a22b-instruct-2507"
+    # DeepSeek API es OpenAI-compatible; reusa el SDK de OpenAI con base_url
+    # personalizada. V4 Flash $0.14/$0.28 por 1M tokens; V4 Pro $1.74/$3.48.
+    deepseek_api_key: str = ""
+    deepseek_model: str = "deepseek-chat"
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    # Moonshot Kimi K2.6: API OpenAI-compatible. Long-context, top open weights.
+    kimi_api_key: str = ""
+    kimi_model: str = "kimi-k2-turbo-preview"
+    kimi_base_url: str = "https://api.moonshot.ai/v1"
     # Observer puede usar un proveedor y modelo distintos al agente principal
     # (p.ej. atacante=openai/gpt-4.1, observer=anthropic/claude-sonnet)
     observer_provider: LLMProvider | None = None
@@ -190,6 +201,10 @@ class Settings(BaseSettings):
             missing.append("OPENROUTER_API_KEY")
         if LLMProvider.CEREBRAS in providers and not self.cerebras_api_key:
             missing.append("CEREBRAS_API_KEY")
+        if LLMProvider.DEEPSEEK in providers and not self.deepseek_api_key:
+            missing.append("DEEPSEEK_API_KEY")
+        if LLMProvider.KIMI in providers and not self.kimi_api_key:
+            missing.append("KIMI_API_KEY")
         return missing
 
 
