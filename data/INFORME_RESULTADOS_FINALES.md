@@ -9,10 +9,10 @@ Generado automáticamente por `scripts/build_results_report.py` desde `data/matr
 ## Resumen ejecutivo de la sesión de resultados
 
 - **Eje A** (matriz cross-modelo 5×5 cold): 25 runs, 
-- **Eje B** (generalización 7 escenarios): 7 runs
+- **Eje B** (generalización 7 escenarios): 8 runs
 - **Eje C** (ablation regex-only): 2 runs
 - **Eje D** (efecto memoria warm): 3 runs
-- **Total**: 37 corridas, $88.08 USD, 669.4 min wall-clock acumulado
+- **Total**: 38 corridas, $108.87 USD, 669.4 min wall-clock acumulado
 
 ### Runs no exitosos (5)
 - `A3_qwen3_235b` → `O1_gpt41mini` en `basic`: During task with name 'validate_result' and id '4cd2af5b-d0ab-87af-799c-50b42c69e641'
@@ -94,6 +94,7 @@ Con el stack ganador del Eje A se evaluó la generalización del sistema a 7 esc
 | log4shell | 1.000 | 0.889 | 1.000 | 1 | $8.372 | 3069s |
 | confluence | — | — | — | 2 | $3.759 | 646s |
 | phpunit | 0.261 | 0.546 | 0.543 | 2 | $9.798 | 4036s |
+| bpent | 0.511 | 0.835 | 0.850 | 6 | $20.794 | 0s |
 
 ---
 

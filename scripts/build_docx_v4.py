@@ -409,9 +409,10 @@ def section_6_3_3(doc, runs):
             "El backlog ratio de DeepSeek en bpent fue +0.47 (moderado en run 102 min)."
         ),
         (
-            "Costo de la sesión completa (4 ejes): $88.08 USD, 11.2 h wall-clock acumulado. "
-            "Desglose: Eje A $9.92, Eje B $65.79, Eje C $8.89, Eje D $1.64. "
-            "El costo está dominado por los runs largos de Eje B con atacante atascado."
+            f"Costo de la sesión completa (38 corridas, 4 ejes): ${total:.2f} USD, ~12 h wall-clock. "
+            f"Desglose: Eje A ${cost_a:.2f}, Eje B ${cost_b:.2f} (incluye B08 bpent Sonnet $20.79), "
+            f"Eje C $8.90, Eje D $1.64. "
+            f"El costo está dominado por los runs largos de Eje B con atacante atascado."
         ),
     ]
 
@@ -436,11 +437,14 @@ def section_6_3_5(doc, runs):
             "mrrobot (WordPress 4.x), dc1 (Drupal 7 + SUID find), bpent (boot2root SSH + SUID "
             "vim.tiny), log4shell (CVE-2021-44228 JNDI), confluence (CVE-2022-26134 OGNL), "
             "phpunit (CVE-2017-9841 eval-stdin). Estos cubren cinco vectores: HTTP form genérico, "
-            "WordPress, SSH brute force, JNDI injection, OGNL injection y eval-stdin."
+            "WordPress, SSH brute force, JNDI injection, OGNL injection y eval-stdin. "
+            "Adicionalmente se ejecutó una replicación de bpent con Sonnet 4.5 atacante (B run08) "
+            "para documentar la dependencia de la cobertura táctica con la elección del modelo."
         ),
         (
             "Tabla 8: Generalización del sistema a 7 escenarios (Eje B). "
-            "GPT-4.1 atacante, DeepSeek-chat observer. mF1* = outlier estadístico (ew<5)."
+            "GPT-4.1 atacante (B01-B07), DeepSeek-chat observer. "
+            "B run08: Sonnet 4.5 atacante, bpent. mF1* = outlier estadístico (ew<5)."
         ),
     ]
 
@@ -470,8 +474,11 @@ def section_6_3_5(doc, runs):
         f"produce mF1=None — la OGNL injection no genera logs HTTP interpretables por el observer. "
         f"El escenario log4shell (mF1=1.0* outlier, ew=4) confirma que señales JNDI son altamente "
         f"discriminativas, pero el resultado está basado en muy pocas ventanas (atacante atascado). "
-        f"NOTA: la replicación bpent con Sonnet 4.5 atacante (run extra, 6-may-2026) se agrega "
-        f"en data/matrix_aggregate.json post-cierre para documentar la dependencia de modelo."
+        f"Replicación bpent con Sonnet 4.5 atacante (B run08, 6-may-2026): mF1=0.511, 6/6 tácticas "
+        f"en 50 min, 2 replans — vs GPT-4.1 mF1=0.086 (1/6 tácticas atascado). El atacante Sonnet 4.5 "
+        f"supera a GPT-4.1 en escenarios con credenciales no canónicas (sesgo de frecuencia resuelto). "
+        f"Hallazgo: la elección del modelo atacante afecta significativamente la cobertura táctica "
+        f"en escenarios con credenciales no canónicas; el observer mF1 sigue el patrón del Eje A."
     )
 
     paras = doc.paragraphs
