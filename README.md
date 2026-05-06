@@ -17,7 +17,7 @@ El sistema opera con dos agentes autónomos que corren en paralelo sin comunicac
 | Atacante | Ejecuta la cadena de ataque contra la red objetivo | ReAct con validador code-based, replan con feedback, memoria de playbooks |
 | Observador | Analiza logs y clasifica tácticas MITRE en tiempo real | Grafo condicional con triaje heurístico + refinamiento forense |
 
-Modelo configurable por agente vía `.env`: soporta OpenAI (GPT-4.1), Anthropic (Claude Sonnet 4.5 / Haiku 4.5), Google (Gemini 2.5 Flash), Groq (Llama 3.3 70B), OpenRouter y Cerebras. Stack default reportado: atacante `claude-sonnet-4-5-20250929`, observador `claude-haiku-4-5-20251001`.
+Modelo configurable por agente vía `.env`: soporta 8 proveedores (OpenAI, Anthropic, Google, Groq, OpenRouter, Cerebras, DeepSeek, Moonshot Kimi). Stack ganador operacional de la sesión de resultados: atacante `gpt-4.1` + observer `deepseek-chat` (Eje B generalización). Para escenarios complejos: atacante `claude-sonnet-4-5-20250929` (bpent: completa 6/6 tácticas donde gpt-4.1 se atasca en initial_access por sesgo de frecuencia).
 
 **Reproducibilidad** (referencia: Bender & Friedman 2018, *Data Statements for NLP*): el sistema fija `LLM_SEED=42` y temperaturas separadas por rol (atacante 0.2 para exploración, observador 0.0 para clasificación determinista). El parámetro seed es respetado a nivel API por OpenAI, Google, Groq, Cerebras y OpenRouter; **Anthropic no expone seed determinista en su API actual** (documentado en `src/config/settings.py:6-12` y `src/llm/provider.py:379-380`). Para corridas Anthropic la reproducibilidad estadística depende del `model_snapshot` fijo (e.g. `claude-sonnet-4-5-20250929`), `temperature=0.0` para el observador, y reporte explícito de varianza inter-corrida (μ ± σ + IC95% bootstrap) sobre n≥3. Cualquier afirmación cuantitativa sobre Anthropic en este repositorio cita el JSON específico que la sustenta.
 
@@ -165,7 +165,7 @@ OBSERVER_PROVIDER=anthropic       # proveedor del agente observador
 OBSERVER_MODEL=claude-haiku-4-5-20251001
 ```
 
-El stack de referencia para los resultados reportados es atacante Claude Sonnet 4.5 + observador Claude Haiku 4.5. Otros pares válidos están documentados en `data/reports/` junto a sus métricas. Un usuario que cambie el stack debe re-correr para validar reproducibilidad bajo su nueva combinación.
+El stack de referencia para los resultados reportados es atacante Claude Sonnet 4.5 + observador Claude Haiku 4.5. La capa multi-proveedor también soporta DeepSeek (V4 Flash/Pro/Reasoner) y Moonshot Kimi (K2 Turbo Preview) — ambos vía API OpenAI-compatible — además de los modelos comerciales más recientes (GPT-5.5, Gemini 3.1 Pro, Claude Opus 4.7) registrados en `_PRICE_PER_M_TOKENS` (`src/llm/provider.py`). Otros pares válidos están documentados en `data/reports/` junto a sus métricas. Un usuario que cambie el stack debe re-correr para validar reproducibilidad bajo su nueva combinación.
 
 ## Uso
 
@@ -194,6 +194,42 @@ poetry run python scripts/run_benchmark.py --scenarios basic --runs-per-scenario
 
 # Visualizacion grafica del run en browser (frontend en web/frontend.html):
 poetry run python -m src.main --scenario basic --open-frontend
+```
+
+### Sesión de resultados (mayo 2026)
+
+Los resultados empíricos finales se obtuvieron mediante un experimento de cuatro ejes documentado en `data/matrix_aggregate.json` (38 corridas, $88+ USD, ~11 h wall-clock acumulado):
+
+- **Eje A — matriz cross-modelo 5×5 sobre `basic`** (cold por celda): cinco atacantes (gpt-4.1, claude-sonnet-4-5, qwen3-235b, deepseek-chat, gpt-oss-120b free) × cinco observers (gpt-4.1-mini, haiku-4-5, qwen3-235b, deepseek-chat, gpt-oss-120b free). Reset de memoria entre runs. 19/25 runs completados (6 fallaron por cuota Cerebras free).
+- **Eje B — generalización 7 escenarios** (stack fijo): atacante `gpt-4.1` + observer `deepseek-chat` sobre dvwa, mrrobot, dc1, bpent, log4shell, confluence, phpunit. Nota: diseño original usaba Sonnet 4.5; cambiado a gpt-4.1 por costo (Sonnet dvwa $23.71, proyectaba >$140 para 7 escenarios).
+- **Eje C — ablation regex-only** sobre basic + log4shell: mide contribución marginal del LLM observer vs pipeline determinista.
+- **Eje D — efecto memoria warm**: tres runs consecutivos sin reset sobre `basic` midiendo reducción cold→warm del playbook (−32% tool_calls en primer run warm).
+
+**Hallazgos principales:**
+
+| Métrica | Valor |
+|---------|-------|
+| Top observer (Eje A, ajustado) | O4_dschat (DeepSeek-chat) μ=0.479 — ganador operacional |
+| Top atacante (Eje A, ajustado) | A5_gptoss120b μ=0.516 (pero σ=0.281, alta varianza) |
+| Mejor Eje B | dc1: mF1=0.529, 6/6 tácticas, $3.68 |
+| Peor Eje B | mrrobot: mF1=0.046 (atacante atascado, 1/6 tácticas) |
+| Ablation: LLM vs regex-only (basic) | 0.441 vs 0.492 (regex-only marginalmente mejor en basic) |
+| Memoria warm (basic) | −32% tool_calls cold→warm (19→13 acciones) |
+| Outliers detectados | 3 runs mF1=1.0 con ew<5 — artefactos estadísticos, excluidos |
+
+Audit completo de las 38 corridas: `data/AUDIT_RUNS.md`. Informe de resultados: `data/INFORME_RESULTADOS_FINALES.md`.
+
+```bash
+# Reproducir el audit sobre el aggregate actual
+poetry run python scripts/audit_runs.py
+
+# Regenerar informe de resultados
+poetry run python scripts/build_results_report.py
+
+# Reproducir un Eje B single-scenario
+LLM_PROVIDER=openai OPENAI_MODEL=gpt-4.1 \
+OBSERVER_PROVIDER=deepseek OBSERVER_MODEL=deepseek-chat \
+poetry run python -m src.main --scenario dc1
 ```
 
 ### Frontend gráfico (`web/frontend.html`)
