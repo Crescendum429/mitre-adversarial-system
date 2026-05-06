@@ -1332,6 +1332,8 @@ def derive_tactic_from_signals(state: ObserverState) -> dict:
         reasoning="regex-only ablation",
         refinement_count=0,
         llm_latency_ms=0,
+        window_start=state.get("window_start", ""),
+        window_end=state.get("window_end", ""),
     )
     return {"current_classification": classification}
 
@@ -1406,6 +1408,8 @@ def classify_tactic(state: ObserverState) -> dict:
             reasoning=str(classification.get("reasoning", ""))[:500],
             refinement_count=state.get("refinement_count", 0),
             llm_latency_ms=_latency_ms,
+            window_start=state.get("window_start", ""),
+            window_end=state.get("window_end", ""),
         )
     else:
         logger.warning("[Observador] No se pudo parsear la clasificacion del LLM")

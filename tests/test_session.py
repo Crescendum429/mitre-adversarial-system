@@ -179,6 +179,88 @@ class TestEnrichForFrontendPropagatesTacticsInWindow:
         )
 
 
+class TestObserverClassifyEventCarriesWindow:
+    """Regresion critica: el evento classify del observer debe transportar
+    window_start y window_end del state. Sin esos campos, _enrich_for_frontend
+    cae al timestamp del evento (= cuando el LLM termino de clasificar, no
+    cuando empezo la ventana observada). El matching ground-truth en
+    metrics.evaluate queda desfasado por 5-15s = mF1 colapsa a 0.
+
+    Detectado al inspeccionar reports del Eje A donde Haiku 4.5 daba mF1=0
+    pese a clasificar correctamente Reconnaissance / Initial Access.
+    """
+
+    def test_classify_event_includes_window_bounds_llm_path(self):
+        from unittest.mock import patch
+        from src.agents.observer import nodes as obs_nodes
+        from src.ui.session import SessionRecorder
+
+        recorder = SessionRecorder()
+        with patch("src.agents.observer.nodes.get_session", lambda: recorder), \
+             patch.object(obs_nodes, "_get_model") as mock_model, \
+             patch.object(obs_nodes, "_parse_classification") as mock_parse:
+            mock_parse.return_value = {
+                "tactic": "Reconnaissance",
+                "tactic_id": "TA0043",
+                "confidence": 0.85,
+                "tactics_in_window": [{"tactic": "Reconnaissance", "tactic_id": "TA0043"}],
+                "evidence": ["nmap scan"],
+                "reasoning": "test",
+                "recommendation": "alert",
+            }
+            class _M:
+                def invoke(self, *a, **kw):
+                    class R: content = "{}"
+                    return R()
+            mock_model.return_value = _M()
+
+            state = {
+                "window_start": "2026-05-06T10:00:00+00:00",
+                "window_end": "2026-05-06T10:00:05+00:00",
+                "log_summary": "log",
+                "anomaly_signals": {},
+                "baseline_prior": None,
+                "has_new_logs": True,
+                "classification_history": [],
+                "refinement_count": 0,
+            }
+            obs_nodes.classify_tactic(state)
+
+        classify_evts = [e for e in recorder.events if e.event_type == "classify"]
+        assert classify_evts, "no classify event emitido"
+        p = classify_evts[0].payload
+        assert p.get("window_start") == "2026-05-06T10:00:00+00:00", \
+            f"window_start ausente o incorrecto en classify event: {p}"
+        assert p.get("window_end") == "2026-05-06T10:00:05+00:00", \
+            f"window_end ausente o incorrecto en classify event: {p}"
+
+    def test_classify_event_includes_window_bounds_regex_only_path(self):
+        from unittest.mock import patch
+        from src.agents.observer import nodes as obs_nodes
+        from src.ui.session import SessionRecorder
+
+        recorder = SessionRecorder()
+        with patch("src.agents.observer.nodes.get_session", lambda: recorder):
+            state = {
+                "window_start": "2026-05-06T11:00:00+00:00",
+                "window_end": "2026-05-06T11:00:05+00:00",
+                "has_new_logs": True,
+                "anomaly_signals": {
+                    "suspicious_ips": {
+                        "10.10.0.5": {"login_success": 1, "tool_detected": True}
+                    },
+                    "webshell_commands": [],
+                },
+            }
+            obs_nodes.derive_tactic_from_signals(state)
+
+        classify_evts = [e for e in recorder.events if e.event_type == "classify"]
+        assert classify_evts, "no classify event emitido en path regex_only"
+        p = classify_evts[0].payload
+        assert p.get("window_start") == "2026-05-06T11:00:00+00:00"
+        assert p.get("window_end") == "2026-05-06T11:00:05+00:00"
+
+
 class TestEnrichForFrontendInjectsBootstrapCi:
     """Regresion H2: cuando incremental_save corre durante el run,
     _enrich_for_frontend popula metadata.evaluation sin bootstrap_ci

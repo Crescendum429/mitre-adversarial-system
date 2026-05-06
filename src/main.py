@@ -1704,6 +1704,9 @@ def _emit_report(
         ),
         # Bootstrap 95% CI (Fase 1 — defensa estadistica vs n=1)
         bootstrap_ci=_LAST_BOOTSTRAP_CI,
+        # Flags metodologicas activas (auditabilidad / reproducibilidad).
+        attacker_tactic_per_window=settings.attacker_tactic_per_window,
+        observer_regex_only=settings.observer_regex_only,
     )
     session.system_event("session_end")
 
