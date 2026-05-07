@@ -50,5 +50,9 @@ data/benchmark_*.json
 # pero no van al repo (regenerables con python -m src.main).
 data/reports/
 
+# Presentaciones generadas (PowerPoint, PDFs intermedios). Artefactos
+# personales del autor; no son codigo del sistema.
+presentations/
+
 .DS_Store
 Thumbs.db

@@ -399,15 +399,16 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
         kwargs: dict = dict(
             model=model_name,
             api_key=settings.anthropic_api_key,
-            temperature=temp,
             max_tokens=settings.llm_max_tokens,
         )
+        # Opus 4.x (extended thinking nativo) no acepta temperature explícito.
+        opus_models = ("claude-opus-4",)
+        if not any(model_name.startswith(m) for m in opus_models):
+            kwargs["temperature"] = temp
         if settings.anthropic_thinking_enabled:
             budget = max(1024, int(settings.anthropic_thinking_budget_tokens))
             kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 1024)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-            # Anthropic exige temperature=1 cuando thinking esta activo.
-            kwargs["temperature"] = 1.0
         return ChatAnthropic(**kwargs)
 
     if provider == LLMProvider.GOOGLE:
