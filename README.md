@@ -10,7 +10,9 @@ El trabajo se enmarca como **measurement paper, no system paper**: la contribuci
 
 ## Arquitectura
 
-![Arquitectura del sistema](docs/architecture.png)
+![Arquitectura del sistema](paper/Arquitectura.png)
+
+> Documento final del proyecto integrador: [`paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf)
 
 Tres capas con responsabilidades estrictamente separadas:
 
@@ -269,9 +271,10 @@ Los componentes visuales se diseñaron con asistencia de **Claude Design** (Anth
 
 ## Documentación adicional
 
+- [`paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf) — documento final del proyecto integrador (USFQ, mayo 2026)
+- [`paper/Arquitectura.png`](paper/Arquitectura.png) — diagrama Eraser del sistema completo
 - `data/AUDIT_RUNS.md` — audit completo de las 38 corridas
 - `data/INFORME_RESULTADOS_FINALES.md` — informe consolidado de resultados
-- Documento final del proyecto integrador: `DocumentoFinal-ProyectoIntegrador-Alarcon.docx`
 
 ## Declaración sobre uso de tecnologías generativas y asistidas por IA
 
