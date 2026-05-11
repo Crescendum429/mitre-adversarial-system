@@ -106,10 +106,10 @@ def main():
 
     out.append("## Tabla completa de corridas")
     out.append("")
-    out.append("| # | Eje | Atacante | Observer | Escenario | ok | mF1 | ew | tc/tp | rp | Costo USD | Flags |")
+    out.append("| # | Eje | Atacante | Observer | Escenario | ok | mF1 | ew | tc/tp | rp | wall-clock (s) | Flags |")
     out.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for run, flags in flagged:
-        cost = (run.get("attacker_cost_usd") or 0) + (run.get("observer_cost_usd") or 0)
+        wc = run.get("elapsed_s") or 0
         tc = run.get("tactics_completed")
         tp = tactics_planned(run)
         ew = run.get("evaluable_windows")
@@ -123,7 +123,7 @@ def main():
             f" | {ew if ew is not None else '—'}"
             f" | {tc if tc is not None else '—'}/{tp}"
             f" | {run.get('replans', '—')}"
-            f" | ${cost:.3f}"
+            f" | {wc:.0f}"
             f" | {', '.join(flags) if flags else '—'} |"
         )
     out.append("")

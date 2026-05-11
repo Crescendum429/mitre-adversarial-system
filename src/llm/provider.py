@@ -409,6 +409,10 @@ def _build_model(provider: LLMProvider, model_name: str, role: str = "attacker")
             budget = max(1024, int(settings.anthropic_thinking_budget_tokens))
             kwargs["max_tokens"] = max(kwargs["max_tokens"], budget + 1024)
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Anthropic API exige temperature=1.0 cuando extended thinking
+            # esta activo. Override del valor por defecto para evitar 400
+            # invalid_request_error en runtime.
+            kwargs["temperature"] = 1.0
         return ChatAnthropic(**kwargs)
 
     if provider == LLMProvider.GOOGLE:

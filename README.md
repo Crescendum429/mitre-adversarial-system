@@ -10,9 +10,9 @@ El trabajo se enmarca como **measurement paper, no system paper**: la contribuci
 
 ## Arquitectura
 
-![Arquitectura del sistema](paper/Arquitectura.png)
+![Arquitectura del sistema](docs/Arquitectura.png)
 
-> Documento final del proyecto integrador: [`paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf)
+> Documento final del proyecto integrador: [`docs/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](docs/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf)
 
 Tres capas con responsabilidades estrictamente separadas:
 
@@ -215,15 +215,14 @@ poetry run python scripts/run_benchmark.py --scenarios basic --runs-per-scenario
 ### Reproducir el audit de la sesión de resultados
 
 ```bash
-poetry run python scripts/audit_runs.py            # audit sobre data/matrix_aggregate.json
-poetry run python scripts/build_results_report.py  # regenera informe
+poetry run python scripts/audit_runs.py  # regenera data/AUDIT_RUNS.md desde data/matrix_aggregate.json
 ```
 
 ## Diseño experimental — sesión de resultados (mayo 2026)
 
 Cuatro ejes documentados en `data/matrix_aggregate.json` (38 corridas, ~12 h wall-clock):
 
-- **Eje A — matriz cross-modelo 5×5 sobre `basic`** (cold por celda): cinco atacantes × cinco observers. Reset de memoria entre runs. 19 corridas válidas (6 falladas por cuota free tier Cerebras).
+- **Eje A — matriz cross-modelo 5×5 sobre `basic`** (cold por celda): cinco atacantes × cinco observers. Reset de memoria entre runs. 18 corridas válidas (5 falladas por cuota free tier Cerebras, 1 outlier mF1=1.0 con ew<5, 1 con observer sin clasificaciones).
 - **Eje B — generalización a 7 escenarios** (stack ganador): GPT-4.1 atacante + DeepSeek observer sobre dvwa, mrrobot, dc1, bpent, log4shell, confluence, phpunit. Run B08: replicación bpent con Sonnet 4.5 atacante.
 - **Eje C — ablation regex-only** (sin LLM observer) sobre basic + log4shell.
 - **Eje D — efecto memoria warm**: tres corridas consecutivas sin reset sobre `basic`.
@@ -232,7 +231,7 @@ Cuatro ejes documentados en `data/matrix_aggregate.json` (38 corridas, ~12 h wal
 
 | Métrica | Valor |
 |---------|-------|
-| μ macro-F1 Eje A (matriz cross-modelo, 19 válidas) | 0,441 |
+| μ macro-F1 Eje A (matriz cross-modelo, 18 válidas) | 0,441 |
 | μ macro-F1 Eje B (Niveles 1+2 evaluables, n=4) | 0,429 |
 | Top observer Eje A (operacional) | DeepSeek-chat μ=0,479 |
 | Mejor escenario Eje B (cadena completa) | dc1 6/6 tácticas, mF1=0,529 |
@@ -271,10 +270,9 @@ Los componentes visuales se diseñaron con asistencia de **Claude Design** (Anth
 
 ## Documentación adicional
 
-- [`paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](paper/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf) — documento final del proyecto integrador (USFQ, mayo 2026)
-- [`paper/Arquitectura.png`](paper/Arquitectura.png) — diagrama Eraser del sistema completo
-- `data/AUDIT_RUNS.md` — audit completo de las 38 corridas
-- `data/INFORME_RESULTADOS_FINALES.md` — informe consolidado de resultados
+- [`docs/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf`](docs/SISTEMA_ADVERSARIAL_MITRE_ATTACK_Alarcon.pdf) — documento final del proyecto integrador (USFQ, mayo 2026)
+- [`docs/Arquitectura.png`](docs/Arquitectura.png) — diagrama Eraser del sistema completo
+- [`data/AUDIT_RUNS.md`](data/AUDIT_RUNS.md) — audit completo de las 38 corridas con flags de inconsistencia
 
 ## Declaración sobre uso de tecnologías generativas y asistidas por IA
 

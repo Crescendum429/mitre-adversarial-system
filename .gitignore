@@ -34,7 +34,7 @@ results/
 !src/config/*.json
 !web/sample_session.json
 
-docs/
+# docs/ ahora contiene los entregables finales (PDF + Arquitectura.png) — NO ignorar
 *_run_output*.txt
 
 # Clones externos (vulhub, SecLists, etc.). No commit — el usuario los clona localmente.
